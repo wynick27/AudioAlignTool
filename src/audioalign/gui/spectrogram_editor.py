@@ -33,6 +33,42 @@ def _colour_map() -> np.ndarray:
     ).astype(np.uint8)
 
 
+class StableTimeAxis(pg.AxisItem):
+    """A single-level time axis whose label interval changes only with zoom."""
+
+    def __init__(self) -> None:
+        super().__init__(orientation="bottom")
+        self._step_seconds = 1.0
+
+    def set_step(self, milliseconds: int) -> None:
+        step = max(0.001, milliseconds / 1000)
+        if abs(step - self._step_seconds) < 1e-12:
+            return
+        self._step_seconds = step
+        self.picture = None
+        self.update()
+
+    def tickValues(self, minVal: float, maxVal: float, size: float):
+        step = self._step_seconds
+        first = int(np.ceil((minVal - step * 1e-9) / step))
+        last = int(np.floor((maxVal + step * 1e-9) / step))
+        values = [index * step for index in range(first, last + 1)]
+        return [(step, values)]
+
+    def tickStrings(self, values, scale, spacing):
+        step = self._step_seconds
+        if step >= 1:
+            result = []
+            for value in values:
+                seconds = round(value)
+                sign = "−" if seconds < 0 else ""
+                absolute = abs(seconds)
+                result.append(f"{sign}{absolute // 60}:{absolute % 60:02d}" if absolute >= 60 else f"{sign}{absolute}")
+            return result
+        decimals = 1 if step >= 0.1 else 2 if step >= 0.01 else 3
+        return [f"{value:.{decimals}f}" for value in values]
+
+
 class InteractiveViewBox(pg.ViewBox):
     dragStarted = Signal(float, int)
     dragMoved = Signal(float, int)
@@ -107,6 +143,7 @@ class _Pane:
     kind: str
     plot: pg.PlotWidget
     view: InteractiveViewBox
+    time_axis: StableTimeAxis
     play_line: pg.InfiniteLine
     selection: pg.LinearRegionItem
     cues: list
@@ -161,6 +198,10 @@ class AudioVisualizerEditor(QWidget):
         self._syncing = False
         self._last_follow_render = 0.0
         self._last_follow_position = -1
+        self._rendered_start = -1
+        self._rendered_end = -1
+        self._rendered_span = -1
+        self._rendered_mode: AudioVisualizationMode | None = None
 
         self.pane_layout = QVBoxLayout(self)
         self.pane_layout.setContentsMargins(0, 0, 0, 0)
@@ -194,10 +235,11 @@ class AudioVisualizerEditor(QWidget):
 
     def _make_pane(self, kind: str) -> _Pane:
         view = InteractiveViewBox(enableMenu=False)
-        plot = pg.PlotWidget(viewBox=view)
+        time_axis = StableTimeAxis()
+        plot = pg.PlotWidget(viewBox=view, axisItems={"bottom": time_axis})
         plot.setBackground((7, 10, 20))
         plot.hideButtons()
-        plot.showGrid(x=True, y=False, alpha=0.12)
+        plot.showGrid(x=False, y=False)
         plot.setLabel("bottom", "时间", units="s")
         if kind == "spectrogram":
             plot.setLabel("left", "频率", units="Hz")
@@ -219,7 +261,7 @@ class AudioVisualizerEditor(QWidget):
         selection.setVisible(False)
         selection.setZValue(9)
         plot.addItem(selection)
-        pane = _Pane(kind, plot, view, play_line, selection, [], {}, {}, [], [])
+        pane = _Pane(kind, plot, view, time_axis, play_line, selection, [], {}, {}, [], [])
         for _ in range(16):
             grid_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(155, 175, 200, 48, width=1))
             grid_line.setZValue(1)
@@ -244,6 +286,7 @@ class AudioVisualizerEditor(QWidget):
         if mode == self.mode and self.isVisible():
             return
         self.mode = mode
+        self._rendered_mode = None
         self.wave_pane.plot.setVisible(mode in {AudioVisualizationMode.WAVEFORM, AudioVisualizationMode.COMBINED})
         self.spectrum_pane.plot.setVisible(mode in {AudioVisualizationMode.SPECTROGRAM, AudioVisualizationMode.COMBINED})
         self.wave_pane.plot.getAxis("bottom").setVisible(mode != AudioVisualizationMode.COMBINED)
@@ -254,6 +297,7 @@ class AudioVisualizerEditor(QWidget):
 
     def set_cache(self, cache: AudioVisualizationCache | None, duration_ms: int | None = None) -> None:
         self.cache = cache
+        self._rendered_start = self._rendered_end = self._rendered_span = -1
         self.duration_ms = max(1, duration_ms or (cache.metadata.duration_ms if cache else 1))
         self.view_start, self.view_end = 0, min(self.duration_ms, 30_000)
         for pane in self._panes:
@@ -276,6 +320,9 @@ class AudioVisualizerEditor(QWidget):
 
     def set_playhead(self, milliseconds: int) -> None:
         self.playhead = max(0, min(self.duration_ms, milliseconds))
+        self._update_playhead_lines()
+
+    def _update_playhead_lines(self) -> None:
         for pane in self._panes:
             pane.play_line.setValue(self.playhead / 1000)
 
@@ -326,6 +373,7 @@ class AudioVisualizerEditor(QWidget):
         first = int(np.floor(self.view_start / step) * step)
         positions = list(range(first, self.view_end + step, step))
         for pane in self._panes:
+            pane.time_axis.set_step(step)
             for index, line in enumerate(pane.grid_lines):
                 if index < len(positions):
                     line.setValue(positions[index] / 1000)
@@ -365,9 +413,11 @@ class AudioVisualizerEditor(QWidget):
             self.follow_playhead(self.playhead, force=True)
 
     def follow_playhead(self, milliseconds: int, *, force: bool = False) -> None:
-        self.set_playhead(milliseconds)
+        milliseconds = max(0, min(self.duration_ms, milliseconds))
         if self.follow_state != PlaybackFollowState.FOLLOWING:
+            self.set_playhead(milliseconds)
             return
+        self.playhead = milliseconds
         now = time.monotonic()
         span = max(500, self.view_end - self.view_start)
         pixel_ms = span / max(1, self.width())
@@ -376,6 +426,7 @@ class AudioVisualizerEditor(QWidget):
         self._last_follow_render = now
         self._last_follow_position = milliseconds
         self.set_time_range(milliseconds - span // 2, milliseconds + span // 2)
+        self._update_playhead_lines()
 
     def select_segment(self, index: int, additive: bool = False, toggle: bool = False) -> None:
         previous = set(self.selected_segments)
@@ -400,6 +451,7 @@ class AudioVisualizerEditor(QWidget):
             self.image.clear()
             self.wave_min.clear()
             self.wave_max.clear()
+            self._rendered_start = self._rendered_end = self._rendered_span = -1
             return
         actual_start = max(0, self.view_start)
         actual_end = min(self.duration_ms, self.view_end)
@@ -407,17 +459,35 @@ class AudioVisualizerEditor(QWidget):
             self.image.clear()
             self.wave_min.clear()
             self.wave_max.clear()
+            self._rendered_start = self._rendered_end = self._rendered_span = -1
             return
-        width = max(64, self.width())
+        span = max(1, self.view_end - self.view_start)
+        scale_unchanged = self._rendered_span > 0 and abs(span - self._rendered_span) <= max(1, span // 1000)
+        horizontal_margin = max(1, span // 5)
+        buffered_view_is_available = (
+            scale_unchanged
+            and self._rendered_mode == self.mode
+            and self._rendered_start <= actual_start - min(horizontal_margin, actual_start)
+            and self._rendered_end >= actual_end + min(horizontal_margin, self.duration_ms - actual_end)
+        )
+        if buffered_view_is_available:
+            return
+        render_start = max(0, actual_start - span)
+        render_end = min(self.duration_ms, actual_end + span)
+        width = max(64, round(max(1, render_end - render_start) / span * self.width()))
         if self.spectrum_pane.plot.isVisible():
-            data, start, end = self.cache.spectrogram_slice(actual_start, actual_end, width)
+            data, start, end = self.cache.spectrogram_slice(render_start, render_end, width)
             self.image.setImage(data.T, autoLevels=False)
             self.image.setRect(start / 1000, 50, max(0.001, (end - start) / 1000), 7950)
         if self.wave_pane.plot.isVisible():
-            minimum, maximum, start, end = self.cache.waveform_slice(actual_start, actual_end, width)
+            minimum, maximum, start, end = self.cache.waveform_slice(render_start, render_end, width)
             x = np.linspace(start / 1000, end / 1000, minimum.size, endpoint=False)
             self.wave_min.setData(x, minimum)
             self.wave_max.setData(x, maximum)
+        self._rendered_start = render_start
+        self._rendered_end = render_end
+        self._rendered_span = span
+        self._rendered_mode = self.mode
 
     @staticmethod
     def _clear_items(plot: pg.PlotWidget, collection: list) -> None:

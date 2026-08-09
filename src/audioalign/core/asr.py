@@ -350,11 +350,20 @@ class FasterWhisperTranscriber:
         return tokens
 
 
-_QWEN_LANGUAGE_NAMES = {
+QWEN_ASR_LANGUAGE_NAMES = {
     "zh": "Chinese", "yue": "Cantonese", "en": "English", "de": "German",
     "es": "Spanish", "fr": "French", "it": "Italian", "pt": "Portuguese",
-    "ru": "Russian", "ko": "Korean", "ja": "Japanese",
+    "ru": "Russian", "ko": "Korean", "ja": "Japanese", "ar": "Arabic",
+    "id": "Indonesian", "th": "Thai", "vi": "Vietnamese", "tr": "Turkish",
+    "hi": "Hindi", "ms": "Malay", "nl": "Dutch", "sv": "Swedish",
+    "da": "Danish", "fi": "Finnish", "pl": "Polish", "cs": "Czech",
+    "fil": "Filipino", "fa": "Persian", "el": "Greek", "ro": "Romanian",
+    "hu": "Hungarian", "mk": "Macedonian",
 }
+
+QWEN_FORCED_LANGUAGE_CODES = (
+    "zh", "en", "yue", "fr", "de", "it", "ja", "ko", "pt", "ru", "es",
+)
 
 
 def _qwen_repo_id(model: str) -> str:
@@ -487,7 +496,7 @@ class Qwen3ASRTranscriber:
         samples, sample_rate = decode_audio_mono(
             path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
         )
-        language = _QWEN_LANGUAGE_NAMES.get((options.language or "").casefold(), options.language)
+        language = QWEN_ASR_LANGUAGE_NAMES.get((options.language or "").casefold(), options.language)
         results = model.transcribe(
             audio=(samples, sample_rate), language=language, return_time_stamps=True,
         )
@@ -526,7 +535,7 @@ class Qwen3ASRTranscriber:
 class Qwen3ForcedAligner:
     """Direct known-text alignment for selected regions up to four minutes."""
 
-    SUPPORTED_LANGUAGES = frozenset(_QWEN_LANGUAGE_NAMES)
+    SUPPORTED_LANGUAGES = frozenset(QWEN_FORCED_LANGUAGE_CODES)
 
     def __init__(self) -> None:
         self.last_device_info = InferenceDeviceInfo("qwen3-forced-aligner", "Qwen3-ForcedAligner-0.6B")
@@ -559,7 +568,7 @@ class Qwen3ForcedAligner:
         samples, sample_rate = decode_audio_mono(
             path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
         )
-        language_name = _QWEN_LANGUAGE_NAMES.get(language.casefold(), language)
+        language_name = QWEN_ASR_LANGUAGE_NAMES.get(language.casefold(), language)
         results = model.align(audio=(samples, sample_rate), text=text, language=language_name)
         tokens: list[ASRToken] = []
         for item in results[0]:
@@ -592,7 +601,7 @@ class WhisperXTranscriber:
         try:
             import whisperx  # type: ignore
         except ImportError as exc:
-            raise BackendUnavailableError("精确模式需要可选的 WhisperX 组件") from exc
+            raise BackendUnavailableError("WhisperX 识别并精确对齐工作流需要安装 WhisperX 组件") from exc
         device = options.device
         if device == "auto":
             try:

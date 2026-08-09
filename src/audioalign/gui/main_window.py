@@ -56,6 +56,8 @@ from audioalign.core.alignment import (
 )
 from audioalign.core.asr import (
     ASROptions,
+    QWEN_ASR_LANGUAGE_NAMES,
+    QWEN_FORCED_LANGUAGE_CODES,
     Qwen3ForcedAligner,
     plan_audio_chunks,
     recognition_cache_key,
@@ -99,6 +101,22 @@ from .asr_comparison import ASRComparisonView
 from .mapping_dialog import ChapterAudioMappingDialog
 from .segment_model import MiniSpectrogramDelegate, SegmentTableModel
 from .spectrogram_editor import AudioVisualizerEditor, AudioVisualizerOverview
+
+
+WORKFLOW_FASTER_WHISPER = "faster-whisper-asr-align"
+WORKFLOW_WHISPERX = "whisperx-asr-align"
+WORKFLOW_QWEN_ASR = "qwen3-asr-align"
+WORKFLOW_QWEN_FORCED = "qwen3-forced-align"
+
+WHISPER_LANGUAGE_CODES = (
+    "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs", "ca", "cs", "cy",
+    "da", "de", "el", "en", "es", "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw",
+    "he", "hi", "hr", "ht", "hu", "hy", "id", "is", "it", "ja", "jw", "ka", "kk", "km", "kn",
+    "ko", "la", "lb", "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+    "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru", "sa", "sd", "si",
+    "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl",
+    "tr", "tt", "uk", "ur", "uz", "vi", "yi", "yo", "zh", "yue",
+)
 
 
 class JobCancelled(Exception):
@@ -607,19 +625,15 @@ class MainWindow(QMainWindow):
         right = QWidget()
         form = QFormLayout(right)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("快速", AlignmentMode.FAST.value)
-        self.mode_combo.addItem("均衡（默认）", AlignmentMode.BALANCED.value)
-        self.mode_combo.addItem("精确 / WhisperX", AlignmentMode.PRECISE.value)
-        self.mode_combo.addItem("Qwen 强制对齐（整章）", AlignmentMode.QWEN_FORCED.value)
-        self.backend_combo = QComboBox()
-        self.backend_combo.addItem("faster-whisper", ASRBackendId.FASTER_WHISPER.value)
-        self.backend_combo.addItem("Qwen3-ASR", ASRBackendId.QWEN3_ASR.value)
+        self.mode_combo.addItem("faster-whisper · 识别后对齐", WORKFLOW_FASTER_WHISPER)
+        self.mode_combo.addItem("WhisperX · 识别并精确对齐", WORKFLOW_WHISPERX)
+        self.mode_combo.addItem("Qwen3-ASR · 识别后对齐", WORKFLOW_QWEN_ASR)
+        self.mode_combo.addItem("Qwen ForcedAligner · 强制对齐", WORKFLOW_QWEN_FORCED)
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.addItems(["small", "medium", "large-v3", "turbo"])
         self.language_combo = QComboBox()
-        self.language_combo.setEditable(True)
-        self.language_combo.addItems(["auto", "zh", "ja", "es", "en", "fr", "de"])
+        self.language_combo.setEditable(False)
         self.vad_spin = QDoubleSpinBox()
         self.vad_spin.setRange(0.05, 0.95)
         self.vad_spin.setSingleStep(0.05)
@@ -636,17 +650,16 @@ class MainWindow(QMainWindow):
         self.snap_spin.setRange(0, 5000)
         self.snap_spin.setValue(250)
         self.snap_spin.setSuffix(" ms")
-        self.backend_combo.currentIndexChanged.connect(self._backend_changed)
         self.mode_combo.currentIndexChanged.connect(self._alignment_mode_changed)
         for control in (self.mode_combo, self.model_combo, self.language_combo, self.vad_spin, self.min_silence_spin, self.padding_spin, self.snap_spin):
             if isinstance(control, QComboBox):
                 control.currentIndexChanged.connect(self._settings_changed)
             else:
                 control.valueChanged.connect(self._settings_changed)
-        form.addRow("识别模式", self.mode_combo)
-        form.addRow("ASR 后端", self.backend_combo)
+        form.addRow("对齐方式", self.mode_combo)
         form.addRow("识别模型", self.model_combo)
-        form.addRow("语言", self.language_combo)
+        self.language_label = QLabel("语言")
+        form.addRow(self.language_label, self.language_combo)
         form.addRow("VAD 阈值", self.vad_spin)
         form.addRow("最短静音", self.min_silence_spin)
         form.addRow("边界留白", self.padding_spin)
@@ -669,8 +682,6 @@ class MainWindow(QMainWindow):
         self.qwen_align_menu.addAction("对齐当前句", self.qwen_align_current_segment)
         self.qwen_align_menu.addAction("对齐所选句子 ↔ 音频选区", self.qwen_align_selected_range)
         self.qwen_align_menu.addAction("从当前句/时间向后对齐", self.qwen_align_from_current_anchor)
-        self.qwen_align_menu.addSeparator()
-        self.qwen_align_menu.addAction("对齐整个章节", self.qwen_align_chapter)
         self.qwen_align_button.setMenu(self.qwen_align_menu)
         silence_button = QPushButton("检测静音区")
         silence_button.clicked.connect(self.detect_silence)
@@ -790,6 +801,7 @@ class MainWindow(QMainWindow):
         self._article_visualization_changed(self.article_view.canvas.mode.value)
         self.spectrogram.set_follow_enabled(self.follow_action.isChecked())
         self._set_silence_markers_visible(self.silence_markers_action.isChecked())
+        self._alignment_mode_changed()
         self._update_model_status()
 
     def _build_segment_editor(self, parent_layout: QVBoxLayout) -> None:
@@ -1202,11 +1214,13 @@ class MainWindow(QMainWindow):
 
     def _asr_options(self) -> ASROptions:
         link = self.current_link
+        backend, mode = self._workflow_components()
+        language = self._selected_language_code()
         return ASROptions(
-            backend=ASRBackendId(self.backend_combo.currentData()),
+            backend=backend,
             model=self.model_combo.currentText().strip() or "small",
-            language=None if self.language_combo.currentText() == "auto" else self.language_combo.currentText(),
-            mode=AlignmentMode(self.mode_combo.currentData()),
+            language=None if language == "auto" else language,
+            mode=mode,
             vad_threshold=self.vad_spin.value(),
             min_silence_ms=self.min_silence_spin.value(),
             model_root=str(self.paths.models),
@@ -1262,7 +1276,7 @@ class MainWindow(QMainWindow):
         if not self.session or self.current_chapter_id is None or not self.current_parts:
             self._show_error("当前章节没有可识别的音频配对。")
             return
-        if AlignmentMode(self.mode_combo.currentData()) == AlignmentMode.QWEN_FORCED:
+        if self.mode_combo.currentData() == WORKFLOW_QWEN_FORCED:
             self.qwen_align_chapter()
             return
         options = self._asr_options()
@@ -1280,7 +1294,7 @@ class MainWindow(QMainWindow):
                 return
         if (options.backend == ASRBackendId.FASTER_WHISPER
                 and options.mode == AlignmentMode.PRECISE and not status.whisperx_available):
-            self._show_error("精确模式需要可选的 WhisperX；快速和均衡模式不受影响。")
+            self._show_error("当前工作流需要 WhisperX；faster-whisper 与 Qwen3-ASR 的识别后对齐不受影响。")
             return
         if options.backend == ASRBackendId.QWEN3_ASR and not status.cuda_available:
             duration = sum(max(0, item[4] - item[3]) for item in self.current_parts)
@@ -1451,7 +1465,7 @@ class MainWindow(QMainWindow):
         if part is None:
             self._show_error("当前选区跨越多个音频资源，请缩小到单个音频切片内")
             return
-        language = self.language_combo.currentText()
+        language = self._selected_language_code()
         if language == "auto":
             self._show_error("Qwen ForcedAligner 需要明确选择文本语言")
             return
@@ -1556,7 +1570,7 @@ class MainWindow(QMainWindow):
         if part is None:
             self._show_error("音频选区跨越多个资源或切片，请缩小到单个音频切片内")
             return
-        language = self.language_combo.currentText()
+        language = self._selected_language_code()
         if language == "auto":
             self._show_error("Qwen ForcedAligner 需要明确选择文本语言")
             return
@@ -1666,7 +1680,7 @@ class MainWindow(QMainWindow):
         if not self.session or self.current_chapter_id is None or not self.current_parts:
             self._show_error("当前章节没有可用于强制对齐的音频")
             return
-        language = self.language_combo.currentText()
+        language = self._selected_language_code()
         if language == "auto":
             self._show_error("Qwen ForcedAligner 整章模式需要明确选择文本语言")
             return
@@ -2656,14 +2670,14 @@ class MainWindow(QMainWindow):
         if not self.session:
             self._update_model_status()
             return
-        self.session.manifest.alignment_mode = AlignmentMode(self.mode_combo.currentData())
-        backend = ASRBackendId(self.backend_combo.currentData())
+        backend, mode = self._workflow_components()
+        self.session.manifest.alignment_mode = mode
         self.session.manifest.asr_backend = backend
         if backend == ASRBackendId.QWEN3_ASR:
             self.session.manifest.qwen_model = self.model_combo.currentText()
         else:
             self.session.manifest.whisper_model = self.model_combo.currentText()
-        self.session.manifest.language = self.language_combo.currentText()
+        self.session.manifest.language = self._selected_language_code()
         self.session.manifest.silence = self._silence_settings()
         self.session.mark_dirty()
         self._update_title()
@@ -2671,15 +2685,22 @@ class MainWindow(QMainWindow):
 
     def _sync_settings_from_manifest(self) -> None:
         manifest = self.session.manifest
-        self.backend_combo.blockSignals(True)
-        self.backend_combo.setCurrentIndex(max(0, self.backend_combo.findData(manifest.asr_backend.value)))
-        self.backend_combo.blockSignals(False)
-        self._backend_changed()
-        self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(manifest.alignment_mode.value)))
-        self.model_combo.setCurrentText(
-            manifest.qwen_model if manifest.asr_backend == ASRBackendId.QWEN3_ASR else manifest.whisper_model
-        )
-        self.language_combo.setCurrentText(manifest.language)
+        desired_language = manifest.language
+        desired_model = manifest.qwen_model if manifest.asr_backend == ASRBackendId.QWEN3_ASR else manifest.whisper_model
+        if manifest.alignment_mode == AlignmentMode.QWEN_FORCED:
+            workflow = WORKFLOW_QWEN_FORCED
+        elif manifest.alignment_mode == AlignmentMode.PRECISE:
+            workflow = WORKFLOW_WHISPERX
+        elif manifest.asr_backend == ASRBackendId.QWEN3_ASR:
+            workflow = WORKFLOW_QWEN_ASR
+        else:
+            workflow = WORKFLOW_FASTER_WHISPER
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(workflow)))
+        self.mode_combo.blockSignals(False)
+        self._alignment_mode_changed()
+        self.model_combo.setCurrentText(desired_model)
+        self._populate_language_options(desired_language)
         self.vad_spin.setValue(manifest.silence.vad_threshold)
         self.min_silence_spin.setValue(manifest.silence.min_silence_ms)
         self.padding_spin.setValue(manifest.silence.boundary_padding_ms)
@@ -2687,46 +2708,96 @@ class MainWindow(QMainWindow):
         self._update_model_status()
 
     def _update_model_status(self) -> None:
-        alignment_mode = AlignmentMode(self.mode_combo.currentData())
-        if alignment_mode == AlignmentMode.QWEN_FORCED:
+        workflow = self.mode_combo.currentData() or WORKFLOW_FASTER_WHISPER
+        backend, _mode = self._workflow_components()
+        if workflow == WORKFLOW_QWEN_FORCED:
             backend = ASRBackendId.QWEN3_ASR
             status = runtime_status("Qwen3-ForcedAligner-0.6B", self.paths.models, backend)
         else:
-            backend = ASRBackendId(self.backend_combo.currentData())
             status = runtime_status(self.model_combo.currentText() or "small", self.paths.models, backend)
-        suffix = "" if status.whisperx_available or backend == ASRBackendId.QWEN3_ASR else " · WhisperX 未安装"
+        suffix = " · WhisperX 未安装" if workflow == WORKFLOW_WHISPERX and not status.whisperx_available else ""
         self.model_status_label.setText(status.message + suffix)
-        precise_index = self.mode_combo.findData(AlignmentMode.PRECISE.value)
+        precise_index = self.mode_combo.findData(WORKFLOW_WHISPERX)
         item = self.mode_combo.model().item(precise_index) if precise_index >= 0 else None
         if item:
-            item.setEnabled(status.whisperx_available and backend == ASRBackendId.FASTER_WHISPER)
+            item.setEnabled(status.whisperx_available)
 
-    def _backend_changed(self, *_args) -> None:
-        backend = ASRBackendId(self.backend_combo.currentData())
+    def _workflow_components(self) -> tuple[ASRBackendId, AlignmentMode]:
+        workflow = self.mode_combo.currentData() or WORKFLOW_FASTER_WHISPER
+        if workflow == WORKFLOW_WHISPERX:
+            return ASRBackendId.FASTER_WHISPER, AlignmentMode.PRECISE
+        if workflow == WORKFLOW_QWEN_ASR:
+            return ASRBackendId.QWEN3_ASR, AlignmentMode.BALANCED
+        if workflow == WORKFLOW_QWEN_FORCED:
+            return ASRBackendId.QWEN3_ASR, AlignmentMode.QWEN_FORCED
+        return ASRBackendId.FASTER_WHISPER, AlignmentMode.BALANCED
+
+    def _selected_language_code(self) -> str:
+        value = self.language_combo.currentData()
+        return str(value) if value else self.language_combo.currentText().strip()
+
+    def _populate_language_options(self, preferred: str | None = None) -> None:
+        workflow = self.mode_combo.currentData() or WORKFLOW_FASTER_WHISPER
+        previous = preferred or self._selected_language_code() or "auto"
+        if workflow == WORKFLOW_QWEN_FORCED:
+            codes = QWEN_FORCED_LANGUAGE_CODES
+            allow_auto = False
+            self.language_label.setText("强制对齐语言")
+        elif workflow == WORKFLOW_QWEN_ASR:
+            codes = tuple(QWEN_ASR_LANGUAGE_NAMES)
+            allow_auto = True
+            self.language_label.setText("识别语言")
+        else:
+            codes = WHISPER_LANGUAGE_CODES
+            allow_auto = True
+            self.language_label.setText("识别语言")
+        self.language_combo.blockSignals(True)
+        self.language_combo.clear()
+        if allow_auto:
+            self.language_combo.addItem("自动检测 (auto)", "auto")
+        for code in codes:
+            name = QWEN_ASR_LANGUAGE_NAMES.get(code)
+            self.language_combo.addItem(f"{name} ({code})" if name else code, code)
+        selected = self.language_combo.findData(previous)
+        if selected < 0:
+            selected = self.language_combo.findData("auto" if allow_auto else "zh")
+        self.language_combo.setCurrentIndex(max(0, selected))
+        self.language_combo.blockSignals(False)
+
+    def _populate_model_options(self) -> None:
+        workflow = self.mode_combo.currentData() or WORKFLOW_FASTER_WHISPER
         current = self.model_combo.currentText()
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
-        if backend == ASRBackendId.QWEN3_ASR:
+        if workflow == WORKFLOW_QWEN_ASR:
             self.model_combo.addItems(["Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B"])
             desired = self.session.manifest.qwen_model if self.session else "Qwen3-ASR-0.6B"
+            self.model_combo.setEditable(False)
+            self.model_combo.setEnabled(True)
+        elif workflow == WORKFLOW_QWEN_FORCED:
+            self.model_combo.addItem("Qwen3-ForcedAligner-0.6B")
+            desired = "Qwen3-ForcedAligner-0.6B"
+            self.model_combo.setEditable(False)
+            self.model_combo.setEnabled(False)
         else:
             self.model_combo.addItems(["small", "medium", "large-v3", "turbo"])
             desired = self.session.manifest.whisper_model if self.session else (current or "small")
+            self.model_combo.setEditable(True)
+            self.model_combo.setEnabled(True)
         self.model_combo.setCurrentText(desired)
         self.model_combo.blockSignals(False)
-        self._settings_changed()
 
     def _alignment_mode_changed(self, *_args) -> None:
-        mode = AlignmentMode(self.mode_combo.currentData())
-        forced = mode == AlignmentMode.QWEN_FORCED
+        workflow = self.mode_combo.currentData() or WORKFLOW_FASTER_WHISPER
+        forced = workflow == WORKFLOW_QWEN_FORCED
+        self._populate_model_options()
+        self._populate_language_options(self.session.manifest.language if self.session else None)
         if hasattr(self, "recognize_button"):
             self.recognize_button.setText(
-                "Qwen 强制对齐整个章节" if forced else "识别并自动对齐"
+                "Qwen 强制对齐整个章节" if forced else "运行识别后对齐"
             )
             self.refresh_recognition_button.setVisible(not forced)
             self.clear_recognition_button.setVisible(not forced)
-        self.backend_combo.setEnabled(not forced)
-        self.model_combo.setEnabled(not forced)
         self._settings_changed()
         self._update_model_status()
 

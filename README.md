@@ -10,7 +10,7 @@ AudioAlignTool 是用于电子书文本与有声书时间轴对齐的 Windows �
 - TXT/EPUB，以及 MP3、M4A、M4B、AAC、WAV、FLAC、OGG、Opus。M4B 内嵌章节作为同一资源中的时间切片参与配对。
 - 章节—音频配对管理器：重新指定、取消、整体 ±1 偏移、自动匹配和一次事务应用。
 - 句子—时间关系编辑：选区绑定、平均分配、开始/结束、拆分、合并、清除和删除；重叠以红色显示，不会静默移动其他句段。
-- faster-whisper 是基础依赖；WhisperX 只用于可选精确模式。CPU 默认 INT8，CTranslate2 检测到 CUDA 时自动使用 GPU。
+- faster-whisper 是基础识别后对齐后端；WhisperX 会在 Whisper 识别后再使用声学对齐模型细化时间。CPU 默认 INT8，CTranslate2 检测到 CUDA 时自动使用 GPU。
 - 静音检测为时间边界候选，Whisper 用于确定文本位置；人工锁定内容不会被自动流程覆盖。
 - HTML、SRT、WebVTT 和 schema v2 JSON 导出。
 
@@ -55,7 +55,7 @@ powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
 .\start.bat
 ```
 
-Whisper 模型在首次确认下载后写入 `models/<模型名>/`，之后可离线运行。精确模式另行安装可选组件：
+Whisper 模型在首次确认下载后写入 `models/<模型名>/`，之后可离线运行。WhisperX 工作流另行安装可选组件：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install whisperx
@@ -65,7 +65,7 @@ Whisper 模型在首次确认下载后写入 `models/<模型名>/`，之后可�
 
 1. 新建以项目名命名的项目，导入 TXT/EPUB 和音频；也可只导入音频。
 2. 在“章节与音频配对”中确认文件或 M4B 内嵌章节的对应关系。
-3. 选择语言、模型和识别模式，执行识别与文本匹配。
+3. 选择对齐方式、模型和语言。可选 faster-whisper/WhisperX/Qwen3-ASR 的识别后对齐，或 Qwen ForcedAligner 的已知文本强制对齐。
 4. 检测静音，在频谱上框选、试听并拖动句段边界；按 Shift 拖动可临时关闭静音吸附。
 5. 在字幕表格或文章频谱视图中检查内容，保存项目并导出所需格式。
 
