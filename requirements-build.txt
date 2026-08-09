@@ -1,0 +1,4 @@
+-r requirements-lock.txt
+
+# 固定打包器版本，保证本地与 GitHub Actions 使用相同的 bootloader 和收集行为。
+pyinstaller==6.21.0

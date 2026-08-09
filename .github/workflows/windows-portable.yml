@@ -1,0 +1,79 @@
+name: Build Windows portable package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    concurrency:
+      group: windows-portable-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          python -m pip install --no-deps -e .
+
+      - name: Run tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+      - name: Select package version
+        id: version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path pyproject.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "Cannot read project version" }
+          $version = $match.Matches[0].Groups[1].Value
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}" -replace '^v', ''
+          } elseif ("${{ github.event_name }}" -eq "pull_request") {
+            $version = "${version}-pr.${{ github.event.pull_request.number }}.${{ github.run_number }}"
+          } else {
+            $version = "${version}-ci.${{ github.run_number }}"
+          }
+          "value=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build portable package
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          .\build-portable.ps1 -Python $python -Version "${{ steps.version.outputs.value }}" -SkipInstall -SkipTests -Clean
+
+      - name: Upload portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AudioAlignTool-${{ steps.version.outputs.value }}-Windows-x64-portable
+          path: |
+            artifacts/AudioAlignTool-*-Windows-x64-portable.zip
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30

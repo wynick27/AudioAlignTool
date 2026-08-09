@@ -1,0 +1,14 @@
+# Python 3.14 Windows reference environment used by bootstrap.ps1.
+numpy==2.3.5
+PySide6==6.11.1
+pyqtgraph==0.14.0
+av==18.0.0
+EbookLib==0.19
+beautifulsoup4==4.13.4
+faster-whisper==1.2.1
+ctranslate2==4.8.1
+tokenizers==0.23.1
+onnxruntime==1.28.0
+huggingface-hub==1.27.0
+qwen-asr==0.0.6
+modelscope==1.38.1

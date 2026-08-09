@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+artifacts/
+*.aatproj
+*.npz
+.work/
+logs/
+models/
+projects/
+settings.json
