@@ -32,6 +32,15 @@ class PortablePackagingTests(unittest.TestCase):
         self.assertIn("COLLECT(", spec_text)
         self.assertRegex(spec_text, re.compile(r"upx\s*=\s*False"))
 
+    def test_ci_validates_dependencies_and_skips_tests(self) -> None:
+        workflow_text = (ROOT / ".github" / "workflows" / "windows-portable.yml").read_text(encoding="utf-8")
+
+        self.assertIn("requirements-lock.txt", workflow_text)
+        self.assertIn("Failed to install locked build dependencies.", workflow_text)
+        self.assertIn("import numpy, PySide6, av, faster_whisper, qwen_asr", workflow_text)
+        self.assertNotIn("- name: Run tests", workflow_text)
+        self.assertIn("-SkipInstall -SkipTests -Clean", workflow_text)
+
     def test_portable_output_is_ignored(self) -> None:
         ignore_text = (ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("artifacts/", ignore_text.splitlines())
