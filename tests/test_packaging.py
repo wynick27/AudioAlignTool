@@ -41,6 +41,15 @@ class PortablePackagingTests(unittest.TestCase):
         self.assertNotIn("- name: Run tests", workflow_text)
         self.assertIn("-SkipInstall -SkipTests -Clean", workflow_text)
 
+    def test_tag_build_publishes_the_portable_archive(self) -> None:
+        workflow_text = (ROOT / ".github" / "workflows" / "windows-portable.yml").read_text(encoding="utf-8")
+
+        self.assertIn("name: Publish GitHub Release", workflow_text)
+        self.assertIn("contents: write", workflow_text)
+        self.assertIn("actions/download-artifact@v4", workflow_text)
+        self.assertIn('gh release create "$tag"', workflow_text)
+        self.assertIn('gh release upload "$tag"', workflow_text)
+
     def test_portable_output_is_ignored(self) -> None:
         ignore_text = (ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("artifacts/", ignore_text.splitlines())
