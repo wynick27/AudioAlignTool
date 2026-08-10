@@ -3,8 +3,11 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -61,6 +64,7 @@ from audioalign.core.asr import (
     Qwen3ForcedAligner,
     plan_audio_chunks,
     recognition_cache_key,
+    RuntimeStatus,
     runtime_status,
     transcriber_for_options,
 )
@@ -83,6 +87,7 @@ from audioalign.core.models import (
     TextSegment,
 )
 from audioalign.core.paths import ApplicationPaths, sanitize_project_name
+from audioalign.core.runtime import subprocess_runtime_environment
 from audioalign.core.spectrogram import (
     AudioVisualizationCache,
     build_audio_visualization_cache_from_slices,
@@ -90,6 +95,7 @@ from audioalign.core.spectrogram import (
 )
 from audioalign.core.storage import (
     ProjectExistsError,
+    ProjectRepository,
     ProjectSession,
     fingerprint_file,
     write_recognition_chunk,
@@ -128,6 +134,10 @@ class WorkerSignals(QObject):
     finished = Signal(object)
     failed = Signal(str)
     cancelled = Signal()
+
+
+class RuntimeProbeSignals(QObject):
+    finished = Signal(str, object)
 
 
 class TaskWorker(QRunnable):
@@ -305,6 +315,10 @@ class MainWindow(QMainWindow):
         self._editing_row = -1
         self._speed_warning_shown = False
         self._playback_row_update = False
+        self._runtime_probe_pending: set[str] = set()
+        self._runtime_probe_cache: dict[str, RuntimeStatus] = {}
+        self._runtime_probe_signals = RuntimeProbeSignals(self)
+        self._runtime_probe_signals.finished.connect(self._runtime_probe_finished)
 
         self.audio_output = QAudioOutput(self)
         self.audio_output.setVolume(0.9)
@@ -367,6 +381,17 @@ class MainWindow(QMainWindow):
         self.import_audio_action = QAction("导入音频/M4B…", self, triggered=self.import_audio)
         self.mapping_action = QAction("章节与音频配对…", self, triggered=self.edit_mappings)
         self.recognize_action = QAction("识别并对齐当前章节", self, triggered=self.recognize_current)
+        self.recognize_book_action = QAction(
+            "按当前识别方式处理全书（使用缓存）", self,
+            triggered=lambda: self.recognize_book(force=False),
+        )
+        self.refresh_book_action = QAction(
+            "按当前识别方式重新处理全书…", self,
+            triggered=lambda: self.recognize_book(force=True),
+        )
+        self.detect_book_silence_action = QAction(
+            "检测全书静音区", self, triggered=self.detect_book_silence,
+        )
         self.export_html_action = QAction("导出 HTML…", self, triggered=lambda: self.export_output("html"))
         self.export_srt_action = QAction("导出 SRT…", self, triggered=lambda: self.export_output("srt"))
         self.export_vtt_action = QAction("导出 VTT…", self, triggered=lambda: self.export_output("vtt"))
@@ -502,6 +527,12 @@ class MainWindow(QMainWindow):
         edit_menu.addActions([self.undo_action, self.redo_action, self.mapping_action])
         recognize_menu = self.menuBar().addMenu("识别")
         recognize_menu.addAction(self.recognize_action)
+        book_menu = recognize_menu.addMenu("全书批量处理")
+        book_menu.addActions([
+            self.recognize_book_action,
+            self.refresh_book_action,
+            self.detect_book_silence_action,
+        ])
         options_menu = self.menuBar().addMenu("选项")
         options_menu.addAction("快捷键…", self.edit_shortcuts)
         options_menu.addAction(self.start_normal_speed_action)
@@ -1228,9 +1259,35 @@ class MainWindow(QMainWindow):
             clip_end_ms=link.source_end_ms if link else None,
         )
 
-    def _recognition_audio_signature(self) -> str:
+    def _chapter_audio_parts(
+        self, chapter_id: int,
+    ) -> tuple[list[tuple[ChapterAudioLink, AudioAsset, Path, int, int]], str]:
+        """Resolve every ordered audio slice for a chapter without changing the UI."""
+        if not self.session:
+            return [], "项目尚未打开"
+        parts: list[tuple[ChapterAudioLink, AudioAsset, Path, int, int]] = []
+        local_cursor = 0
+        links = self.session.repository.chapter_links(chapter_id)
+        if not links:
+            return [], "没有音频配对"
+        for link in links:
+            asset = self.session.repository.audio(link.audio_id)
+            path = self.session.resolve_audio(asset)
+            if not asset or not path:
+                return [], "找不到已配对的音频文件"
+            duration = max(0, link.source_end_ms - link.source_start_ms)
+            if duration <= 0:
+                return [], "音频切片时长无效"
+            parts.append((link, asset, path, local_cursor, local_cursor + duration))
+            local_cursor += duration
+        return parts, ""
+
+    @staticmethod
+    def _parts_audio_signature(
+        parts: list[tuple[ChapterAudioLink, AudioAsset, Path, int, int]],
+    ) -> str:
         values: list[str] = []
-        for link, asset, path, local_start, local_end in self.current_parts:
+        for link, asset, path, local_start, local_end in parts:
             fingerprint = asset.fingerprint
             if not fingerprint:
                 try:
@@ -1242,6 +1299,9 @@ class MainWindow(QMainWindow):
                 f"{asset.id}:{fingerprint}:{link.source_start_ms}:{link.source_end_ms}:{local_start}:{local_end}"
             )
         return hashlib.sha256("|".join(values).encode("utf-8")).hexdigest()
+
+    def _recognition_audio_signature(self) -> str:
+        return self._parts_audio_signature(self.current_parts)
 
     def _confirm_qwen_cpu_run(self, operation: str, duration_ms: int) -> bool:
         """Allow Qwen on CPU, but make the potentially very long wait explicit."""
@@ -1393,6 +1453,207 @@ class MainWindow(QMainWindow):
             self._apply_recognition_tokens(chapter_id, tokens, refreshed)
 
         self.tasks.submit("识别 / 原文对比 / 分块缓存", job, done)
+
+    def recognize_book(self, force: bool = False) -> None:
+        """Recognize every paired chapter sequentially while reusing one loaded model."""
+        if not self.session:
+            return
+        if self.mode_combo.currentData() == WORKFLOW_QWEN_FORCED:
+            self._show_error(
+                "全书批量处理请先选择 faster-whisper、WhisperX 或 Qwen3-ASR 的“识别后对齐”。\n\n"
+                "Qwen3-ASR 已在内部使用 ForcedAligner 生成识别稿时间戳；显式 ForcedAligner 仍用于当前句、"
+                "选定范围、锚点向后或单章，避免书籍前言与音频不一致时把误差扩散到全书。"
+            )
+            return
+
+        options = copy.copy(self._asr_options())
+        options.clip_start_ms = 0
+        options.clip_end_ms = None
+        status = runtime_status(options.model, self.paths.models, options.backend)
+        if not status.runtime_available:
+            self._show_error(status.message)
+            return
+        if not status.model_available:
+            answer = QMessageBox.question(
+                self,
+                "下载识别模型",
+                f"模型 {options.model} 尚未下载。是否在批处理开始时下载到\n{self.paths.models}？",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if (options.backend == ASRBackendId.FASTER_WHISPER
+                and options.mode == AlignmentMode.PRECISE and not status.whisperx_available):
+            self._show_error("当前工作流需要 WhisperX；请安装后再执行全书批处理。")
+            return
+
+        prepared = []
+        skipped: list[str] = []
+        settings = self._silence_settings()
+        for chapter in self.session.repository.chapters():
+            chapter_id = chapter.id or 0
+            parts, error = self._chapter_audio_parts(chapter_id)
+            if not parts:
+                skipped.append(f"{chapter.title}：{error}")
+                continue
+            silence_signature = self._parts_silence_signature(parts, settings)
+            candidates = self.session.repository.silence_candidates(chapter_id, silence_signature)
+            prepared.append((chapter_id, chapter.title, parts, candidates))
+        if not prepared:
+            self._show_error("全书没有可处理的章节；请先在配对管理器中建立章节与音频关系。")
+            return
+
+        total_duration = sum(parts[-1][4] for _chapter_id, _title, parts, _candidates in prepared)
+        if options.backend == ASRBackendId.QWEN3_ASR and not status.cuda_available:
+            if not self._confirm_qwen_cpu_run("Qwen3-ASR 全书识别", total_duration):
+                return
+        duration_text = f"{total_duration / 3_600_000:.1f} 小时"
+        skip_text = f"\n将跳过 {len(skipped)} 个未配对或音频缺失章节。" if skipped else ""
+        action_text = "强制重新识别并覆盖未锁定自动结果" if force else "优先使用已有分块缓存"
+        answer = QMessageBox.question(
+            self,
+            "全书批量处理",
+            f"将按当前方式处理 {len(prepared)} 个章节（音频约 {duration_text}）。\n"
+            f"策略：{action_text}。{skip_text}\n\n"
+            "锁定句段不会被覆盖；取消时保留已经完整完成的章节和识别分块。是否开始？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        database = Path(self.session.repository.database)
+        alignment_language = options.language or self.session.manifest.language
+        total_chapters = len(prepared)
+        self._mark_dirty()
+
+        def job(progress):
+            repository = ProjectRepository(database)
+            transcriber = transcriber_for_options(options)
+            completed_count = 0
+            cache_count = 0
+            last_device = None
+            try:
+                for chapter_index, (chapter_id, title, parts, candidates) in enumerate(prepared):
+                    chapter_prefix = f"全书 {chapter_index + 1}/{total_chapters} · {title}"
+                    progress(chapter_index / total_chapters, f"{chapter_prefix} · 准备")
+                    audio_signature = self._parts_audio_signature(parts)
+                    cache_key, parameters_json = recognition_cache_key(audio_signature, options)
+                    if force:
+                        repository.reset_recognition_run(cache_key)
+                    run = repository.ensure_recognition_run(
+                        chapter_id=chapter_id,
+                        cache_key=cache_key,
+                        backend=options.backend.value,
+                        model=options.model,
+                        language=options.language or "auto",
+                        audio_signature=audio_signature,
+                        parameters_json=parameters_json,
+                    )
+                    used_cache = run.status == "complete" and not force
+                    if not used_cache:
+                        planned = []
+                        chunk_position = 0
+                        for link, _asset, path, local_start, local_end in parts:
+                            part_candidates = [
+                                candidate for candidate in candidates
+                                if local_start < candidate.time_ms < local_end
+                            ]
+                            for chunk in plan_audio_chunks(local_start, local_end, part_candidates):
+                                planned.append((chunk_position, chunk, link, path, local_start))
+                                chunk_position += 1
+                        completed_positions = {
+                            chunk.position for chunk in repository.recognition_chunks(run.id or 0)
+                            if chunk.status == "complete"
+                        }
+                        chunk_total = max(1, len(planned))
+                        for chunk_index, (position, chunk, link, path, local_start) in enumerate(planned):
+                            if position in completed_positions:
+                                local_fraction = (chunk_index + 1) / chunk_total
+                                progress(
+                                    (chapter_index + local_fraction) / total_chapters,
+                                    f"{chapter_prefix} · 缓存块 {chunk_index + 1}/{chunk_total}",
+                                )
+                                continue
+                            part_options = copy.copy(options)
+                            part_options.clip_start_ms = link.source_start_ms + (chunk.start_ms - local_start)
+                            part_options.clip_end_ms = link.source_start_ms + (chunk.end_ms - local_start)
+                            started = time.monotonic()
+                            chunk_tokens = transcriber.transcribe(
+                                path,
+                                chapter_id,
+                                part_options,
+                                lambda value, message, ci=chunk_index, ct=chunk_total: progress(
+                                    -1.0 if value < 0 else
+                                    (chapter_index + (ci + value) / ct) / total_chapters,
+                                    f"{chapter_prefix} · {message} · {ci + 1}/{ct}",
+                                ),
+                            )
+                            kept = []
+                            for token in chunk_tokens:
+                                token.start_ms += chunk.start_ms
+                                token.end_ms += chunk.start_ms
+                                midpoint = (token.start_ms + token.end_ms) // 2
+                                if chunk.core_start_ms <= midpoint <= chunk.core_end_ms:
+                                    token.position = len(kept)
+                                    kept.append(token)
+                            record = RecognitionChunk(
+                                None, run.id or 0, position, chunk.start_ms, chunk.end_ms,
+                                chunk.core_start_ms, chunk.core_end_ms, "complete",
+                                "".join(token.text for token in kept),
+                                round((time.monotonic() - started) * 1000), "",
+                            )
+                            write_recognition_chunk(database, record, kept)
+                        last_device = getattr(transcriber, "last_device_info", None)
+                        if last_device is not None:
+                            repository.complete_recognition_run(run.id or 0, last_device)
+                    else:
+                        cache_count += 1
+
+                    tokens = repository.recognition_tokens(run.id or 0)
+                    for token_position, token in enumerate(tokens):
+                        token.chapter_id = chapter_id
+                        token.position = token_position
+                    current = repository.segments(chapter_id)
+                    aligned = (
+                        align_segments_to_tokens(current, tokens, language=alignment_language)
+                        if current else segments_from_asr_tokens(tokens, chapter_id=chapter_id)
+                    )
+                    if candidates:
+                        aligned = snap_boundaries(
+                            aligned, candidates,
+                            window_ms=settings.snap_window_ms,
+                            padding_ms=settings.boundary_padding_ms,
+                        )
+                    anchors = anchors_from_segments_tokens(aligned, tokens, language=alignment_language)
+                    repository.replace_recognition_alignment(
+                        chapter_id,
+                        tokens,
+                        aligned,
+                        anchors,
+                    )
+                    completed_count += 1
+                    progress(
+                        (chapter_index + 1) / total_chapters,
+                        f"{chapter_prefix} · 已提交完整结果",
+                    )
+                return completed_count, cache_count, skipped, last_device
+            finally:
+                repository.close()
+
+        def done(payload):
+            if not self.session or Path(self.session.repository.database) != database:
+                return
+            completed_count, cache_count, skipped_chapters, device = payload
+            current_row = self.chapter_list.currentRow()
+            if current_row >= 0:
+                self._chapter_selected(current_row)
+            if device is not None:
+                self.model_status_label.setText(device.display_text)
+            self.status_stage.setText(
+                f"全书批量处理完成 · {completed_count}/{total_chapters} 章 · "
+                f"命中完整缓存 {cache_count} 章 · 跳过 {len(skipped_chapters)} 章"
+            )
+            self._mark_dirty()
+
+        self.tasks.submit("全书识别 / 原文对比 / 自动对齐", job, done)
 
     def _apply_recognition_tokens(self, chapter_id: int, tokens, run=None) -> None:
         if not self.session or chapter_id != self.current_chapter_id:
@@ -1830,18 +2091,113 @@ class MainWindow(QMainWindow):
 
         self.tasks.submit(f"Qwen ForcedAligner · {task_scope}", job, done)
 
-    def _silence_signature(self) -> str:
-        settings = self._silence_settings()
-        parts = "|".join(
+    @staticmethod
+    def _parts_silence_signature(
+        parts: list[tuple[ChapterAudioLink, AudioAsset, Path, int, int]],
+        settings: SilenceSettings,
+    ) -> str:
+        part_signature = "|".join(
             f"{link.audio_id}:{link.source_start_ms}:{link.source_end_ms}"
-            for link, _asset, _path, _local_start, _local_end in self.current_parts
+            for link, _asset, _path, _local_start, _local_end in parts
         )
         raw = (
-            f"{parts}|vad={settings.vad_threshold:.3f}|min={settings.min_silence_ms}|"
+            f"{part_signature}|vad={settings.vad_threshold:.3f}|min={settings.min_silence_ms}|"
             f"pad={settings.boundary_padding_ms}|snap={settings.snap_window_ms}|"
             f"energy={settings.energy_percentile:.3f}"
         )
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _silence_signature(self) -> str:
+        return self._parts_silence_signature(self.current_parts, self._silence_settings())
+
+    def detect_book_silence(self) -> None:
+        if not self.session:
+            return
+        settings = self._silence_settings()
+        prepared = []
+        skipped = []
+        for chapter in self.session.repository.chapters():
+            chapter_id = chapter.id or 0
+            parts, error = self._chapter_audio_parts(chapter_id)
+            if parts:
+                prepared.append((chapter_id, chapter.title, parts))
+            else:
+                skipped.append(f"{chapter.title}：{error}")
+        if not prepared:
+            self._show_error("全书没有已配对且可读取的音频章节。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "检测全书静音区",
+            f"将按当前 VAD/静音参数检测 {len(prepared)} 个章节。"
+            f"{' 将跳过 ' + str(len(skipped)) + ' 章。' if skipped else ''}\n\n"
+            "检测只更新静音候选标记，不会直接修改句段时间。是否开始？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        database = Path(self.session.repository.database)
+        total_chapters = len(prepared)
+        self._mark_dirty()
+
+        def job(progress):
+            repository = ProjectRepository(database)
+            counts: list[tuple[int, int]] = []
+            try:
+                for chapter_index, (chapter_id, title, parts) in enumerate(prepared):
+                    result = []
+                    part_total = max(1, len(parts))
+                    for part_index, (link, _asset, path, local_start, _local_end) in enumerate(parts):
+                        progress(
+                            (chapter_index + part_index / part_total) / total_chapters,
+                            f"全书 {chapter_index + 1}/{total_chapters} · {title} · "
+                            f"解码/检测 {part_index + 1}/{part_total}",
+                        )
+                        samples, rate = decode_audio_mono(
+                            path, 16000,
+                            start_ms=link.source_start_ms,
+                            end_ms=link.source_end_ms,
+                        )
+                        local_candidates = detect_silence_candidates(samples, rate, settings)
+                        for candidate in local_candidates:
+                            candidate.time_ms += local_start
+                            if candidate.start_ms is not None:
+                                candidate.start_ms += local_start
+                            if candidate.end_ms is not None:
+                                candidate.end_ms += local_start
+                            result.append(candidate)
+                    repository.replace_silence_candidates(
+                        chapter_id,
+                        result,
+                        self._parts_silence_signature(parts, settings),
+                    )
+                    counts.append((chapter_id, len(result)))
+                    progress(
+                        (chapter_index + 1) / total_chapters,
+                        f"全书 {chapter_index + 1}/{total_chapters} · {title} · {len(result)} 个候选",
+                    )
+                return counts, skipped
+            finally:
+                repository.close()
+
+        def done(payload):
+            if not self.session or Path(self.session.repository.database) != database:
+                return
+            counts, skipped_chapters = payload
+            if self.current_chapter_id is not None:
+                parts, _error = self._chapter_audio_parts(self.current_chapter_id)
+                signature = self._parts_silence_signature(parts, settings) if parts else ""
+                self.silence_candidates = self.session.repository.silence_candidates(
+                    self.current_chapter_id, signature,
+                ) if signature else []
+                self.spectrogram.set_silences(self.silence_candidates)
+                self.overview.set_silences(self.silence_candidates)
+            self.status_stage.setText(
+                f"全书静音检测完成 · {len(counts)}/{total_chapters} 章 · "
+                f"{sum(count for _chapter_id, count in counts)} 个候选 · 跳过 {len(skipped_chapters)} 章"
+            )
+            self._mark_dirty()
+
+        self.tasks.submit("检测全书静音区", job, done)
 
     def detect_silence(self, after=None) -> None:
         if not callable(after):
@@ -2708,13 +3064,82 @@ class MainWindow(QMainWindow):
         self._update_model_status()
 
     def _update_model_status(self) -> None:
+        workflow, backend, model = self._runtime_status_target()
+        key = f"{backend.value}|{model}"
+        status = self._runtime_probe_cache.get(key)
+        if status is None:
+            status = runtime_status(model, self.paths.models, backend, probe_device=False)
+            self._schedule_runtime_probe(key, model, backend)
+        self._render_model_status(workflow, status)
+
+    def _runtime_status_target(self) -> tuple[str, ASRBackendId, str]:
         workflow = self.mode_combo.currentData() or WORKFLOW_FASTER_WHISPER
         backend, _mode = self._workflow_components()
         if workflow == WORKFLOW_QWEN_FORCED:
             backend = ASRBackendId.QWEN3_ASR
-            status = runtime_status("Qwen3-ForcedAligner-0.6B", self.paths.models, backend)
+            model = "Qwen3-ForcedAligner-0.6B"
         else:
-            status = runtime_status(self.model_combo.currentText() or "small", self.paths.models, backend)
+            model = self.model_combo.currentText() or "small"
+        return workflow, backend, model
+
+    def _schedule_runtime_probe(self, key: str, model: str, backend: ASRBackendId) -> None:
+        if key in self._runtime_probe_pending:
+            return
+        self._runtime_probe_pending.add(key)
+
+        def launch() -> None:
+            def probe() -> None:
+                try:
+                    if getattr(sys, "frozen", False):
+                        command = [sys.executable, "--runtime-probe", backend.value, model, str(self.paths.models)]
+                    else:
+                        command = [
+                            sys.executable,
+                            str(self.paths.root / "run.py"),
+                            "--runtime-probe",
+                            backend.value,
+                            model,
+                            str(self.paths.models),
+                        ]
+                    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    environment = subprocess_runtime_environment()
+                    environment["PYTHONIOENCODING"] = "utf-8"
+                    result = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=20,
+                        check=True,
+                        env=environment,
+                        creationflags=creation_flags,
+                    )
+                    payload = json.loads(result.stdout.strip().splitlines()[-1])
+                    status = RuntimeStatus(**payload)
+                except Exception as exc:
+                    status = exc
+                try:
+                    self._runtime_probe_signals.finished.emit(key, status)
+                except RuntimeError:
+                    pass
+
+            # Only the child process imports CUDA/PyTorch.  This thread waits
+            # for its JSON result and therefore cannot hold Qt's Python thread.
+            threading.Thread(target=probe, name="audioalign-runtime-probe", daemon=True).start()
+
+        QTimer.singleShot(100, launch)
+
+    def _runtime_probe_finished(self, key: str, status) -> None:
+        self._runtime_probe_pending.discard(key)
+        if isinstance(status, Exception):
+            return
+        self._runtime_probe_cache[key] = status
+        workflow, backend, model = self._runtime_status_target()
+        if key == f"{backend.value}|{model}":
+            self._render_model_status(workflow, status)
+
+    def _render_model_status(self, workflow: str, status) -> None:
         suffix = " · WhisperX 未安装" if workflow == WORKFLOW_WHISPERX and not status.whisperx_available else ""
         self.model_status_label.setText(status.message + suffix)
         precise_index = self.mode_combo.findData(WORKFLOW_WHISPERX)

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -14,8 +16,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PySide6.QtCore import QRect, Qt
     from PySide6.QtGui import QImage, QPainter
-    from PySide6.QtWidgets import QApplication
-    from audioalign.core.models import AlignmentMode, AudioAsset, AudioVisualizationMode, Chapter, ChapterAudioLink, PlaybackFollowState, SegmentStatus, TextSegment
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from audioalign.core.models import ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentStatus, TextSegment
     from audioalign.core.paths import ApplicationPaths
     from audioalign.core.spectrogram import build_spectrogram_cache_from_slices
     from audioalign.core.storage import ProjectSession
@@ -236,6 +238,75 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertTrue((project / "project.sqlite3").is_file())
             for name in ("source", "media", "cache"):
                 self.assertTrue((project / name).is_dir())
+            window.close()
+
+    def test_book_batch_recognition_processes_paired_chapters_with_one_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            audio = root / "book.wav"
+            rate = 16000
+            with wave.open(str(audio), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(rate)
+                handle.writeframes(np.zeros(rate * 2, dtype=np.int16).tobytes())
+            session = ProjectSession.create("batch", root / "project")
+            audio_id = session.repository.add_audio(
+                AudioAsset(None, str(audio), duration_ms=1000, sample_rate=rate, channels=1, format="wav")
+            )
+            chapter_ids = []
+            for position in range(2):
+                chapter_id = session.repository.add_chapter(Chapter(None, f"chapter {position + 1}", position))
+                chapter_ids.append(chapter_id)
+                session.repository.replace_segments(
+                    chapter_id, [TextSegment(None, chapter_id, 0, "hello")]
+                )
+                session.repository.set_chapter_links(
+                    chapter_id,
+                    [ChapterAudioLink(None, chapter_id, audio_id, 0, position * 1000, (position + 1) * 1000, 1.0)],
+                )
+
+            class FakeTranscriber:
+                def __init__(self):
+                    self.calls = 0
+                    self.last_device_info = InferenceDeviceInfo(
+                        "fake", "small", actual_device="cpu", compute_type="int8"
+                    )
+
+                def transcribe(self, _path, chapter_id, _options, progress):
+                    self.calls += 1
+                    progress(1.0, "fake recognition")
+                    return [ASRToken(None, chapter_id, 0, "hello", 100, 900, 0.95)]
+
+            fake = FakeTranscriber()
+            ready = SimpleNamespace(
+                runtime_available=True,
+                model_available=True,
+                whisperx_available=True,
+                cuda_available=True,
+                message="ready",
+            )
+            window = MainWindow()
+            window.session = session
+            window.mode_combo.setCurrentIndex(window.mode_combo.findData(WORKFLOW_FASTER_WHISPER))
+            with (
+                patch("audioalign.gui.main_window.runtime_status", return_value=ready),
+                patch("audioalign.gui.main_window.transcriber_for_options", return_value=fake),
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+            ):
+                window.recognize_book()
+                deadline = time.monotonic() + 10
+                while (window.tasks.current or window.tasks.queue) and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+                self.app.processEvents()
+
+            self.assertFalse(window.tasks.current)
+            self.assertEqual(2, fake.calls)
+            for chapter_id in chapter_ids:
+                segment = session.repository.segments(chapter_id)[0]
+                self.assertEqual((100, 900), (segment.start_ms, segment.end_ms))
+                self.assertEqual("hello", session.repository.asr_tokens(chapter_id)[0].text)
             window.close()
 
     def test_inline_audio_visibility_and_article_text_selection(self) -> None:

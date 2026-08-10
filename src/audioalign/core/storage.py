@@ -630,6 +630,56 @@ class ProjectRepository:
                 anchor_rows,
             )
 
+    def replace_recognition_alignment(
+        self,
+        chapter_id: int,
+        tokens: Sequence[ASRToken],
+        segments: Sequence[TextSegment],
+        anchors: Sequence[TextAudioAnchor],
+    ) -> None:
+        """Atomically publish one chapter's complete ASR and alignment result."""
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM text_audio_anchors WHERE chapter_id=?", (chapter_id,))
+            connection.execute("DELETE FROM asr_tokens WHERE chapter_id=?", (chapter_id,))
+            connection.execute("DELETE FROM text_segments WHERE chapter_id=?", (chapter_id,))
+            connection.executemany(
+                "INSERT INTO asr_tokens(chapter_id,position,text,start_ms,end_ms,probability) VALUES (?,?,?,?,?,?)",
+                [
+                    (chapter_id, token.position, token.text, token.start_ms, token.end_ms, token.probability)
+                    for token in tokens
+                ],
+            )
+            inserted: list[tuple[int, int, int]] = []
+            source_offset = 0
+            for segment in segments:
+                cursor = connection.execute(
+                    """INSERT INTO text_segments
+                    (chapter_id,position,text,start_ms,end_ms,confidence,status,locked)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (chapter_id, segment.position, segment.text, segment.start_ms, segment.end_ms,
+                     segment.confidence, segment.status.value, int(segment.locked)),
+                )
+                end_offset = source_offset + len(segment.text)
+                inserted.append((source_offset, end_offset, int(cursor.lastrowid)))
+                source_offset = end_offset
+            anchor_rows = []
+            for anchor in anchors:
+                segment_id = next(
+                    (item_id for start, end, item_id in inserted
+                     if start <= anchor.source_start_char < max(start + 1, end)),
+                    None,
+                )
+                anchor_rows.append((
+                    chapter_id, segment_id, anchor.source_start_char, anchor.source_end_char,
+                    anchor.start_ms, anchor.end_ms, anchor.confidence, anchor.method,
+                ))
+            connection.executemany(
+                """INSERT INTO text_audio_anchors
+                (chapter_id,segment_id,source_start_char,source_end_char,start_ms,end_ms,confidence,method)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                anchor_rows,
+            )
+
 
 class ProjectSession:
     def __init__(self, root: Path, manifest: ProjectManifest, *, archive_path: Path | None = None) -> None:

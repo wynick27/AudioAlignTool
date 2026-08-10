@@ -141,6 +141,8 @@ def runtime_status(
     model: str,
     model_root: str | Path,
     backend: ASRBackendId | str = ASRBackendId.FASTER_WHISPER,
+    *,
+    probe_device: bool = True,
 ) -> RuntimeStatus:
     import importlib.util
 
@@ -151,7 +153,7 @@ def runtime_status(
     cuda = False
     compute_types: tuple[str, ...] = ()
     paths = bootstrap_native_runtime()
-    if runtime and backend == ASRBackendId.FASTER_WHISPER:
+    if probe_device and runtime and backend == ASRBackendId.FASTER_WHISPER:
         cuda = cuda_runtime_available()
         if cuda:
             try:
@@ -159,7 +161,7 @@ def runtime_status(
                 compute_types = tuple(sorted(ctranslate2.get_supported_compute_types("cuda", 0)))
             except (ImportError, RuntimeError):
                 pass
-    elif runtime:
+    elif probe_device and runtime:
         try:
             import torch  # type: ignore
             cuda = bool(torch.cuda.is_available())
@@ -176,7 +178,7 @@ def runtime_status(
         message = f"{runtime_module} 运行库缺失"
     elif not available:
         device_preview = ""
-        if backend == ASRBackendId.QWEN3_ASR:
+        if probe_device and backend == ASRBackendId.QWEN3_ASR:
             if cuda:
                 device_name = ""
                 try:
@@ -197,6 +199,8 @@ def runtime_status(
                     reason = "PyTorch 缺失"
                 device_preview = f" · 将使用 CPU · float32 · {reason}"
         message = f"模型 {model} 尚未下载{device_preview}"
+    elif not probe_device:
+        message = f"模型 {model} 已就绪 · 设备状态检测中（不阻塞界面）"
     elif cuda:
         device_name = ""
         if backend == ASRBackendId.QWEN3_ASR:
