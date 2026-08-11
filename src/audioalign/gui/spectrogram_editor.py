@@ -20,6 +20,9 @@ from audioalign.core.models import (
 from audioalign.core.spectrogram import AudioVisualizationCache
 
 
+EMPTY_TIMELINE_MS = 30_000
+
+
 def _colour_map() -> np.ndarray:
     stops = np.array([0, 55, 120, 185, 235, 255], dtype=float)
     colours = np.array(
@@ -82,11 +85,22 @@ class InteractiveViewBox(pg.ViewBox):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.setAcceptHoverEvents(True)
+        self._last_hover_global = None
 
     def hoverEvent(self, event) -> None:
         if event.isExit():
+            self._last_hover_global = None
             self.hoverLeft.emit()
         else:
+            # ViewBox transforms during centred playback can synthesize hover
+            # events under a stationary mouse.  They must not change the edit
+            # cursor or its hit target.
+            global_position = QCursor.pos()
+            if self._last_hover_global == global_position:
+                event.acceptClicks(Qt.MouseButton.LeftButton)
+                event.acceptDrags(Qt.MouseButton.LeftButton)
+                return
+            self._last_hover_global = global_position
             point = self.mapSceneToView(event.scenePos())
             self.hoverMoved.emit(float(point.x()))
         event.acceptClicks(Qt.MouseButton.LeftButton)
@@ -158,6 +172,8 @@ class AudioVisualizerEditor(QWidget):
     selectionChanged = Signal(int, int)
     segmentSelected = Signal(int, int)
     segmentDoubleClicked = Signal(int)
+    timeActivated = Signal(int, int, int)
+    segmentDoubleClickedAt = Signal(int, int)
     boundaryDragStarted = Signal()
     boundaryMoved = Signal(int, str, int, bool)
     segmentShiftRequested = Signal(int, int)
@@ -173,14 +189,22 @@ class AudioVisualizerEditor(QWidget):
     deleteRequested = Signal()
     clearTimingRequested = Signal()
     nextSilenceRequested = Signal()
+    playCurrentRequested = Signal()
+    editTextRequested = Signal()
+    splitPunctuationRequested = Signal()
+    lockRequested = Signal()
+    restoreSourceRequested = Signal()
+    insertBeforeRequested = Signal()
+    insertAfterRequested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setMinimumHeight(260)
         self.cache: AudioVisualizationCache | None = None
-        self.duration_ms = 1
+        self.has_audio = False
+        self.duration_ms = EMPTY_TIMELINE_MS
         self.view_start = 0
-        self.view_end = 1
+        self.view_end = EMPTY_TIMELINE_MS
         self.playhead = 0
         self.selection: SelectionRange | None = None
         self.segments: list[TextSegment] = []
@@ -228,6 +252,7 @@ class AudioVisualizerEditor(QWidget):
         self.image.setLevels((0, 255))
         self.spectrum_pane.plot.addItem(self.image)
         self.set_mode(self.mode)
+        self.set_cache(None)
 
     @property
     def plot(self) -> pg.PlotWidget:
@@ -297,8 +322,12 @@ class AudioVisualizerEditor(QWidget):
 
     def set_cache(self, cache: AudioVisualizationCache | None, duration_ms: int | None = None) -> None:
         self.cache = cache
+        self.has_audio = cache is not None or (duration_ms is not None and duration_ms > 0)
         self._rendered_start = self._rendered_end = self._rendered_span = -1
-        self.duration_ms = max(1, duration_ms or (cache.metadata.duration_ms if cache else 1))
+        self.duration_ms = (
+            max(1, duration_ms or (cache.metadata.duration_ms if cache else 1))
+            if self.has_audio else EMPTY_TIMELINE_MS
+        )
         self.view_start, self.view_end = 0, min(self.duration_ms, 30_000)
         for pane in self._panes:
             pane.plot.setLimits(xMin=-self.duration_ms, xMax=self.duration_ms * 2)
@@ -319,7 +348,7 @@ class AudioVisualizerEditor(QWidget):
                 item.setVisible(self.silences_visible)
 
     def set_playhead(self, milliseconds: int) -> None:
-        self.playhead = max(0, min(self.duration_ms, milliseconds))
+        self.playhead = max(0, min(self.duration_ms, milliseconds)) if self.has_audio else 0
         self._update_playhead_lines()
 
     def _update_playhead_lines(self) -> None:
@@ -341,6 +370,8 @@ class AudioVisualizerEditor(QWidget):
         self.selectionChanged.emit(0, 0)
 
     def set_time_range(self, start_ms: int, end_ms: int) -> None:
+        if not self.has_audio:
+            start_ms, end_ms = 0, EMPTY_TIMELINE_MS
         span = max(500, end_ms - start_ms)
         minimum = -span // 2
         maximum_start = self.duration_ms - span // 2
@@ -382,6 +413,9 @@ class AudioVisualizerEditor(QWidget):
                     line.setVisible(False)
 
     def focus_time(self, milliseconds: int, span_ms: int = 30_000) -> None:
+        if not self.has_audio:
+            self.set_time_range(0, EMPTY_TIMELINE_MS)
+            return
         span = min(max(self.duration_ms, 500), max(500, span_ms))
         self.set_time_range(milliseconds - span // 2, milliseconds + span // 2)
 
@@ -413,6 +447,10 @@ class AudioVisualizerEditor(QWidget):
             self.follow_playhead(self.playhead, force=True)
 
     def follow_playhead(self, milliseconds: int, *, force: bool = False) -> None:
+        if not self.has_audio:
+            self.playhead = 0
+            self._update_playhead_lines()
+            return
         milliseconds = max(0, min(self.duration_ms, milliseconds))
         if self.follow_state != PlaybackFollowState.FOLLOWING:
             self.set_playhead(milliseconds)
@@ -609,7 +647,7 @@ class AudioVisualizerEditor(QWidget):
         cursors = {
             "start": Qt.CursorShape.SizeHorCursor,
             "end": Qt.CursorShape.SizeHorCursor,
-            "body": Qt.CursorShape.OpenHandCursor,
+            "body": Qt.CursorShape.ArrowCursor,
             "selection": Qt.CursorShape.CrossCursor,
         }
         view.setCursor(QCursor(cursors[target.kind]))
@@ -639,6 +677,8 @@ class AudioVisualizerEditor(QWidget):
                 )
 
     def _drag_start(self, seconds: float, _modifiers: int) -> None:
+        if not self.has_audio:
+            return
         milliseconds = max(0, min(self.duration_ms, round(seconds * 1000)))
         self._drag_origin = milliseconds
         target = self._nearest_target(milliseconds)
@@ -697,23 +737,26 @@ class AudioVisualizerEditor(QWidget):
         return min(candidates)[1] if candidates else -1
 
     def _click(self, seconds: float, modifiers: int) -> None:
+        if not self.has_audio:
+            return
         milliseconds = max(0, min(self.duration_ms, round(seconds * 1000)))
         index = self._segment_at(milliseconds)
+        self.timeActivated.emit(milliseconds, index, modifiers)
         if index >= 0:
             control = bool(modifiers & int(Qt.KeyboardModifier.ControlModifier.value))
             shift = bool(modifiers & int(Qt.KeyboardModifier.ShiftModifier.value))
             self.select_segment(index, additive=control or shift, toggle=control)
             self.segmentSelected.emit(index, modifiers)
-        else:
-            self.seekRequested.emit(milliseconds)
 
     def _double_click(self, seconds: float) -> None:
+        if not self.has_audio:
+            return
         milliseconds = max(0, min(self.duration_ms, round(seconds * 1000)))
         index = self._segment_at(milliseconds)
         if index >= 0:
             self.select_segment(index)
             self.segmentSelected.emit(index, 0)
-            self.segmentDoubleClicked.emit(index)
+            self.segmentDoubleClickedAt.emit(index, milliseconds)
         else:
             self.seekRequested.emit(milliseconds)
 
@@ -723,6 +766,8 @@ class AudioVisualizerEditor(QWidget):
         control = bool(modifiers & int(Qt.KeyboardModifier.ControlModifier.value))
         shift = bool(modifiers & int(Qt.KeyboardModifier.ShiftModifier.value))
         pane = self.wave_pane if pane_name == "waveform" else self.spectrum_pane
+        if not self.has_audio and not shift:
+            return
         if shift:
             current = pane.view.viewRange()[1]
             factor = 0.82 if delta > 0 else 1.22
@@ -757,6 +802,16 @@ class AudioVisualizerEditor(QWidget):
     def _range_changed(self, pane_name: str, ranges) -> None:
         if self._syncing:
             return
+        if not self.has_audio:
+            self._syncing = True
+            try:
+                for pane in self._panes:
+                    pane.plot.setXRange(0, EMPTY_TIMELINE_MS / 1000, padding=0)
+            finally:
+                self._syncing = False
+            self.view_start, self.view_end = 0, EMPTY_TIMELINE_MS
+            self._update_time_grid()
+            return
         start = round(ranges[0][0] * 1000)
         end = max(start + 1, round(ranges[0][1] * 1000))
         self._syncing = True
@@ -771,15 +826,31 @@ class AudioVisualizerEditor(QWidget):
         self.viewChanged.emit(start, end)
 
     def _context_menu(self, source: pg.PlotWidget, position: QPoint) -> None:
+        scene_position = source.mapToScene(position)
+        point = source.plotItem.vb.mapSceneToView(scene_position)
+        milliseconds = max(0, min(self.duration_ms, round(point.x() * 1000)))
+        index = self._segment_at(milliseconds)
+        if index >= 0:
+            self.select_segment(index)
+            self.segmentSelected.emit(index, 0)
         menu = QMenu(self)
         actions = []
+        if index >= 0:
+            actions.extend([
+                ("播放当前句", self.playCurrentRequested),
+                ("编辑文本", self.editTextRequested),
+                ("在当前句前插入", self.insertBeforeRequested),
+                ("在当前句后插入", self.insertAfterRequested),
+            ])
         if self.selection and self.selection.end_ms > self.selection.start_ms:
             actions.extend([("将选区绑定到当前句", self.bindSelectionRequested),
                             ("用选区新建句段", self.newSegmentRequested)])
         actions.extend([
-            ("在播放头处拆分", self.splitRequested), ("与前一句合并", self.mergePreviousRequested),
+            ("在播放头处拆分", self.splitRequested), ("按标点拆成多句", self.splitPunctuationRequested),
+            ("与前一句合并", self.mergePreviousRequested),
             ("与后一句合并", self.mergeNextRequested), ("清除时间对应", self.clearTimingRequested),
-            ("寻找下一处静音", self.nextSilenceRequested), ("移除时间匹配（保留文本）", self.deleteRequested),
+            ("锁定/解锁", self.lockRequested), ("恢复原始段落", self.restoreSourceRequested),
+            ("寻找下一处静音", self.nextSilenceRequested), ("删除句段", self.deleteRequested),
         ])
         for label, signal in actions:
             action = QAction(label, menu)
@@ -826,7 +897,8 @@ class AudioVisualizerOverview(pg.PlotWidget):
         self.setMouseEnabled(x=False, y=False)
         self.getAxis("left").setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.getAxis("bottom").setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self.duration_ms = 1
+        self.has_audio = False
+        self.duration_ms = EMPTY_TIMELINE_MS
         self.mode = AudioVisualizationMode.COMBINED
         self.cache: AudioVisualizationCache | None = None
         self.image = pg.ImageItem(axisOrder="col-major")
@@ -848,6 +920,7 @@ class AudioVisualizerOverview(pg.PlotWidget):
         self._markers: list = []
         self._silences: list = []
         self.silences_visible = True
+        self.set_cache(None)
 
     def set_mode(self, mode: AudioVisualizationMode | str) -> None:
         self.mode = AudioVisualizationMode(mode)
@@ -855,7 +928,11 @@ class AudioVisualizerOverview(pg.PlotWidget):
 
     def set_cache(self, cache: AudioVisualizationCache | None, duration_ms: int | None = None) -> None:
         self.cache = cache
-        self.duration_ms = max(1, duration_ms or (cache.metadata.duration_ms if cache else 1))
+        self.has_audio = cache is not None or (duration_ms is not None and duration_ms > 0)
+        self.duration_ms = (
+            max(1, duration_ms or (cache.metadata.duration_ms if cache else 1))
+            if self.has_audio else EMPTY_TIMELINE_MS
+        )
         self.setXRange(0, self.duration_ms / 1000, padding=0)
         self.setYRange(-1.05, 1.05, padding=0)
         self.window.blockSignals(True)
@@ -921,13 +998,18 @@ class AudioVisualizerOverview(pg.PlotWidget):
         self.window.blockSignals(False)
 
     def _window_moved(self) -> None:
+        if not self.has_audio:
+            return
         start, end = self.window.getRegion()
         self.windowRequested.emit(round(start * 1000), round(end * 1000))
 
     def _scene_clicked(self, event) -> None:
-        if event.button() != Qt.MouseButton.LeftButton or self.window.sceneBoundingRect().contains(event.scenePos()):
+        if (
+            not self.has_audio
+            or event.button() != Qt.MouseButton.LeftButton
+            or self.window.sceneBoundingRect().contains(event.scenePos())
+        ):
             return
-        self.interactionStarted.emit()
         point = self.plotItem.vb.mapSceneToView(event.scenePos())
         self.seekRequested.emit(max(0, min(self.duration_ms, round(point.x() * 1000))))
 

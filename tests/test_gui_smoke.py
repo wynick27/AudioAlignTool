@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 import unittest
 import wave
@@ -17,24 +18,147 @@ try:
     from PySide6.QtCore import QRect, Qt
     from PySide6.QtGui import QImage, QPainter
     from PySide6.QtWidgets import QApplication, QMessageBox
-    from audioalign.core.models import ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentStatus, TextSegment
+    from audioalign.core.models import ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentOverlapPolicy, SegmentStatus, TaskLane, TextSegment
     from audioalign.core.paths import ApplicationPaths
     from audioalign.core.spectrogram import build_spectrogram_cache_from_slices
     from audioalign.core.storage import ProjectSession
+    from audioalign.gui.asr_comparison import ASRComparisonView
     from audioalign.gui.main_window import (
         MainWindow,
+        TaskManager,
         WORKFLOW_FASTER_WHISPER,
         WORKFLOW_QWEN_ASR,
         WORKFLOW_QWEN_FORCED,
     )
     from audioalign.gui.mapping_dialog import ChapterAudioMappingDialog
-    from audioalign.gui.spectrogram_editor import AudioVisualizerEditor, StableTimeAxis
+    from audioalign.gui.spectrogram_editor import (
+        AudioVisualizerEditor,
+        AudioVisualizerOverview,
+        StableTimeAxis,
+    )
 except ImportError:
     QApplication = None
 
 
 @unittest.skipIf(QApplication is None, "PySide6 is not installed")
 class GuiSmokeTests(unittest.TestCase):
+    def test_fixed_text_editor_splits_at_cursor_as_one_undo_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("cursor-split", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            original = "First clause, second clause"
+            session.repository.replace_segments(
+                chapter_id,
+                [TextSegment(None, chapter_id, 0, original, 100, 2100)],
+            )
+            window = MainWindow()
+            window._set_session(session)
+            window._select_segment_row(0)
+            cursor = window.editor_text.textCursor()
+            cursor.setPosition(len("First clause"))
+            window.editor_text.setTextCursor(cursor)
+            window.split_segment_at_text_cursor()
+
+            self.assertEqual(2, window.segment_model.rowCount())
+            self.assertEqual("First clause,", window.segment_model.segments[0].text)
+            self.assertEqual("second clause", window.segment_model.segments[1].text)
+            self.assertEqual(
+                window.segment_model.segments[0].end_ms,
+                window.segment_model.segments[1].start_ms,
+            )
+            window.undo()
+            self.assertEqual(1, window.segment_model.rowCount())
+            self.assertEqual(original, window.segment_model.segments[0].text)
+            window.close()
+
+    def test_asr_comparison_separates_blocks_and_restores_word_spaces(self) -> None:
+        view = ASRComparisonView()
+        view.set_content(
+            [
+                TextSegment(None, 1, 0, "Hello, world."),
+                TextSegment(None, 1, 1, "日本語です。"),
+            ],
+            [
+                ASRToken(None, 1, 0, "Hello", 0, 300, 0.9),
+                ASRToken(None, 1, 1, ",", 300, 320, 0.9),
+                ASRToken(None, 1, 2, "world", 320, 600, 0.9),
+                ASRToken(None, 1, 3, ".", 600, 650, 0.9),
+                ASRToken(None, 1, 4, "日本", 1800, 2100, 0.9),
+                ASRToken(None, 1, 5, "語です。", 2100, 2500, 0.9),
+            ],
+        )
+        source_text = view.source.toPlainText()
+        transcript_text = view.transcript.toPlainText()
+        self.assertIn("Hello, world.", source_text)
+        self.assertIn("日本語です。", source_text)
+        self.assertIn("Hello, world.", transcript_text)
+        self.assertIn("日本語です。", transcript_text)
+        self.assertNotIn("日本 語", transcript_text)
+        self.assertGreaterEqual(transcript_text.count("\n"), 1)
+
+    def test_inference_and_media_lanes_run_concurrently(self) -> None:
+        manager = TaskManager()
+        barrier = threading.Barrier(2)
+        completed: list[str] = []
+
+        def make_job(label: str):
+            def job(progress):
+                progress(0.1, label)
+                barrier.wait(timeout=3)
+                progress(1.0, label)
+                return label
+            return job
+
+        manager.submit("inference", make_job("inference"), completed.append)
+        manager.submit("media", make_job("media"), completed.append, lane=TaskLane.MEDIA)
+        deadline = time.monotonic() + 5
+        while len(completed) < 2 and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertCountEqual(["inference", "media"], completed)
+
+    def test_three_overlap_policies(self) -> None:
+        window = MainWindow()
+        try:
+            def reset():
+                window.segment_model.set_segments([
+                    TextSegment(None, 1, 0, "a", 0, 1000),
+                    TextSegment(None, 1, 1, "b", 1000, 2000),
+                ])
+                window.spectrogram.set_segments(window.segment_model.segments)
+
+            reset()
+            window.overlap_policy_combo.setCurrentIndex(
+                window.overlap_policy_combo.findData(SegmentOverlapPolicy.CLAMP_CURRENT)
+            )
+            window._boundary_moved(0, "end", 1500, False)
+            self.assertEqual((1000, 1000), (
+                window.segment_model.segments[0].end_ms,
+                window.segment_model.segments[1].start_ms,
+            ))
+
+            reset()
+            window.overlap_policy_combo.setCurrentIndex(
+                window.overlap_policy_combo.findData(SegmentOverlapPolicy.TRIM_NEIGHBORS)
+            )
+            window._boundary_moved(0, "end", 1500, False)
+            self.assertEqual((1500, 1500), (
+                window.segment_model.segments[0].end_ms,
+                window.segment_model.segments[1].start_ms,
+            ))
+
+            reset()
+            window.overlap_policy_combo.setCurrentIndex(
+                window.overlap_policy_combo.findData(SegmentOverlapPolicy.ALLOW_OVERLAP)
+            )
+            window._boundary_moved(0, "end", 1500, False)
+            self.assertEqual((1500, 1000), (
+                window.segment_model.segments[0].end_ms,
+                window.segment_model.segments[1].start_ms,
+            ))
+        finally:
+            window.close()
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
@@ -69,6 +193,30 @@ class GuiSmokeTests(unittest.TestCase):
         editor.follow_playhead(20_001)
         centre = (editor.view_start + editor.view_end) / 2
         self.assertAlmostEqual(centre / 1000, editor.wave_pane.play_line.value())
+
+    def test_empty_audio_timeline_keeps_one_fixed_scale(self) -> None:
+        editor = AudioVisualizerEditor()
+        editor.resize(1000, 300)
+        self.assertFalse(editor.has_audio)
+        self.assertEqual((0, 30_000), (editor.view_start, editor.view_end))
+        initial_ticks = editor.wave_pane.time_axis.tickValues(0, 30, 900)
+        editor.follow_playhead(12_345, force=True)
+        editor.focus_time(999_999, 500)
+        editor._range_changed("waveform", [[0.123, 0.124], [-1, 1]])
+        editor.set_mode(AudioVisualizationMode.WAVEFORM)
+        editor.set_mode(AudioVisualizationMode.COMBINED)
+        self.assertEqual((0, 30_000), (editor.view_start, editor.view_end))
+        self.assertEqual(0, editor.playhead)
+        self.assertEqual(initial_ticks, editor.wave_pane.time_axis.tickValues(0, 30, 900))
+
+        overview = AudioVisualizerOverview()
+        self.assertFalse(overview.has_audio)
+        self.assertEqual(30_000, overview.duration_ms)
+
+        # A known audio duration is usable before its FFT cache has finished.
+        editor.set_cache(None, 60_000)
+        self.assertTrue(editor.has_audio)
+        self.assertEqual(60_000, editor.duration_ms)
 
     def test_window_loads_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"LOCALAPPDATA": temporary}):
@@ -201,6 +349,8 @@ class GuiSmokeTests(unittest.TestCase):
             window.spectrogram.suspend_follow("test")
             self.assertEqual(PlaybackFollowState.SUSPENDED, window.spectrogram.follow_state)
             window.follow_button.click()
+            self.assertEqual(PlaybackFollowState.FOLLOWING, window.spectrogram.follow_state)
+            window.follow_button.click()
             self.assertEqual(PlaybackFollowState.DISABLED, window.spectrogram.follow_state)
             window.follow_button.click()
             self.assertEqual(PlaybackFollowState.FOLLOWING, window.spectrogram.follow_state)
@@ -294,6 +444,15 @@ class GuiSmokeTests(unittest.TestCase):
                 patch("audioalign.gui.main_window.transcriber_for_options", return_value=fake),
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
             ):
+                window.recognize_book()
+                deadline = time.monotonic() + 10
+                while (window.tasks.current or window.tasks.queue) and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+                self.app.processEvents()
+
+                # A second book run must skip both inference and text matching;
+                # the completed alignment is a separate cache layer.
                 window.recognize_book()
                 deadline = time.monotonic() + 10
                 while (window.tasks.current or window.tasks.queue) and time.monotonic() < deadline:

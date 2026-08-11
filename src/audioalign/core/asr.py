@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ctypes
+import gc
 import hashlib
 import json
+import os
 from pathlib import Path
+import sys
 import time
 from typing import Callable, Protocol, Sequence
 
@@ -17,6 +21,109 @@ ProgressCallback = Callable[[float, str], None]
 
 class BackendUnavailableError(RuntimeError):
     pass
+
+
+class InferenceMemoryPressureError(RuntimeError):
+    """Raised before the operating system has to terminate an inference process."""
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceMemoryStatus:
+    available_bytes: int
+    total_bytes: int
+    gpu_available_bytes: int | None = None
+    gpu_total_bytes: int | None = None
+
+
+def inference_memory_status() -> InferenceMemoryStatus:
+    """Read memory counters without adding a psutil dependency or importing torch."""
+    available = total = 0
+    if os.name == "nt":
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        state = MemoryStatusEx()
+        state.dwLength = ctypes.sizeof(state)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(state)):
+            available, total = int(state.ullAvailPhys), int(state.ullTotalPhys)
+    elif hasattr(os, "sysconf"):
+        try:
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            available = page_size * int(os.sysconf("SC_AVPHYS_PAGES"))
+            total = page_size * int(os.sysconf("SC_PHYS_PAGES"))
+        except (OSError, ValueError):
+            pass
+
+    gpu_available = gpu_total = None
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                gpu_available, gpu_total = (int(value) for value in torch.cuda.mem_get_info())
+        except (AttributeError, RuntimeError):
+            pass
+    return InferenceMemoryStatus(available, total, gpu_available, gpu_total)
+
+
+def release_inference_memory(transcriber=None, *, aggressive: bool = False) -> None:
+    """Release per-chunk objects while deliberately retaining the loaded model."""
+    release = getattr(transcriber, "release_temporary_memory", None)
+    if callable(release):
+        release(aggressive=aggressive)
+        return
+    if aggressive:
+        gc.collect()
+        torch = sys.modules.get("torch")
+        if torch is not None:
+            try:
+                if torch.cuda.is_available() and torch.cuda.is_initialized():
+                    torch.cuda.empty_cache()
+            except (AttributeError, RuntimeError):
+                pass
+
+
+def ensure_inference_memory_headroom(transcriber=None) -> InferenceMemoryStatus:
+    """Clean up early and stop safely if either host RAM or VRAM is critically low."""
+    status = inference_memory_status()
+    cleanup_limit = max(768 * 1024**2, round(status.total_bytes * 0.06)) if status.total_bytes else 0
+    gpu_cleanup_limit = 768 * 1024**2
+    needs_cleanup = (
+        (cleanup_limit and status.available_bytes < cleanup_limit)
+        or (status.gpu_available_bytes is not None and status.gpu_available_bytes < gpu_cleanup_limit)
+    )
+    if needs_cleanup:
+        release_inference_memory(transcriber, aggressive=True)
+        status = inference_memory_status()
+    stop_limit = max(384 * 1024**2, round(status.total_bytes * 0.03)) if status.total_bytes else 0
+    if stop_limit and status.available_bytes < stop_limit:
+        raise InferenceMemoryPressureError(
+            f"系统可用内存只剩 {status.available_bytes / 1024**2:.0f} MB"
+        )
+    if status.gpu_available_bytes is not None and status.gpu_available_bytes < 256 * 1024**2:
+        raise InferenceMemoryPressureError(
+            f"GPU 可用显存只剩 {status.gpu_available_bytes / 1024**2:.0f} MB"
+        )
+    return status
+
+
+def is_inference_out_of_memory(error: BaseException) -> bool:
+    if isinstance(error, MemoryError):
+        return True
+    message = str(error).casefold()
+    return any(marker in message for marker in (
+        "out of memory", "cuda out of memory", "not enough memory",
+        "cannot allocate memory", "bad allocation", "cublas_status_alloc_failed",
+    ))
 
 
 @dataclass(slots=True)
@@ -229,6 +336,7 @@ def runtime_status(
 
 class Transcriber(Protocol):
     def transcribe(self, path: str | Path, chapter_id: int, options: ASROptions, progress: ProgressCallback | None = None) -> list[ASRToken]: ...
+    def release_temporary_memory(self, *, aggressive: bool = False) -> None: ...
 
 
 class FasterWhisperTranscriber:
@@ -237,6 +345,12 @@ class FasterWhisperTranscriber:
         self._model = None
         self._model_key: tuple[str, str, str] | None = None
         self._forced_cpu_reason = ""
+
+    def release_temporary_memory(self, *, aggressive: bool = False) -> None:
+        # The CTranslate2 model is intentionally retained; decoded NumPy arrays and
+        # generator frames are ordinary Python objects and can be reclaimed here.
+        if aggressive:
+            gc.collect()
 
     def transcribe(
         self,
@@ -283,28 +397,34 @@ class FasterWhisperTranscriber:
                 end_ms=options.clip_end_ms,
             )
         def collect(active_model) -> list[ASRToken]:
-            segments, info = active_model.transcribe(
-                audio_input, language=options.language, word_timestamps=True,
-                vad_filter=True,
-                vad_parameters={
-                    "threshold": options.vad_threshold,
-                    "min_silence_duration_ms": options.min_silence_ms,
-                },
-            )
-            duration = max(1.0, float(info.duration))
-            result: list[ASRToken] = []
-            for segment in segments:
-                for word in segment.words or []:
-                    result.append(
-                        ASRToken(
-                            id=None, chapter_id=chapter_id, position=len(result), text=word.word,
-                            start_ms=int(word.start * 1000), end_ms=int(word.end * 1000),
-                            probability=float(word.probability),
+            segments = None
+            try:
+                segments, info = active_model.transcribe(
+                    audio_input, language=options.language, word_timestamps=True,
+                    vad_filter=True,
+                    vad_parameters={
+                        "threshold": options.vad_threshold,
+                        "min_silence_duration_ms": options.min_silence_ms,
+                    },
+                )
+                duration = max(1.0, float(info.duration))
+                result: list[ASRToken] = []
+                for segment in segments:
+                    for word in segment.words or []:
+                        result.append(
+                            ASRToken(
+                                id=None, chapter_id=chapter_id, position=len(result), text=word.word,
+                                start_ms=int(word.start * 1000), end_ms=int(word.end * 1000),
+                                probability=float(word.probability),
+                            )
                         )
-                    )
-                if progress:
-                    progress(min(0.98, float(segment.end) / duration), segment.text.strip())
-            return result
+                    if progress:
+                        progress(min(0.98, float(segment.end) / duration), segment.text.strip())
+                return result
+            finally:
+                close = getattr(segments, "close", None)
+                if callable(close):
+                    close()
 
         model_key = (model_name, device, compute)
         try:
@@ -468,6 +588,17 @@ class Qwen3ASRTranscriber:
         self._model = None
         self._model_key: tuple[str, str] | None = None
 
+    def release_temporary_memory(self, *, aggressive: bool = False) -> None:
+        if aggressive:
+            gc.collect()
+            torch = sys.modules.get("torch")
+            if torch is not None:
+                try:
+                    if torch.cuda.is_available() and torch.cuda.is_initialized():
+                        torch.cuda.empty_cache()
+                except (AttributeError, RuntimeError):
+                    pass
+
     def transcribe(
         self,
         path: str | Path,
@@ -497,28 +628,37 @@ class Qwen3ASRTranscriber:
             )
             self._model_key = model_key
         model = self._model
-        samples, sample_rate = decode_audio_mono(
-            path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
-        )
-        language = QWEN_ASR_LANGUAGE_NAMES.get((options.language or "").casefold(), options.language)
-        results = model.transcribe(
-            audio=(samples, sample_rate), language=language, return_time_stamps=True,
-        )
-        record = results[0]
-        tokens: list[ASRToken] = []
-        for item in getattr(record, "time_stamps", None) or []:
-            text = str(getattr(item, "text", ""))
-            start = getattr(item, "start_time", None)
-            end = getattr(item, "end_time", None)
-            if start is None or end is None:
-                continue
-            tokens.append(ASRToken(
-                None, chapter_id, len(tokens), text,
-                _qwen_timestamp_value(start), _qwen_timestamp_value(end), 0.8,
-            ))
-        if not tokens and getattr(record, "text", ""):
-            duration = max(0, (options.clip_end_ms or options.clip_start_ms) - options.clip_start_ms)
-            tokens.append(ASRToken(None, chapter_id, 0, str(record.text), 0, duration, 0.45))
+        samples = results = record = None
+        try:
+            samples, sample_rate = decode_audio_mono(
+                path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
+            )
+            language = QWEN_ASR_LANGUAGE_NAMES.get((options.language or "").casefold(), options.language)
+            with torch.inference_mode():
+                results = model.transcribe(
+                    audio=(samples, sample_rate), language=language, return_time_stamps=True,
+                )
+            record = results[0]
+            tokens: list[ASRToken] = []
+            for item in getattr(record, "time_stamps", None) or []:
+                text = str(getattr(item, "text", ""))
+                start = getattr(item, "start_time", None)
+                end = getattr(item, "end_time", None)
+                if start is None or end is None:
+                    continue
+                tokens.append(ASRToken(
+                    None, chapter_id, len(tokens), text,
+                    _qwen_timestamp_value(start), _qwen_timestamp_value(end), 0.8,
+                ))
+            if not tokens and getattr(record, "text", ""):
+                duration = max(0, (options.clip_end_ms or options.clip_start_ms) - options.clip_start_ms)
+                tokens.append(ASRToken(None, chapter_id, 0, str(record.text), 0, duration, 0.45))
+        finally:
+            # Some qwen-asr result objects retain tensors through their timestamp
+            # records. Break those references before the next book chunk starts.
+            record = None
+            results = None
+            samples = None
         device_name = ""
         if device.startswith("cuda"):
             try:
@@ -546,6 +686,17 @@ class Qwen3ForcedAligner:
         self._model = None
         self._model_key: tuple[str, str, str] | None = None
 
+    def release_temporary_memory(self, *, aggressive: bool = False) -> None:
+        if aggressive:
+            gc.collect()
+            torch = sys.modules.get("torch")
+            if torch is not None:
+                try:
+                    if torch.cuda.is_available() and torch.cuda.is_initialized():
+                        torch.cuda.empty_cache()
+                except (AttributeError, RuntimeError):
+                    pass
+
     def align(
         self,
         path: str | Path,
@@ -569,17 +720,23 @@ class Qwen3ForcedAligner:
             self._model = QwenAlignerModel.from_pretrained(model_path, dtype=dtype, device_map=device)
             self._model_key = model_key
         model = self._model
-        samples, sample_rate = decode_audio_mono(
-            path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
-        )
-        language_name = QWEN_ASR_LANGUAGE_NAMES.get(language.casefold(), language)
-        results = model.align(audio=(samples, sample_rate), text=text, language=language_name)
-        tokens: list[ASRToken] = []
-        for item in results[0]:
-            tokens.append(ASRToken(
-                None, chapter_id, len(tokens), str(item.text),
-                _qwen_timestamp_value(item.start_time), _qwen_timestamp_value(item.end_time), 0.9,
-            ))
+        samples = results = None
+        try:
+            samples, sample_rate = decode_audio_mono(
+                path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
+            )
+            language_name = QWEN_ASR_LANGUAGE_NAMES.get(language.casefold(), language)
+            with torch.inference_mode():
+                results = model.align(audio=(samples, sample_rate), text=text, language=language_name)
+            tokens: list[ASRToken] = []
+            for item in results[0]:
+                tokens.append(ASRToken(
+                    None, chapter_id, len(tokens), str(item.text),
+                    _qwen_timestamp_value(item.start_time), _qwen_timestamp_value(item.end_time), 0.9,
+                ))
+        finally:
+            results = None
+            samples = None
         device_name = torch.cuda.get_device_name(0) if device.startswith("cuda") else ""
         self.last_device_info = InferenceDeviceInfo(
             "qwen3-forced-aligner", "Qwen3-ForcedAligner-0.6B", options.device,
@@ -594,6 +751,22 @@ class WhisperXTranscriber:
 
     def __init__(self) -> None:
         self.last_device_info = InferenceDeviceInfo("whisperx", "")
+        self._model = None
+        self._model_key: tuple[str, str, str] | None = None
+        self._align_model = None
+        self._align_metadata = None
+        self._align_key: tuple[str, str] | None = None
+
+    def release_temporary_memory(self, *, aggressive: bool = False) -> None:
+        if aggressive:
+            gc.collect()
+            torch = sys.modules.get("torch")
+            if torch is not None:
+                try:
+                    if torch.cuda.is_available() and torch.cuda.is_initialized():
+                        torch.cuda.empty_cache()
+                except (AttributeError, RuntimeError):
+                    pass
 
     def transcribe(
         self,
@@ -615,28 +788,45 @@ class WhisperXTranscriber:
                 device = "cpu"
         if progress:
             progress(-1.0, "加载 WhisperX")
-        audio = whisperx.load_audio(str(path))
         if options.clip_start_ms or options.clip_end_ms is not None:
-            start = round(options.clip_start_ms * 16000 / 1000)
-            end = None if options.clip_end_ms is None else round(options.clip_end_ms * 16000 / 1000)
-            audio = audio[start:end]
-        compute_type = "float16" if device == "cuda" else "int8"
-        model = whisperx.load_model(options.model, device, compute_type=compute_type)
-        result = model.transcribe(audio, language=options.language)
-        language = result.get("language") or options.language
-        align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
-        aligned = whisperx.align(result["segments"], align_model, metadata, audio, device)
-        tokens: list[ASRToken] = []
-        for word in aligned.get("word_segments", []):
-            if "start" not in word or "end" not in word:
-                continue
-            tokens.append(
-                ASRToken(
-                    id=None, chapter_id=chapter_id, position=len(tokens), text=word.get("word", ""),
-                    start_ms=int(word["start"] * 1000), end_ms=int(word["end"] * 1000),
-                    probability=float(word.get("score", 0.0)),
-                )
+            audio, _sample_rate = decode_audio_mono(
+                path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
             )
+        else:
+            audio = whisperx.load_audio(str(path))
+        compute_type = "float16" if device == "cuda" else "int8"
+        model_key = (options.model, device, compute_type)
+        if self._model is None or self._model_key != model_key:
+            self._model = whisperx.load_model(options.model, device, compute_type=compute_type)
+            self._model_key = model_key
+        result = aligned = None
+        try:
+            result = self._model.transcribe(audio, language=options.language)
+            language = result.get("language") or options.language
+            align_key = (str(language), device)
+            if self._align_model is None or self._align_key != align_key:
+                self._align_model, self._align_metadata = whisperx.load_align_model(
+                    language_code=language, device=device,
+                )
+                self._align_key = align_key
+            aligned = whisperx.align(
+                result["segments"], self._align_model, self._align_metadata, audio, device,
+            )
+            tokens: list[ASRToken] = []
+            for word in aligned.get("word_segments", []):
+                if "start" not in word or "end" not in word:
+                    continue
+                tokens.append(
+                    ASRToken(
+                        id=None, chapter_id=chapter_id, position=len(tokens), text=word.get("word", ""),
+                        start_ms=int(word["start"] * 1000), end_ms=int(word["end"] * 1000),
+                        probability=float(word.get("score", 0.0)),
+                    )
+                )
+        finally:
+            aligned = None
+            result = None
+            audio = None
         if progress:
             progress(1.0, "精确对齐完成")
         self.last_device_info = InferenceDeviceInfo(

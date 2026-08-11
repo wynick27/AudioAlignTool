@@ -5,10 +5,44 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from audioalign.core.text import import_epub, normalize_for_match, split_sentences
+from audioalign.core.text import (
+    cursor_split_offset,
+    import_epub,
+    normalize_for_match,
+    preferred_split_offset,
+    split_sentences,
+)
 
 
 class TextTests(unittest.TestCase):
+    def test_english_ellipsis_is_a_sentence_boundary(self) -> None:
+        text = (
+            "nor that he would spend the next few weeks being prodded and pinched "
+            "by his cousin Dudley … He could not know that at this very moment,，另外"
+        )
+        result = split_sentences(text)
+        self.assertEqual(2, len(result))
+        self.assertTrue(result[0].endswith("Dudley …"))
+        self.assertTrue(result[1].startswith("He could not know"))
+
+    def test_new_direct_speech_after_narration_starts_a_new_segment(self) -> None:
+        text = (
+            "Quir\u00adrell laughed and it wasn’t his usual quiv\u00ader\u00ading treble, "
+            "either, but cold and sharp. ‘Yes, Severus does seem the type, doesn’t he?"
+        )
+        result = split_sentences(text)
+        self.assertEqual(2, len(result))
+        self.assertTrue(result[0].endswith("cold and sharp."))
+        self.assertTrue(result[1].startswith("‘Yes, Severus"))
+        self.assertEqual(
+            ["Narration ends.", "‘New speaker?’"],
+            split_sentences("Narration ends.‘New speaker?’"),
+        )
+
+    def test_cursor_split_keeps_following_punctuation_on_the_left(self) -> None:
+        text = "First clause, second clause"
+        self.assertEqual(len("First clause,"), cursor_split_offset(text, len("First clause")))
+
     def test_multilingual_sentence_split(self) -> None:
         text = "第一句。第二句！\n\nこれは三文目です。\n\nHola mundo. Esta es una prueba."
         result = split_sentences(text)
@@ -19,6 +53,18 @@ class TextTests(unittest.TestCase):
     def test_normalization_does_not_keep_punctuation(self) -> None:
         self.assertEqual("ａｂｃ".encode("utf-8") is not None, True)
         self.assertEqual("abc你好", normalize_for_match("ＡＢＣ， 你好！"))
+
+    def test_long_sentence_uses_multiple_comma_boundaries_without_punctuation_rows(self) -> None:
+        clause = (
+            "这是第一部分，包含一些说明，这是第二部分，也有更多说明，"
+            "这是第三部分，仍然继续补充，这是第四部分，还要继续补充，"
+            "这是第五部分，仍有一些内容，这是第六部分，最后再作说明，"
+        )
+        text = clause * 2 + "这是最后一部分，最终结束。"
+        result = split_sentences(text)
+        self.assertGreaterEqual(len(result), 3)
+        self.assertTrue(all(any(character.isalnum() for character in item) for item in result))
+        self.assertEqual("，", text[preferred_split_offset(text, 42) - 1])
 
     def test_epub_standard_library_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

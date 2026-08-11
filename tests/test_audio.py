@@ -2,17 +2,38 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+import sys
 import wave
 from pathlib import Path
 
 import numpy as np
 
-from audioalign.core.audio import audio_metadata, detect_silence_candidates
+from unittest.mock import patch
+
+from audioalign.core.audio import audio_metadata, decode_audio_mono, detect_silence_candidates
 from audioalign.core.models import SilenceSettings
 from audioalign.core.spectrogram import AudioVisualizationCache, SpectrogramCache, build_spectrogram_cache
 
 
 class AudioTests(unittest.TestCase):
+    def test_wav_chunk_decode_reads_only_requested_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audio = Path(temporary) / "long.wav"
+            rate = 16000
+            values = np.arange(rate * 3, dtype=np.int16)
+            with wave.open(str(audio), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(rate)
+                handle.writeframes(values.tobytes())
+            with patch.dict(sys.modules, {"av": None}):
+                samples, sample_rate = decode_audio_mono(
+                    audio, rate, start_ms=1000, end_ms=2000,
+                )
+            self.assertEqual(rate, sample_rate)
+            self.assertEqual(rate, samples.size)
+            self.assertAlmostEqual(values[rate] / 32768.0, float(samples[0]), places=5)
+
     def test_energy_silence_detection(self) -> None:
         rate = 16000
         voice = np.sin(np.linspace(0, 100, rate)).astype(np.float32) * 0.2

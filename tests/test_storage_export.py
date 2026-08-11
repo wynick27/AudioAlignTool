@@ -10,7 +10,7 @@ from unittest.mock import patch
 from audioalign.core.exporters import export_html, export_json, export_subtitles
 from audioalign.core.models import (
     ASRToken, BoundaryCandidate, Chapter, InferenceDeviceInfo, RecognitionChunk,
-    SegmentStatus, TextSegment,
+    SegmentOrigin, SegmentStatus, SourceFragment, TextSegment,
 )
 from audioalign.core.storage import (
     ProjectSession, UnsupportedProjectError, migrate_manifest, write_recognition_chunk,
@@ -18,6 +18,24 @@ from audioalign.core.storage import (
 
 
 class StorageExportTests(unittest.TestCase):
+    def test_source_fragment_and_segment_provenance_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("source-test", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0, "<p>原始段落。</p>"))
+            session.repository.replace_source_fragments(
+                chapter_id,
+                [SourceFragment(None, chapter_id, 0, "p", "原始段落。", 0, 5)],
+            )
+            fragment = session.repository.source_fragments(chapter_id)[0]
+            session.repository.replace_segments(chapter_id, [TextSegment(
+                None, chapter_id, 0, "原始段落。", origin=SegmentOrigin.SOURCE,
+                source_fragment_id=fragment.id, source_start_char=0, source_end_char=5,
+            )])
+            loaded = session.repository.segments(chapter_id)[0]
+            self.assertEqual(SegmentOrigin.SOURCE, loaded.origin)
+            self.assertEqual(fragment.id, loaded.source_fragment_id)
+            session.close()
+
     def test_chunked_recognition_cache_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("cache-test", Path(temporary) / "project")
@@ -39,6 +57,28 @@ class StorageExportTests(unittest.TestCase):
             self.assertEqual("complete", restored.status)
             self.assertEqual("cuda", restored.actual_device)
             self.assertEqual("hola", session.repository.recognition_tokens(run.id or 0)[0].text)
+            session.close()
+
+    def test_alignment_cache_requires_matching_text_and_silence_signatures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("alignment-cache", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            run = session.repository.ensure_recognition_run(
+                chapter_id=chapter_id, cache_key="alignment-key", backend="faster-whisper",
+                model="small", language="es", audio_signature="audio", parameters_json="{}",
+            )
+            session.repository.record_alignment_run(
+                chapter_id, run.id or 0, "text-a", "algorithm-v2", "silence-a",
+            )
+            self.assertTrue(session.repository.alignment_is_current(
+                chapter_id, run.id or 0, "text-a", "algorithm-v2", "silence-a",
+            ))
+            self.assertFalse(session.repository.alignment_is_current(
+                chapter_id, run.id or 0, "text-b", "algorithm-v2", "silence-a",
+            ))
+            self.assertFalse(session.repository.alignment_is_current(
+                chapter_id, run.id or 0, "text-a", "algorithm-v2", "silence-b",
+            ))
             session.close()
 
     def test_silence_candidates_round_trip_by_signature(self) -> None:

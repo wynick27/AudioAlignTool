@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .alignment import enforce_monotonic
-from .models import SegmentStatus, TextSegment
+from .models import SegmentOverlapPolicy, SegmentStatus, TextSegment
 from .storage import ProjectSession
 
 
@@ -35,7 +35,15 @@ def export_subtitles(session: ProjectSession, output: str | Path, kind: str) -> 
     target.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for chapter in session.repository.chapters():
-        segments = [s for s in enforce_monotonic(session.repository.segments(chapter.id or 0)) if s.end_ms > s.start_ms]
+        source_segments = [s for s in session.repository.segments(chapter.id or 0) if s.end_ms > s.start_ms]
+        conflicts = [
+            index for index in range(len(source_segments) - 1)
+            if source_segments[index].end_ms > source_segments[index + 1].start_ms
+        ]
+        if conflicts and session.manifest.segment_overlap_policy == SegmentOverlapPolicy.ALLOW_OVERLAP:
+            first = conflicts[0] + 1
+            raise ValueError(f"章节“{chapter.title}”的第 {first}/{first + 1} 句存在时间重叠，请先修正")
+        segments = enforce_monotonic(source_segments)
         lines: list[str] = ["WEBVTT", ""] if kind == "vtt" else []
         for index, segment in enumerate(segments, 1):
             if kind == "srt":
@@ -84,6 +92,10 @@ def project_alignment_dict(session: ProjectSession) -> dict:
                         "confidence": round(segment.confidence, 4),
                         "status": segment.status.value,
                         "locked": segment.locked,
+                        "origin": segment.origin.value,
+                        "source_fragment_id": segment.source_fragment_id,
+                        "source_start_char": segment.source_start_char,
+                        "source_end_char": segment.source_end_char,
                     }
                     for segment in session.repository.segments(chapter.id or 0)
                 ],
@@ -95,6 +107,7 @@ def project_alignment_dict(session: ProjectSession) -> dict:
         "title": session.manifest.title,
         "language": session.manifest.language,
         "alignment_mode": session.manifest.alignment_mode.value,
+        "segment_overlap_policy": session.manifest.segment_overlap_policy.value,
         "chapters": chapters,
     }
 

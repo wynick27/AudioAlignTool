@@ -23,11 +23,13 @@ from .models import (
     ProjectManifest,
     RecognitionChunk,
     RecognitionRun,
+    SegmentOrigin,
     SegmentStatus,
+    SourceFragment,
     TextAudioAnchor,
     TextSegment,
 )
-from .text import display_chapter_title
+from .text import display_chapter_title, source_fragments
 from .paths import ApplicationPaths, sanitize_project_name
 
 
@@ -42,6 +44,16 @@ CREATE TABLE IF NOT EXISTS chapters (
     position INTEGER NOT NULL,
     source_html TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS source_fragments (
+    id INTEGER PRIMARY KEY,
+    chapter_id INTEGER NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'paragraph',
+    text TEXT NOT NULL,
+    source_start_char INTEGER NOT NULL,
+    source_end_char INTEGER NOT NULL,
+    UNIQUE(chapter_id, position)
+);
 CREATE TABLE IF NOT EXISTS text_segments (
     id INTEGER PRIMARY KEY,
     chapter_id INTEGER NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
@@ -52,6 +64,10 @@ CREATE TABLE IF NOT EXISTS text_segments (
     confidence REAL NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'unmatched',
     locked INTEGER NOT NULL DEFAULT 0,
+    origin TEXT NOT NULL DEFAULT 'source',
+    source_fragment_id INTEGER REFERENCES source_fragments(id),
+    source_start_char INTEGER,
+    source_end_char INTEGER,
     UNIQUE(chapter_id, position)
 );
 CREATE TABLE IF NOT EXISTS audio_assets (
@@ -178,6 +194,7 @@ CREATE TABLE IF NOT EXISTS silence_candidates (
     UNIQUE(chapter_id, position)
 );
 CREATE INDEX IF NOT EXISTS idx_segments_chapter ON text_segments(chapter_id, position);
+CREATE INDEX IF NOT EXISTS idx_source_fragments_chapter ON source_fragments(chapter_id, position);
 CREATE INDEX IF NOT EXISTS idx_tokens_chapter ON asr_tokens(chapter_id, position);
 CREATE INDEX IF NOT EXISTS idx_recognition_runs_chapter ON recognition_runs(chapter_id, backend, model);
 CREATE INDEX IF NOT EXISTS idx_recognition_chunks_run ON recognition_chunks(run_id, position);
@@ -287,7 +304,44 @@ class ProjectRepository:
         if version != SUPPORTED_SCHEMA_VERSION:
             raise UnsupportedProjectError(f"项目数据库不是 schema v{SUPPORTED_SCHEMA_VERSION}")
         self.connection.executescript(SCHEMA_V2)
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(text_segments)")}
+        extensions = {
+            "origin": "TEXT NOT NULL DEFAULT 'source'",
+            "source_fragment_id": "INTEGER REFERENCES source_fragments(id)",
+            "source_start_char": "INTEGER",
+            "source_end_char": "INTEGER",
+        }
+        for name, declaration in extensions.items():
+            if name not in columns:
+                self.connection.execute(f"ALTER TABLE text_segments ADD COLUMN {name} {declaration}")
         self.connection.commit()
+        self._initialize_missing_source_fragments()
+
+    def _initialize_missing_source_fragments(self) -> None:
+        """Populate immutable blocks once for current projects without a format prompt."""
+        chapters = self.connection.execute(
+            """SELECT c.id,c.source_html FROM chapters c
+            WHERE NOT EXISTS (SELECT 1 FROM source_fragments f WHERE f.chapter_id=c.id)"""
+        ).fetchall()
+        for chapter in chapters:
+            segment_rows = self.connection.execute(
+                "SELECT id,text FROM text_segments WHERE chapter_id=? ORDER BY position,id",
+                (chapter["id"],),
+            ).fetchall()
+            fallback = "\n\n".join(row["text"] for row in segment_rows)
+            fragments = source_fragments(chapter["source_html"], fallback)
+            if fragments:
+                self.replace_source_fragments(
+                    chapter["id"],
+                    [
+                        SourceFragment(
+                            None, chapter["id"], item.position, item.kind, item.text,
+                            item.source_start_char, item.source_end_char,
+                        )
+                        for item in fragments
+                    ],
+                    assign_existing=True,
+                )
 
     def close(self) -> None:
         self.connection.commit()
@@ -317,6 +371,57 @@ class ProjectRepository:
         self.connection.commit()
         return int(cursor.lastrowid)
 
+    def replace_source_fragments(
+        self,
+        chapter_id: int,
+        fragments: Sequence[SourceFragment],
+        *,
+        assign_existing: bool = False,
+    ) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM source_fragments WHERE chapter_id=?", (chapter_id,))
+            connection.executemany(
+                """INSERT INTO source_fragments
+                (chapter_id,position,kind,text,source_start_char,source_end_char)
+                VALUES (?,?,?,?,?,?)""",
+                [
+                    (chapter_id, item.position, item.kind, item.text,
+                     item.source_start_char, item.source_end_char)
+                    for item in fragments
+                ],
+            )
+            if assign_existing:
+                stored = connection.execute(
+                    "SELECT * FROM source_fragments WHERE chapter_id=? ORDER BY position",
+                    (chapter_id,),
+                ).fetchall()
+                cursor = 0
+                rows = connection.execute(
+                    "SELECT id,text FROM text_segments WHERE chapter_id=? ORDER BY position,id",
+                    (chapter_id,),
+                ).fetchall()
+                for row in rows:
+                    text = row["text"]
+                    owner = next(
+                        (item for item in stored
+                         if item["source_start_char"] <= cursor
+                         and cursor + len(text) <= item["source_end_char"]),
+                        None,
+                    )
+                    if owner:
+                        connection.execute(
+                            """UPDATE text_segments SET origin='source',source_fragment_id=?,
+                            source_start_char=?,source_end_char=? WHERE id=?""",
+                            (owner["id"], cursor, cursor + len(text), row["id"]),
+                        )
+                    cursor += len(text)
+
+    def source_fragments(self, chapter_id: int) -> list[SourceFragment]:
+        return [SourceFragment(**dict(row)) for row in self.connection.execute(
+            "SELECT * FROM source_fragments WHERE chapter_id=? ORDER BY position,id",
+            (chapter_id,),
+        )]
+
     def chapters(self) -> list[Chapter]:
         chapters = [Chapter(**dict(row)) for row in self.connection.execute("SELECT * FROM chapters ORDER BY position,id")]
         for chapter in chapters:
@@ -328,10 +433,13 @@ class ProjectRepository:
             connection.execute("DELETE FROM text_segments WHERE chapter_id=?", (chapter_id,))
             connection.executemany(
                 """INSERT INTO text_segments
-                (chapter_id,position,text,start_ms,end_ms,confidence,status,locked)
-                VALUES (?,?,?,?,?,?,?,?)""",
+                (chapter_id,position,text,start_ms,end_ms,confidence,status,locked,origin,
+                 source_fragment_id,source_start_char,source_end_char)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 [
-                    (chapter_id, s.position, s.text, s.start_ms, s.end_ms, s.confidence, s.status.value, int(s.locked))
+                    (chapter_id, s.position, s.text, s.start_ms, s.end_ms, s.confidence,
+                     s.status.value, int(s.locked), s.origin.value, s.source_fragment_id,
+                     s.source_start_char, s.source_end_char)
                     for s in segments
                 ],
             )
@@ -343,16 +451,36 @@ class ProjectRepository:
                 id=row["id"], chapter_id=row["chapter_id"], position=row["position"], text=row["text"],
                 start_ms=row["start_ms"], end_ms=row["end_ms"], confidence=row["confidence"],
                 status=SegmentStatus(row["status"]), locked=bool(row["locked"]),
+                origin=SegmentOrigin(row["origin"]), source_fragment_id=row["source_fragment_id"],
+                source_start_char=row["source_start_char"], source_end_char=row["source_end_char"],
             ) for row in rows
         ]
 
     def update_segment(self, segment: TextSegment) -> None:
         segment.validate()
         self.connection.execute(
-            "UPDATE text_segments SET text=?,start_ms=?,end_ms=?,confidence=?,status=?,locked=? WHERE id=?",
-            (segment.text, segment.start_ms, segment.end_ms, segment.confidence, segment.status.value, int(segment.locked), segment.id),
+            """UPDATE text_segments SET text=?,start_ms=?,end_ms=?,confidence=?,status=?,locked=?,
+            origin=?,source_fragment_id=?,source_start_char=?,source_end_char=? WHERE id=?""",
+            (segment.text, segment.start_ms, segment.end_ms, segment.confidence, segment.status.value,
+             int(segment.locked), segment.origin.value, segment.source_fragment_id,
+             segment.source_start_char, segment.source_end_char, segment.id),
         )
         self.connection.commit()
+
+    def update_segments(self, segments: Sequence[TextSegment]) -> None:
+        """Persist one interactive multi-cue edit as a single transaction."""
+        with self.transaction() as connection:
+            connection.executemany(
+                """UPDATE text_segments SET text=?,start_ms=?,end_ms=?,confidence=?,status=?,locked=?,
+                origin=?,source_fragment_id=?,source_start_char=?,source_end_char=? WHERE id=?""",
+                [
+                    (segment.text, segment.start_ms, segment.end_ms, segment.confidence,
+                     segment.status.value, int(segment.locked), segment.origin.value,
+                     segment.source_fragment_id, segment.source_start_char,
+                     segment.source_end_char, segment.id)
+                    for segment in segments if segment.id is not None
+                ],
+            )
 
     def mark_segments_unmatched(self, segment_ids: Sequence[int]) -> None:
         """Remove audio timing while preserving the source text and row identity."""
@@ -370,6 +498,22 @@ class ProjectRepository:
                 SET start_ms=0,end_ms=0,confidence=0,status=?,locked=0
                 WHERE id IN ({placeholders})""",
                 [SegmentStatus.UNMATCHED.value, *ids],
+            )
+
+    def delete_segments(self, chapter_id: int, segment_ids: Sequence[int]) -> None:
+        ids = [int(value) for value in segment_ids if value is not None]
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with self.transaction() as connection:
+            connection.execute(f"DELETE FROM text_segments WHERE id IN ({placeholders})", ids)
+            rows = connection.execute(
+                "SELECT id FROM text_segments WHERE chapter_id=? ORDER BY position,id",
+                (chapter_id,),
+            ).fetchall()
+            connection.executemany(
+                "UPDATE text_segments SET position=? WHERE id=?",
+                [(position, row["id"]) for position, row in enumerate(rows)],
             )
 
     def add_audio(self, asset: AudioAsset) -> int:
@@ -534,6 +678,38 @@ class ProjectRepository:
         )
         self.connection.commit()
 
+    def alignment_is_current(
+        self,
+        chapter_id: int,
+        recognition_run_id: int,
+        text_hash: str,
+        algorithm_version: str,
+        silence_signature: str,
+    ) -> bool:
+        row = self.connection.execute(
+            """SELECT 1 FROM alignment_runs
+            WHERE chapter_id=? AND recognition_run_id=? AND text_hash=?
+              AND algorithm_version=? AND silence_signature=?""",
+            (chapter_id, recognition_run_id, text_hash, algorithm_version, silence_signature),
+        ).fetchone()
+        return row is not None
+
+    def record_alignment_run(
+        self,
+        chapter_id: int,
+        recognition_run_id: int,
+        text_hash: str,
+        algorithm_version: str,
+        silence_signature: str,
+    ) -> None:
+        self.connection.execute(
+            """INSERT OR IGNORE INTO alignment_runs
+            (chapter_id,recognition_run_id,text_hash,algorithm_version,silence_signature,created_at)
+            VALUES (?,?,?,?,?,?)""",
+            (chapter_id, recognition_run_id, text_hash, algorithm_version, silence_signature, utc_now()),
+        )
+        self.connection.commit()
+
     def delete_recognition_cache(self, chapter_id: int, backend: str | None = None, model: str | None = None) -> int:
         clauses = ["chapter_id=?"]
         values: list[object] = [chapter_id]
@@ -604,10 +780,12 @@ class ProjectRepository:
             for segment in segments:
                 cursor = connection.execute(
                     """INSERT INTO text_segments
-                    (chapter_id,position,text,start_ms,end_ms,confidence,status,locked)
-                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (chapter_id,position,text,start_ms,end_ms,confidence,status,locked,origin,
+                     source_fragment_id,source_start_char,source_end_char)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (chapter_id, segment.position, segment.text, segment.start_ms, segment.end_ms,
-                     segment.confidence, segment.status.value, int(segment.locked)),
+                     segment.confidence, segment.status.value, int(segment.locked), segment.origin.value,
+                     segment.source_fragment_id, segment.source_start_char, segment.source_end_char),
                 )
                 end_offset = source_offset + len(segment.text)
                 inserted.append((source_offset, end_offset, int(cursor.lastrowid)))
@@ -654,10 +832,12 @@ class ProjectRepository:
             for segment in segments:
                 cursor = connection.execute(
                     """INSERT INTO text_segments
-                    (chapter_id,position,text,start_ms,end_ms,confidence,status,locked)
-                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (chapter_id,position,text,start_ms,end_ms,confidence,status,locked,origin,
+                     source_fragment_id,source_start_char,source_end_char)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (chapter_id, segment.position, segment.text, segment.start_ms, segment.end_ms,
-                     segment.confidence, segment.status.value, int(segment.locked)),
+                     segment.confidence, segment.status.value, int(segment.locked), segment.origin.value,
+                     segment.source_fragment_id, segment.source_start_char, segment.source_end_char),
                 )
                 end_offset = source_offset + len(segment.text)
                 inserted.append((source_offset, end_offset, int(cursor.lastrowid)))

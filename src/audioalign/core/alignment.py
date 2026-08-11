@@ -9,6 +9,7 @@ from typing import Sequence
 from .models import (
     ASRToken,
     BoundaryCandidate,
+    SegmentOrigin,
     SegmentStatus,
     SilenceAlignmentOptions,
     TextAudioAnchor,
@@ -65,6 +66,7 @@ def segments_from_asr_tokens(
                 confidence=max(0.0, min(1.0, probability)),
                 status=SegmentStatus.AUTO if probability >= 0.58 else SegmentStatus.LOW_CONFIDENCE,
                 locked=False,
+                origin=SegmentOrigin.ASR,
             )
         )
     return result
@@ -154,6 +156,8 @@ def align_segments_to_tokens(
                 id=s.id, chapter_id=s.chapter_id, position=s.position, text=s.text,
                 start_ms=s.start_ms, end_ms=s.end_ms, confidence=0.0,
                 status=s.status if s.locked else SegmentStatus.UNMATCHED, locked=s.locked,
+                origin=s.origin, source_fragment_id=s.source_fragment_id,
+                source_start_char=s.source_start_char, source_end_char=s.source_end_char,
             )
             for s in segments
         ]
@@ -185,6 +189,8 @@ def align_segments_to_tokens(
                     id=segment.id, chapter_id=segment.chapter_id, position=segment.position,
                     text=segment.text, start_ms=last_end, end_ms=last_end,
                     confidence=coverage, status=SegmentStatus.UNMATCHED, locked=False,
+                    origin=segment.origin, source_fragment_id=segment.source_fragment_id,
+                    source_start_char=segment.source_start_char, source_end_char=segment.source_end_char,
                 )
             )
             continue
@@ -202,6 +208,8 @@ def align_segments_to_tokens(
                 id=segment.id, chapter_id=segment.chapter_id, position=segment.position,
                 text=segment.text, start_ms=start_ms, end_ms=end_ms,
                 confidence=confidence, status=status, locked=False,
+                origin=segment.origin, source_fragment_id=segment.source_fragment_id,
+                source_start_char=segment.source_start_char, source_end_char=segment.source_end_char,
             )
         )
         last_end = end_ms
@@ -221,6 +229,8 @@ def snap_boundaries(
             id=s.id, chapter_id=s.chapter_id, position=s.position, text=s.text,
             start_ms=s.start_ms, end_ms=s.end_ms, confidence=s.confidence,
             status=s.status, locked=s.locked,
+            origin=s.origin, source_fragment_id=s.source_fragment_id,
+            source_start_char=s.source_start_char, source_end_char=s.source_end_char,
         )
         for s in segments
     ]
@@ -256,6 +266,8 @@ def enforce_monotonic(segments: Sequence[TextSegment]) -> list[TextSegment]:
                 id=source.id, chapter_id=source.chapter_id, position=source.position,
                 text=source.text, start_ms=start, end_ms=end, confidence=source.confidence,
                 status=source.status, locked=source.locked,
+                origin=source.origin, source_fragment_id=source.source_fragment_id,
+                source_start_char=source.source_start_char, source_end_char=source.source_end_char,
             )
         )
         cursor = end
@@ -266,6 +278,7 @@ def _copy_segment(source: TextSegment) -> TextSegment:
     return TextSegment(
         source.id, source.chapter_id, source.position, source.text,
         source.start_ms, source.end_ms, source.confidence, source.status, source.locked,
+        source.origin, source.source_fragment_id, source.source_start_char, source.source_end_char,
     )
 
 

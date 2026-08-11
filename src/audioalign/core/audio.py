@@ -74,7 +74,16 @@ def decode_audio_mono(
         channels = handle.getnchannels()
         source_rate = handle.getframerate()
         width = handle.getsampwidth()
-        raw = handle.readframes(handle.getnframes())
+        frame_count = handle.getnframes()
+        source_start = max(0, min(frame_count, int(start_ms * source_rate / 1000)))
+        source_end = frame_count if end_ms is None else max(
+            source_start, min(frame_count, int(end_ms * source_rate / 1000)),
+        )
+        # Reading the complete WAV for every ASR chunk made long book jobs retain
+        # several full-file buffers until Python's collector ran. Decode only the
+        # requested source-frame interval.
+        handle.setpos(source_start)
+        raw = handle.readframes(source_end - source_start)
     dtype = {1: np.uint8, 2: np.int16, 4: np.int32}.get(width)
     if dtype is None:
         raise ValueError(f"不支持的 WAV 位深：{width * 8}")
@@ -90,9 +99,6 @@ def decode_audio_mono(
         target_length = int(round(samples.size * target_rate / source_rate))
         target_x = np.linspace(0, samples.size - 1, target_length)
         samples = np.interp(target_x, source_x, samples).astype(np.float32)
-    start_sample = max(0, int(start_ms * target_rate / 1000))
-    end_sample = samples.size if end_ms is None else min(samples.size, int(end_ms * target_rate / 1000))
-    samples = samples[start_sample:end_sample]
     return samples, target_rate
 
 
