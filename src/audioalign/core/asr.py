@@ -11,12 +11,25 @@ import sys
 import time
 from typing import Callable, Protocol, Sequence
 
-from .models import ASRBackendId, ASRToken, AlignmentMode, BoundaryCandidate, InferenceDeviceInfo
-from .audio import decode_audio_mono
+from .models import (
+    ASRBackendId, ASRToken, AlignmentMode, BoundaryCandidate,
+    InferenceDeviceInfo, SilenceSettings,
+)
+from .audio import decode_audio_mono, detect_silence_candidates
 from .runtime import bootstrap_native_runtime
 
 
 ProgressCallback = Callable[[float, str], None]
+_qwen_cuda_disabled_reason = ""
+
+# Qwen's timestamp path internally splits at 180 seconds. Passing one of our
+# 180-second cores with 1.5-second overlap on both sides produces a 183-second
+# request and a tiny, context-free 3-second tail inside Qwen. Split only inputs
+# that exceed the upstream limit, preferably at a VAD silence near 150 seconds.
+QWEN_MAX_INPUT_MS = 180_000
+QWEN_SPLIT_TARGET_MS = 150_000
+QWEN_MIN_SUBCHUNK_MS = 30_000
+QWEN_MAX_NEW_TOKENS = 1_024
 
 
 class BackendUnavailableError(RuntimeError):
@@ -70,7 +83,7 @@ def inference_memory_status() -> InferenceMemoryStatus:
         try:
             if torch.cuda.is_available() and torch.cuda.is_initialized():
                 gpu_available, gpu_total = (int(value) for value in torch.cuda.mem_get_info())
-        except (AttributeError, RuntimeError):
+        except Exception:
             pass
     return InferenceMemoryStatus(available, total, gpu_available, gpu_total)
 
@@ -88,7 +101,7 @@ def release_inference_memory(transcriber=None, *, aggressive: bool = False) -> N
             try:
                 if torch.cuda.is_available() and torch.cuda.is_initialized():
                     torch.cuda.empty_cache()
-            except (AttributeError, RuntimeError):
+            except Exception:
                 pass
 
 
@@ -124,6 +137,32 @@ def is_inference_out_of_memory(error: BaseException) -> bool:
         "out of memory", "cuda out of memory", "not enough memory",
         "cannot allocate memory", "bad allocation", "cublas_status_alloc_failed",
     ))
+
+
+def _is_fatal_torch_cuda_error(error: BaseException) -> bool:
+    message = f"{type(error).__name__}: {error}".casefold()
+    return is_inference_out_of_memory(error) or any(marker in message for marker in (
+        "cuda error",
+        "illegal memory access",
+        "device-side assert",
+        "unspecified launch failure",
+        "acceleratorerror",
+        "cudnn_status",
+        "cublas_status",
+    ))
+
+
+def qwen_cuda_disabled_reason() -> str:
+    return _qwen_cuda_disabled_reason
+
+
+def _disable_qwen_cuda(error: BaseException) -> str:
+    global _qwen_cuda_disabled_reason
+    summary = " ".join(str(error).split())
+    if len(summary) > 300:
+        summary = summary[:297] + "..."
+    _qwen_cuda_disabled_reason = summary or type(error).__name__
+    return _qwen_cuda_disabled_reason
 
 
 @dataclass(slots=True)
@@ -183,6 +222,7 @@ def plan_audio_chunks(
     target_ms: int = 120_000,
     maximum_ms: int = 180_000,
     overlap_ms: int = 1_500,
+    minimum_tail_ms: int = 0,
 ) -> list[AudioChunkPlan]:
     """Plan bounded chunks whose non-overlapping cores meet at long pauses."""
     start_ms, end_ms = max(0, int(start_ms)), max(0, int(end_ms))
@@ -195,11 +235,14 @@ def plan_audio_chunks(
     boundaries = [start_ms]
     cursor = start_ms
     while end_ms - cursor > maximum_ms:
-        target = cursor + target_ms
-        upper = min(end_ms, cursor + maximum_ms)
+        tail_limit = end_ms - max(0, minimum_tail_ms) if minimum_tail_ms else end_ms
+        upper = min(tail_limit, cursor + maximum_ms)
+        target = min(upper, cursor + target_ms)
         lower = cursor + max(30_000, target_ms // 2)
         choices = [value for value in pauses if lower <= value <= upper]
-        boundary = min(choices, key=lambda value: abs(value - target)) if choices else upper
+        boundary = min(choices, key=lambda value: abs(value - target)) if choices else (
+            target if minimum_tail_ms else upper
+        )
         if boundary <= cursor:
             break
         boundaries.append(boundary)
@@ -211,6 +254,31 @@ def plan_audio_chunks(
         raw_end = min(end_ms, core_end + (overlap_ms if index + 1 < len(boundaries) - 1 else 0))
         result.append(AudioChunkPlan(index, raw_start, raw_end, core_start, core_end))
     return result
+
+
+def plan_recognition_chunks(
+    start_ms: int,
+    end_ms: int,
+    candidates: Sequence[BoundaryCandidate],
+    options: ASROptions,
+    *,
+    preserve_existing_plan: bool = False,
+) -> list[AudioChunkPlan]:
+    """Plan new Qwen runs below its limit while retaining resumable v1 plans."""
+    if options.backend == ASRBackendId.QWEN3_ASR and not preserve_existing_plan:
+        # Interior chunks receive 1.5 seconds of context on both sides, so a
+        # 177-second core is the largest one whose actual request stays within
+        # Qwen's 180-second forced-alignment limit.
+        return plan_audio_chunks(
+            start_ms,
+            end_ms,
+            candidates,
+            target_ms=QWEN_SPLIT_TARGET_MS,
+            maximum_ms=QWEN_MAX_INPUT_MS - 3_000,
+            overlap_ms=1_500,
+            minimum_tail_ms=QWEN_MIN_SUBCHUNK_MS,
+        )
+    return plan_audio_chunks(start_ms, end_ms, candidates)
 
 
 def recognition_cache_key(audio_signature: str, options: ASROptions) -> tuple[str, str]:
@@ -271,7 +339,7 @@ def runtime_status(
     elif probe_device and runtime:
         try:
             import torch  # type: ignore
-            cuda = bool(torch.cuda.is_available())
+            cuda = bool(torch.cuda.is_available()) and not bool(qwen_cuda_disabled_reason())
             compute_types = ("bfloat16", "float16") if cuda else ("float32",)
         except ImportError:
             pass
@@ -296,11 +364,14 @@ def runtime_status(
                     pass
                 device_preview = f" · 将使用 GPU 0 {device_name} · bfloat16".rstrip()
             else:
-                reason = "CPU 版 PyTorch"
+                reason = (
+                    f"本次运行 CUDA 已熔断：{qwen_cuda_disabled_reason()}"
+                    if qwen_cuda_disabled_reason() else "CPU 版 PyTorch"
+                )
                 try:
                     import torch  # type: ignore
 
-                    if torch.version.cuda is not None:
+                    if torch.version.cuda is not None and not qwen_cuda_disabled_reason():
                         reason = "CUDA 不可用"
                 except ImportError:
                     reason = "PyTorch 缺失"
@@ -323,12 +394,15 @@ def runtime_status(
     else:
         reason = ""
         if backend == ASRBackendId.QWEN3_ASR:
-            try:
-                import torch  # type: ignore
+            if qwen_cuda_disabled_reason():
+                reason = f" · CUDA 已熔断并回退 CPU：{qwen_cuda_disabled_reason()}"
+            else:
+                try:
+                    import torch  # type: ignore
 
-                reason = " · CPU 版 PyTorch" if torch.version.cuda is None else " · CUDA 不可用"
-            except ImportError:
-                reason = " · PyTorch 缺失"
+                    reason = " · CPU 版 PyTorch" if torch.version.cuda is None else " · CUDA 不可用"
+                except ImportError:
+                    reason = " · PyTorch 缺失"
         compute = "float32" if backend == ASRBackendId.QWEN3_ASR else "INT8"
         message = f"模型 {model} 已就绪 · CPU · {compute}{reason}"
     return RuntimeStatus(runtime, available, precise, cuda, message, backend.value, compute_types, paths)
@@ -572,14 +646,95 @@ def _qwen_device(options: ASROptions):
         raise BackendUnavailableError("Qwen3-ASR 需要 PyTorch 运行库") from exc
     device = options.device
     if device == "auto":
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        device = (
+            "cuda:0"
+            if torch.cuda.is_available() and not qwen_cuda_disabled_reason()
+            else "cpu"
+        )
     dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
     return torch, str(device), dtype
+
+
+def _load_qwen_with_cpu_fallback(
+    loader,
+    *,
+    torch,
+    device: str,
+    dtype,
+    progress: ProgressCallback | None,
+):
+    """Load on CUDA once, then permanently use CPU after a fatal CUDA failure."""
+    try:
+        return loader(device, dtype), device, dtype, ""
+    except Exception as exc:
+        # Retrying a CUDA OOM by loading the same model on CPU can double host
+        # memory pressure. On Windows that path can terminate in torch_cpu.dll
+        # before Python gets a chance to report the exception.
+        if device.startswith("cuda") and is_inference_out_of_memory(exc):
+            raise InferenceMemoryPressureError(
+                f"Qwen GPU model load ran out of memory: {exc}"
+            ) from exc
+        if not device.startswith("cuda") or not _is_fatal_torch_cuda_error(exc):
+            raise
+        reason = _disable_qwen_cuda(exc)
+        if progress:
+            progress(
+                -1.0,
+                "Qwen CUDA 模型加载失败，已切换 CPU float32；"
+                f"本次运行不再重试 GPU · {reason}",
+            )
+        exc.__traceback__ = None
+        # Do not call any CUDA cleanup API here. After an illegal memory access
+        # even mem_get_info()/empty_cache() may report the previous async error.
+        gc.collect()
+        cpu_device, cpu_dtype = "cpu", torch.float32
+        return loader(cpu_device, cpu_dtype), cpu_device, cpu_dtype, reason
 
 
 def _qwen_timestamp_value(value) -> int:
     numeric = float(value)
     return round(numeric * 1000)
+
+
+def _qwen_vad_subchunk_ranges(
+    samples,
+    sample_rate: int,
+    options: ASROptions,
+) -> list[tuple[int, int]]:
+    """Split only over-limit Qwen inputs, preferring a real VAD silence."""
+    total_samples = len(samples)
+    maximum_samples = max(1, round(sample_rate * QWEN_MAX_INPUT_MS / 1000))
+    if total_samples <= maximum_samples:
+        return [(0, total_samples)] if total_samples else []
+
+    settings = SilenceSettings(
+        vad_threshold=options.vad_threshold,
+        min_silence_ms=options.min_silence_ms,
+    )
+    candidates = detect_silence_candidates(samples, sample_rate, settings)
+    candidate_samples = sorted(
+        round(candidate.time_ms * sample_rate / 1000)
+        for candidate in candidates
+    )
+    minimum_samples = max(1, round(sample_rate * QWEN_MIN_SUBCHUNK_MS / 1000))
+    target_samples = max(1, round(sample_rate * QWEN_SPLIT_TARGET_MS / 1000))
+
+    boundaries = [0]
+    cursor = 0
+    while total_samples - cursor > maximum_samples:
+        # Keep enough material for the final part. This avoids recreating the
+        # pathological 180-second + 3-second split inside Qwen.
+        latest = min(cursor + maximum_samples, total_samples - minimum_samples)
+        earliest = cursor + minimum_samples
+        target = min(cursor + target_samples, latest)
+        nearby = [value for value in candidate_samples if earliest <= value <= latest]
+        boundary = min(nearby, key=lambda value: abs(value - target)) if nearby else target
+        if boundary <= cursor:
+            boundary = latest
+        boundaries.append(boundary)
+        cursor = boundary
+    boundaries.append(total_samples)
+    return list(zip(boundaries, boundaries[1:]))
 
 
 class Qwen3ASRTranscriber:
@@ -596,7 +751,7 @@ class Qwen3ASRTranscriber:
                 try:
                     if torch.cuda.is_available() and torch.cuda.is_initialized():
                         torch.cuda.empty_cache()
-                except (AttributeError, RuntimeError):
+                except Exception:
                     pass
 
     def transcribe(
@@ -616,48 +771,110 @@ class Qwen3ASRTranscriber:
         if progress:
             progress(-1.0, f"加载 {options.model} · {'GPU' if device.startswith('cuda') else 'CPU'}")
         model_key = (model_path, device)
-        if self._model is None or self._model_key != model_key:
-            self._model = Qwen3ASRModel.from_pretrained(
+        fallback_reason = qwen_cuda_disabled_reason() if device == "cpu" else ""
+
+        def load_model(target_device: str, target_dtype):
+            return Qwen3ASRModel.from_pretrained(
                 model_path,
-                dtype=dtype,
-                device_map=device,
+                dtype=target_dtype,
+                device_map=target_device,
                 max_inference_batch_size=1,
-                max_new_tokens=4096,
+                max_new_tokens=QWEN_MAX_NEW_TOKENS,
                 forced_aligner=aligner_path,
-                forced_aligner_kwargs={"dtype": dtype, "device_map": device},
+                forced_aligner_kwargs={"dtype": target_dtype, "device_map": target_device},
             )
-            self._model_key = model_key
+
+        if self._model is None or self._model_key != model_key:
+            self._model, device, dtype, load_fallback = _load_qwen_with_cpu_fallback(
+                load_model, torch=torch, device=device, dtype=dtype, progress=progress,
+            )
+            fallback_reason = load_fallback or fallback_reason
+            self._model_key = (model_path, device)
         model = self._model
-        samples = results = record = None
+        samples = results = record = part_samples = None
+        tokens: list[ASRToken] = []
         try:
             samples, sample_rate = decode_audio_mono(
                 path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
             )
             language = QWEN_ASR_LANGUAGE_NAMES.get((options.language or "").casefold(), options.language)
-            with torch.inference_mode():
-                results = model.transcribe(
-                    audio=(samples, sample_rate), language=language, return_time_stamps=True,
-                )
-            record = results[0]
-            tokens: list[ASRToken] = []
-            for item in getattr(record, "time_stamps", None) or []:
-                text = str(getattr(item, "text", ""))
-                start = getattr(item, "start_time", None)
-                end = getattr(item, "end_time", None)
-                if start is None or end is None:
-                    continue
-                tokens.append(ASRToken(
-                    None, chapter_id, len(tokens), text,
-                    _qwen_timestamp_value(start), _qwen_timestamp_value(end), 0.8,
-                ))
-            if not tokens and getattr(record, "text", ""):
-                duration = max(0, (options.clip_end_ms or options.clip_start_ms) - options.clip_start_ms)
-                tokens.append(ASRToken(None, chapter_id, 0, str(record.text), 0, duration, 0.45))
+            part_ranges = _qwen_vad_subchunk_ranges(samples, sample_rate, options)
+            part_total = max(1, len(part_ranges))
+            for part_index, (sample_start, sample_end) in enumerate(part_ranges):
+                part_samples = samples[sample_start:sample_end]
+                offset_ms = round(sample_start * 1000 / sample_rate)
+                duration_ms = round((sample_end - sample_start) * 1000 / sample_rate)
+                if progress and part_total > 1:
+                    progress(
+                        part_index / part_total,
+                        f"Qwen 安全子块 {part_index + 1}/{part_total}",
+                    )
+                try:
+                    with torch.inference_mode():
+                        results = model.transcribe(
+                            audio=(part_samples, sample_rate),
+                            language=language,
+                            return_time_stamps=True,
+                        )
+                except Exception as exc:
+                    if device.startswith("cuda") and is_inference_out_of_memory(exc):
+                        raise InferenceMemoryPressureError(
+                            "Qwen GPU 推理显存不足；已完成的识别块仍会保留。"
+                            f"失败的安全子块：{part_index + 1}/{part_total}。"
+                        ) from exc
+                    if not device.startswith("cuda") or not _is_fatal_torch_cuda_error(exc):
+                        raise
+                    fallback_reason = _disable_qwen_cuda(exc)
+                    if progress:
+                        progress(
+                            -1.0,
+                            "Qwen CUDA 推理失败，正在用 CPU float32 重试当前安全子块；"
+                            f"本次运行不再重试 GPU · {fallback_reason}",
+                        )
+                    exc.__traceback__ = None
+                    self._model = None
+                    self._model_key = None
+                    model = None
+                    gc.collect()
+                    device, dtype = "cpu", torch.float32
+                    self._model = load_model(device, dtype)
+                    self._model_key = (model_path, device)
+                    model = self._model
+                    with torch.inference_mode():
+                        results = model.transcribe(
+                            audio=(part_samples, sample_rate),
+                            language=language,
+                            return_time_stamps=True,
+                        )
+                record = results[0]
+                part_had_timestamps = False
+                for item in getattr(record, "time_stamps", None) or []:
+                    text = str(getattr(item, "text", ""))
+                    start = getattr(item, "start_time", None)
+                    end = getattr(item, "end_time", None)
+                    if start is None or end is None:
+                        continue
+                    part_had_timestamps = True
+                    tokens.append(ASRToken(
+                        None, chapter_id, len(tokens), text,
+                        offset_ms + _qwen_timestamp_value(start),
+                        offset_ms + _qwen_timestamp_value(end),
+                        0.8,
+                    ))
+                if not part_had_timestamps and getattr(record, "text", ""):
+                    tokens.append(ASRToken(
+                        None, chapter_id, len(tokens), str(record.text),
+                        offset_ms, offset_ms + duration_ms, 0.45,
+                    ))
+                record = None
+                results = None
+                part_samples = None
         finally:
             # Some qwen-asr result objects retain tensors through their timestamp
             # records. Break those references before the next book chunk starts.
             record = None
             results = None
+            part_samples = None
             samples = None
         device_name = ""
         if device.startswith("cuda"):
@@ -670,6 +887,7 @@ class Qwen3ASRTranscriber:
             "cuda" if device.startswith("cuda") else "cpu",
             0 if device.startswith("cuda") else None, device_name,
             "bfloat16" if device.startswith("cuda") else "float32",
+            fallback_reason,
         )
         if progress:
             progress(1.0, "Qwen3-ASR 识别完成")
@@ -694,7 +912,7 @@ class Qwen3ForcedAligner:
                 try:
                     if torch.cuda.is_available() and torch.cuda.is_initialized():
                         torch.cuda.empty_cache()
-                except (AttributeError, RuntimeError):
+                except Exception:
                     pass
 
     def align(
@@ -716,9 +934,19 @@ class Qwen3ForcedAligner:
         torch, device, dtype = _qwen_device(options)
         model_path = _ensure_qwen_model(options.model_root, "Qwen3-ForcedAligner-0.6B", progress)
         model_key = (model_path, device, str(dtype))
+        fallback_reason = qwen_cuda_disabled_reason() if device == "cpu" else ""
+
+        def load_model(target_device: str, target_dtype):
+            return QwenAlignerModel.from_pretrained(
+                model_path, dtype=target_dtype, device_map=target_device,
+            )
+
         if self._model is None or self._model_key != model_key:
-            self._model = QwenAlignerModel.from_pretrained(model_path, dtype=dtype, device_map=device)
-            self._model_key = model_key
+            self._model, device, dtype, load_fallback = _load_qwen_with_cpu_fallback(
+                load_model, torch=torch, device=device, dtype=dtype, progress=progress,
+            )
+            fallback_reason = load_fallback or fallback_reason
+            self._model_key = (model_path, device, str(dtype))
         model = self._model
         samples = results = None
         try:
@@ -726,8 +954,32 @@ class Qwen3ForcedAligner:
                 path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
             )
             language_name = QWEN_ASR_LANGUAGE_NAMES.get(language.casefold(), language)
-            with torch.inference_mode():
-                results = model.align(audio=(samples, sample_rate), text=text, language=language_name)
+            try:
+                with torch.inference_mode():
+                    results = model.align(audio=(samples, sample_rate), text=text, language=language_name)
+            except Exception as exc:
+                if not device.startswith("cuda") or not _is_fatal_torch_cuda_error(exc):
+                    raise
+                fallback_reason = _disable_qwen_cuda(exc)
+                if progress:
+                    progress(
+                        -1.0,
+                        "Qwen ForcedAligner CUDA 失败，正在用 CPU float32 重试；"
+                        f"本次运行不再重试 GPU · {fallback_reason}",
+                    )
+                exc.__traceback__ = None
+                self._model = None
+                self._model_key = None
+                model = None
+                gc.collect()
+                device, dtype = "cpu", torch.float32
+                self._model = load_model(device, dtype)
+                self._model_key = (model_path, device, str(dtype))
+                model = self._model
+                with torch.inference_mode():
+                    results = model.align(
+                        audio=(samples, sample_rate), text=text, language=language_name,
+                    )
             tokens: list[ASRToken] = []
             for item in results[0]:
                 tokens.append(ASRToken(
@@ -737,11 +989,17 @@ class Qwen3ForcedAligner:
         finally:
             results = None
             samples = None
-        device_name = torch.cuda.get_device_name(0) if device.startswith("cuda") else ""
+        device_name = ""
+        if device.startswith("cuda"):
+            try:
+                device_name = torch.cuda.get_device_name(0)
+            except Exception:
+                pass
         self.last_device_info = InferenceDeviceInfo(
             "qwen3-forced-aligner", "Qwen3-ForcedAligner-0.6B", options.device,
             "cuda" if device.startswith("cuda") else "cpu", 0 if device.startswith("cuda") else None,
             device_name, "bfloat16" if device.startswith("cuda") else "float32",
+            fallback_reason,
         )
         return tokens
 

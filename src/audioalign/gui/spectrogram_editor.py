@@ -901,6 +901,10 @@ class AudioVisualizerOverview(pg.PlotWidget):
         self.duration_ms = EMPTY_TIMELINE_MS
         self.mode = AudioVisualizationMode.COMBINED
         self.cache: AudioVisualizationCache | None = None
+        self.setToolTip(
+            "总览图：黄色=低置信度句段，红色=未匹配句段，灰蓝=静音区，"
+            "蓝色边框及淡蓝填充=主视图窗口，青色竖线=当前播放位置"
+        )
         self.image = pg.ImageItem(axisOrder="col-major")
         self.image.setLookupTable(_colour_map())
         self.image.setLevels((0, 255))
@@ -911,7 +915,18 @@ class AudioVisualizerOverview(pg.PlotWidget):
         self.addItem(self.wave_fill)
         self.addItem(self.wave_min)
         self.addItem(self.wave_max)
+        self.play_line = pg.InfiniteLine(
+            angle=90, movable=False, pen=pg.mkPen("#35e7ef", width=2),
+        )
+        self.play_line.setZValue(12)
+        self.addItem(self.play_line)
         self.window = pg.LinearRegionItem((0, 1), movable=True, brush=pg.mkBrush(90, 160, 255, 42))
+        # PyQtGraph's default region handles are yellow, which is already used
+        # for low-confidence cues in this overview. Give the viewport its own
+        # unambiguous blue visual language.
+        for line in self.window.lines:
+            line.setPen(pg.mkPen("#4da3ff", width=2))
+            line.setHoverPen(pg.mkPen("#d8efff", width=3))
         self.window.setZValue(8)
         self.addItem(self.window)
         self.window.sigRegionChanged.connect(self.interactionStarted.emit)
@@ -921,6 +936,11 @@ class AudioVisualizerOverview(pg.PlotWidget):
         self._silences: list = []
         self.silences_visible = True
         self.set_cache(None)
+
+    def set_playhead(self, milliseconds: int) -> None:
+        value = max(0, min(self.duration_ms, int(milliseconds)))
+        self.play_line.setValue(value / 1000)
+        self.play_line.setVisible(self.has_audio)
 
     def set_mode(self, mode: AudioVisualizationMode | str) -> None:
         self.mode = AudioVisualizationMode(mode)
@@ -938,6 +958,7 @@ class AudioVisualizerOverview(pg.PlotWidget):
         self.window.blockSignals(True)
         self.window.setBounds((0, self.duration_ms / 1000))
         self.window.blockSignals(False)
+        self.set_playhead(0)
         self._render()
 
     def _render(self) -> None:

@@ -42,6 +42,54 @@ except ImportError:
 
 @unittest.skipIf(QApplication is None, "PySide6 is not installed")
 class GuiSmokeTests(unittest.TestCase):
+    def test_segment_loop_uses_live_timing_but_manual_selection_is_fixed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("live-loop", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(
+                chapter_id,
+                [TextSegment(None, chapter_id, 0, "sentence", 1_000, 4_000)],
+            )
+            window = MainWindow()
+            window._set_session(session)
+            window._set_segment_play_range(0)
+            self.assertEqual((1_000, 4_000), window._active_play_bounds())
+
+            window.segment_model.segments[0].end_ms = 2_500
+            window._refresh_segment_play_range()
+            self.assertEqual((1_000, 2_500), window._active_play_bounds())
+            self.assertEqual(
+                (1_000, 2_500),
+                (window.spectrogram.selection.start_ms, window.spectrogram.selection.end_ms),
+            )
+
+            window._clear_play_range()
+            window.spectrogram.set_selection(5_000, 7_000)
+            window._play_range_start = 5_000
+            window._play_range_end = 7_000
+            window.segment_model.segments[0].end_ms = 2_000
+            self.assertEqual((5_000, 7_000), window._active_play_bounds())
+            window.close()
+
+    def test_audio_double_click_preserves_pre_seek_playing_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("double-click", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(
+                chapter_id,
+                [TextSegment(None, chapter_id, 0, "sentence", 1_000, 4_000)],
+            )
+            window = MainWindow()
+            window._set_session(session)
+            # Simulate the backend reporting Paused after the first click seek,
+            # while the click latch records that playback had been active.
+            window._recent_audio_click_at = time.monotonic()
+            window._recent_audio_click_row = 0
+            window._recent_audio_click_was_playing = True
+            window._segment_double_activated(0, 2_000)
+            self.assertEqual((1_000, 4_000), window._active_play_bounds())
+            window.close()
+
     def test_fixed_text_editor_splits_at_cursor_as_one_undo_step(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("cursor-split", Path(temporary) / "project")
@@ -217,6 +265,12 @@ class GuiSmokeTests(unittest.TestCase):
         editor.set_cache(None, 60_000)
         self.assertTrue(editor.has_audio)
         self.assertEqual(60_000, editor.duration_ms)
+        overview.set_cache(None, 60_000)
+        overview.set_playhead(12_345)
+        self.assertAlmostEqual(12.345, overview.play_line.value())
+        self.assertIn("黄色=低置信度句段", overview.toolTip())
+        self.assertIn("蓝色边框及淡蓝填充=主视图窗口", overview.toolTip())
+        self.assertTrue(all(line.pen.color().name() == "#4da3ff" for line in overview.window.lines))
 
     def test_window_loads_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"LOCALAPPDATA": temporary}):

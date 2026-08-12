@@ -4,18 +4,25 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
+
+import numpy as np
 
 from audioalign.core.asr import (
     ASROptions,
     FasterWhisperTranscriber,
+    InferenceMemoryPressureError,
+    QWEN_MAX_NEW_TOKENS,
+    Qwen3ASRTranscriber,
     _ensure_qwen_model,
     _qwen_device,
     plan_audio_chunks,
+    plan_recognition_chunks,
     recognition_cache_key,
 )
-from audioalign.core.models import BoundaryCandidate
+from audioalign.core.models import ASRBackendId, BoundaryCandidate
 
 
 class _Info:
@@ -36,6 +43,145 @@ class _Segment:
 
 
 class ASRTests(unittest.TestCase):
+    def test_qwen_splits_over_limit_outer_chunk_at_vad_silence(self) -> None:
+        calls: list[int] = []
+        load_options: list[dict] = []
+
+        class FakeQwenModel:
+            @classmethod
+            def from_pretrained(cls, _path, **kwargs):
+                load_options.append(kwargs)
+                return cls()
+
+            def transcribe(self, *, audio, **_kwargs):
+                samples, sample_rate = audio
+                calls.append(len(samples))
+                duration = len(samples) / sample_rate
+                stamp = types.SimpleNamespace(text="part", start_time=0.0, end_time=duration)
+                return [types.SimpleNamespace(text="part", time_stamps=[stamp])]
+
+        fake_qwen = types.ModuleType("qwen_asr")
+        fake_qwen.Qwen3ASRModel = FakeQwenModel
+        fake_torch = types.ModuleType("torch")
+        fake_torch.float32 = object()
+        fake_torch.bfloat16 = object()
+        fake_torch.inference_mode = nullcontext
+        fake_torch.cuda = types.SimpleNamespace(
+            is_available=lambda: False,
+            is_initialized=lambda: False,
+        )
+        with (
+            patch.dict(sys.modules, {"qwen_asr": fake_qwen, "torch": fake_torch}),
+            patch("audioalign.core.asr._ensure_qwen_model", return_value="model"),
+            patch(
+                "audioalign.core.asr.decode_audio_mono",
+                return_value=(np.zeros(183 * 16_000, dtype=np.float32), 16_000),
+            ),
+            patch(
+                "audioalign.core.asr.detect_silence_candidates",
+                return_value=[BoundaryCandidate(150_000, 0.95, "vad-silence")],
+            ),
+        ):
+            tokens = Qwen3ASRTranscriber().transcribe(
+                "audio.wav", 1, ASROptions(model="Qwen3-ASR-0.6B"),
+            )
+
+        self.assertEqual([150 * 16_000, 33 * 16_000], calls)
+        self.assertEqual(QWEN_MAX_NEW_TOKENS, load_options[0]["max_new_tokens"])
+        self.assertEqual([0, 150_000], [token.start_ms for token in tokens])
+        self.assertEqual(183_000, tokens[-1].end_ms)
+
+    def test_qwen_fatal_cuda_load_error_falls_back_to_cpu_for_the_task(self) -> None:
+        load_devices: list[str] = []
+
+        class FakeQwenModel:
+            @classmethod
+            def from_pretrained(cls, _path, **kwargs):
+                device = kwargs["device_map"]
+                load_devices.append(device)
+                if str(device).startswith("cuda"):
+                    raise RuntimeError("CUDA error: an illegal memory access was encountered")
+                return cls()
+
+            def transcribe(self, **_kwargs):
+                stamp = types.SimpleNamespace(text="hello", start_time=0.1, end_time=0.5)
+                return [types.SimpleNamespace(text="hello", time_stamps=[stamp])]
+
+        fake_qwen = types.ModuleType("qwen_asr")
+        fake_qwen.Qwen3ASRModel = FakeQwenModel
+        fake_torch = types.ModuleType("torch")
+        fake_torch.float32 = object()
+        fake_torch.bfloat16 = object()
+        fake_torch.inference_mode = nullcontext
+        fake_torch.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            is_initialized=lambda: True,
+            get_device_name=lambda _index: "Fake GPU",
+        )
+        messages: list[str] = []
+        with (
+            patch.dict(sys.modules, {"qwen_asr": fake_qwen, "torch": fake_torch}),
+            patch("audioalign.core.asr._qwen_cuda_disabled_reason", ""),
+            patch("audioalign.core.asr._ensure_qwen_model", return_value="model"),
+            patch(
+                "audioalign.core.asr.decode_audio_mono",
+                return_value=(np.zeros(1600, dtype=np.float32), 16000),
+            ),
+        ):
+            transcriber = Qwen3ASRTranscriber()
+            tokens = transcriber.transcribe(
+                "audio.wav",
+                1,
+                ASROptions(model="Qwen3-ASR-0.6B"),
+                lambda _value, message: messages.append(message),
+            )
+            self.assertNotEqual("", __import__("audioalign.core.asr", fromlist=[""]).qwen_cuda_disabled_reason())
+
+        self.assertEqual(["cuda:0", "cpu"], load_devices)
+        self.assertEqual("hello", tokens[0].text)
+        self.assertEqual("cpu", transcriber.last_device_info.actual_device)
+        self.assertIn("illegal memory access", transcriber.last_device_info.fallback_reason)
+        self.assertTrue(any("CPU float32" in message for message in messages))
+
+    def test_qwen_cuda_oom_stops_without_loading_cpu_copy(self) -> None:
+        load_devices: list[str] = []
+
+        class FakeQwenModel:
+            @classmethod
+            def from_pretrained(cls, _path, **kwargs):
+                load_devices.append(kwargs["device_map"])
+                return cls()
+
+            def transcribe(self, **_kwargs):
+                raise RuntimeError("CUDA out of memory. Tried to allocate 10.83 GiB")
+
+        fake_qwen = types.ModuleType("qwen_asr")
+        fake_qwen.Qwen3ASRModel = FakeQwenModel
+        fake_torch = types.ModuleType("torch")
+        fake_torch.float32 = object()
+        fake_torch.bfloat16 = object()
+        fake_torch.inference_mode = nullcontext
+        fake_torch.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            is_initialized=lambda: True,
+            get_device_name=lambda _index: "Fake GPU",
+        )
+        with (
+            patch.dict(sys.modules, {"qwen_asr": fake_qwen, "torch": fake_torch}),
+            patch("audioalign.core.asr._qwen_cuda_disabled_reason", ""),
+            patch("audioalign.core.asr._ensure_qwen_model", return_value="model"),
+            patch(
+                "audioalign.core.asr.decode_audio_mono",
+                return_value=(np.zeros(1600, dtype=np.float32), 16_000),
+            ),
+        ):
+            with self.assertRaises(InferenceMemoryPressureError):
+                Qwen3ASRTranscriber().transcribe(
+                    "audio.wav", 1, ASROptions(model="Qwen3-ASR-0.6B"),
+                )
+
+        self.assertEqual(["cuda:0"], load_devices)
+
     def test_long_audio_chunk_plan_uses_pause_and_bounded_overlap(self) -> None:
         chunks = plan_audio_chunks(
             0, 400_000, [BoundaryCandidate(118_000, 0.9), BoundaryCandidate(241_000, 0.8)],
@@ -45,6 +191,25 @@ class ASRTests(unittest.TestCase):
         self.assertEqual(400_000, chunks[-1].core_end_ms)
         self.assertTrue(all(chunk.end_ms - chunk.start_ms <= 183_000 for chunk in chunks))
         self.assertEqual(chunks[0].core_end_ms - 1_500, chunks[1].start_ms)
+
+    def test_new_qwen_plan_accounts_for_overlap_and_avoids_short_tail(self) -> None:
+        options = ASROptions(backend=ASRBackendId.QWEN3_ASR)
+        chunks = plan_recognition_chunks(
+            0, 400_000,
+            [BoundaryCandidate(147_450, 0.95), BoundaryCandidate(299_000, 0.9)],
+            options,
+        )
+        self.assertEqual(147_450, chunks[0].core_end_ms)
+        self.assertTrue(all(chunk.end_ms - chunk.start_ms <= 180_000 for chunk in chunks))
+        self.assertGreaterEqual(chunks[-1].core_end_ms - chunks[-1].core_start_ms, 30_000)
+
+    def test_resumed_qwen_run_keeps_original_chunk_plan(self) -> None:
+        options = ASROptions(backend=ASRBackendId.QWEN3_ASR)
+        resumed = plan_recognition_chunks(
+            0, 400_000, [], options, preserve_existing_plan=True,
+        )
+        original = plan_audio_chunks(0, 400_000, [])
+        self.assertEqual(original, resumed)
 
     def test_cache_key_changes_with_recognition_parameters(self) -> None:
         options = ASROptions(model="small", vad_threshold=0.5)

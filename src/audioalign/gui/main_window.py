@@ -65,7 +65,8 @@ from audioalign.core.asr import (
     Qwen3ForcedAligner,
     ensure_inference_memory_headroom,
     is_inference_out_of_memory,
-    plan_audio_chunks,
+    plan_recognition_chunks,
+    qwen_cuda_disabled_reason,
     recognition_cache_key,
     release_inference_memory,
     RuntimeStatus,
@@ -447,7 +448,14 @@ class MainWindow(QMainWindow):
         self._task_fraction = 0.0
         self._media_task_fraction = 0.0
         self._loop_selection = False
+        self._play_range_start: int | None = None
         self._play_range_end: int | None = None
+        # A sentence playback range is identified by the segment, not copied
+        # timestamps. Its live boundaries may change while the user drags or
+        # edits the timing fields. `_play_range_end` is reserved for a manual
+        # time selection, whose range is intentionally fixed.
+        self._play_range_segment_id: int | None = None
+        self._play_range_segment_row: int | None = None
         self._tasks_paused = False
         self._proxy_attempted: set[int] = set()
         self._editor_loading = False
@@ -456,6 +464,9 @@ class MainWindow(QMainWindow):
         self._speed_warning_shown = False
         self._playback_row_update = False
         self._manual_selection_until = 0.0
+        self._recent_audio_click_at = 0.0
+        self._recent_audio_click_row = -1
+        self._recent_audio_click_was_playing = False
         self._seek_generation = 0
         self._pending_seek_target: int | None = None
         self._pending_seek_deadline = 0.0
@@ -1192,6 +1203,7 @@ class MainWindow(QMainWindow):
             self.session.close()
         self.session = session
         self.current_chapter_id = None
+        self._clear_play_range()
         self._sync_settings_from_manifest()
         self._reload_chapters()
         self._update_title()
@@ -1229,6 +1241,7 @@ class MainWindow(QMainWindow):
         if row >= len(chapters):
             return
         chapter = chapters[row]
+        self._clear_play_range()
         self.current_chapter_id = chapter.id
         self.status_chapters.setText(f"章节 {row + 1}/{len(chapters)}")
         segments = self.session.repository.segments(chapter.id or 0)
@@ -1598,10 +1611,12 @@ class MainWindow(QMainWindow):
             self.model_status_label.setText(status.message)
             return True
         reason = "PyTorch 没有检测到可用的 CUDA 设备"
+        if qwen_cuda_disabled_reason():
+            reason = f"本次运行 CUDA 已发生致命错误并熔断：{qwen_cuda_disabled_reason()}"
         try:
             import torch  # type: ignore
 
-            if torch.version.cuda is None:
+            if torch.version.cuda is None and not qwen_cuda_disabled_reason():
                 reason = f"当前安装的是 CPU 版 PyTorch（{torch.__version__}）"
         except ImportError:
             reason = "PyTorch 运行库缺失"
@@ -1672,6 +1687,8 @@ class MainWindow(QMainWindow):
             self._apply_recognition_tokens(chapter_id, tokens, run)
             return
 
+        existing_chunks = self.session.repository.recognition_chunks(run.id or 0)
+        preserve_existing_plan = bool(existing_chunks) and not force
         planned: list[tuple[int, object, object, Path, int]] = []
         position = 0
         for part_index, (link, asset, path, local_start, local_end) in enumerate(parts):
@@ -1679,11 +1696,14 @@ class MainWindow(QMainWindow):
                 candidate for candidate in self.silence_candidates
                 if local_start < candidate.time_ms < local_end
             ]
-            for chunk in plan_audio_chunks(local_start, local_end, candidates):
+            for chunk in plan_recognition_chunks(
+                local_start, local_end, candidates, options,
+                preserve_existing_plan=preserve_existing_plan,
+            ):
                 planned.append((position, chunk, link, path, local_start))
                 position += 1
         completed_positions = {
-            chunk.position for chunk in self.session.repository.recognition_chunks(run.id or 0)
+            chunk.position for chunk in existing_chunks
             if chunk.status == "complete"
         }
         database = self.session.repository.database
@@ -1818,19 +1838,35 @@ class MainWindow(QMainWindow):
                 continue
             silence_signature = self._parts_silence_signature(parts, settings)
             candidates = self.session.repository.silence_candidates(chapter_id, silence_signature)
-            prepared.append((chapter_id, chapter.title, parts, candidates))
+            audio_signature = self._parts_audio_signature(parts)
+            cache_key, _parameters_json = recognition_cache_key(audio_signature, options)
+            existing_run = self.session.repository.recognition_run(cache_key)
+            preserve_existing_plan = bool(
+                existing_run
+                and existing_run.id
+                and self.session.repository.recognition_chunks(existing_run.id)
+                and not force
+            )
+            prepared.append((
+                chapter_id, chapter.title, parts, candidates, preserve_existing_plan,
+            ))
         if not prepared:
             self._show_error("全书没有可处理的章节；请先在配对管理器中建立章节与音频关系。")
             return
 
-        total_duration = sum(parts[-1][4] for _chapter_id, _title, parts, _candidates in prepared)
+        total_duration = sum(
+            parts[-1][4]
+            for _chapter_id, _title, parts, _candidates, _preserve in prepared
+        )
         total_chunks = sum(
-            len(plan_audio_chunks(
+            len(plan_recognition_chunks(
                 local_start,
                 local_end,
                 [candidate for candidate in candidates if local_start < candidate.time_ms < local_end],
+                options,
+                preserve_existing_plan=preserve_existing_plan,
             ))
-            for _chapter_id, _title, parts, candidates in prepared
+            for _chapter_id, _title, parts, candidates, preserve_existing_plan in prepared
             for _link, _asset, _path, local_start, local_end in parts
         )
         work_plan = BookWorkPlan(len(prepared), total_chunks, total_duration)
@@ -1865,7 +1901,9 @@ class MainWindow(QMainWindow):
             processed_audio_ms = 0
             completed_chunks = 0
             try:
-                for chapter_index, (chapter_id, title, parts, candidates) in enumerate(prepared):
+                for chapter_index, (
+                    chapter_id, title, parts, candidates, preserve_existing_plan,
+                ) in enumerate(prepared):
                     chapter_duration = parts[-1][4]
                     chapter_prefix = f"全书 {chapter_index + 1}/{total_chapters} · {title}"
                     progress(
@@ -1909,6 +1947,10 @@ class MainWindow(QMainWindow):
                         )
                         continue
                     if not used_cache:
+                        existing_chunks = repository.recognition_chunks(run.id or 0)
+                        preserve_existing_plan = (
+                            preserve_existing_plan or (bool(existing_chunks) and not force)
+                        )
                         planned = []
                         chunk_position = 0
                         for link, _asset, path, local_start, local_end in parts:
@@ -1916,11 +1958,14 @@ class MainWindow(QMainWindow):
                                 candidate for candidate in candidates
                                 if local_start < candidate.time_ms < local_end
                             ]
-                            for chunk in plan_audio_chunks(local_start, local_end, part_candidates):
+                            for chunk in plan_recognition_chunks(
+                                local_start, local_end, part_candidates, options,
+                                preserve_existing_plan=preserve_existing_plan,
+                            ):
                                 planned.append((chunk_position, chunk, link, path, local_start))
                                 chunk_position += 1
                         completed_positions = {
-                            chunk.position for chunk in repository.recognition_chunks(run.id or 0)
+                            chunk.position for chunk in existing_chunks
                             if chunk.status == "complete"
                         }
                         chunk_total = max(1, len(planned))
@@ -2923,6 +2968,7 @@ class MainWindow(QMainWindow):
         )
         if self.segment_table.currentIndex().row() == row:
             self._load_segment_editor(row)
+        self._refresh_segment_play_range()
         self._drag_changed_rows.clear()
         self._mark_dirty()
 
@@ -3393,6 +3439,7 @@ class MainWindow(QMainWindow):
         self.asr_comparison.set_content(
             self.segment_model.segments, self.session.repository.asr_tokens(self.current_chapter_id),
         )
+        self._refresh_segment_play_range()
         self._mark_dirty()
 
     def _persist_current_segments(self) -> None:
@@ -3410,6 +3457,7 @@ class MainWindow(QMainWindow):
             self.asr_comparison.set_content(
                 self.segment_model.segments, self.session.repository.asr_tokens(self.current_chapter_id or 0),
             )
+            self._refresh_segment_play_range()
             self._mark_dirty()
 
     def _push_history(self) -> None:
@@ -3434,7 +3482,7 @@ class MainWindow(QMainWindow):
             return
         row = current.row()
         if not self._playback_row_update:
-            self._play_range_end = None
+            self._clear_play_range()
             self._manual_selection_until = time.monotonic() + 0.35
         self.spectrogram.select_segment(row)
         self.article_view.focus_segment(
@@ -3546,6 +3594,7 @@ class MainWindow(QMainWindow):
         self.editor_end.setText(_time(end))
         self.editor_duration.setText(_time(end - start))
         self._editor_loading = False
+        self._refresh_segment_play_range()
         self._mark_dirty()
 
     def _select_segment_row(self, row: int) -> None:
@@ -3563,13 +3612,69 @@ class MainWindow(QMainWindow):
         self.spectrogram.suspend_follow("article")
         self.spectrogram.focus_time(milliseconds, self.spectrogram.view_end - self.spectrogram.view_start)
 
-    def _audio_seek_requested(self, milliseconds: int) -> None:
+    def _clear_play_range(self) -> None:
+        self._play_range_start = None
         self._play_range_end = None
+        self._play_range_segment_id = None
+        self._play_range_segment_row = None
+
+    def _set_segment_play_range(self, row: int) -> None:
+        if not (0 <= row < len(self.segment_model.segments)):
+            self._clear_play_range()
+            return
+        segment = self.segment_model.segments[row]
+        self._play_range_start = None
+        self._play_range_end = None
+        self._play_range_segment_id = segment.id
+        self._play_range_segment_row = row
+
+    def _active_segment_play_row(self) -> int:
+        if self._play_range_segment_id is not None:
+            for row, segment in enumerate(self.segment_model.segments):
+                if segment.id == self._play_range_segment_id:
+                    self._play_range_segment_row = row
+                    return row
+            return -1
+        row = self._play_range_segment_row
+        return row if row is not None and 0 <= row < len(self.segment_model.segments) else -1
+
+    def _active_play_bounds(self) -> tuple[int, int] | None:
+        row = self._active_segment_play_row()
+        if row >= 0:
+            segment = self.segment_model.segments[row]
+            if segment.end_ms > segment.start_ms:
+                return segment.start_ms, segment.end_ms
+            return None
+        if self._play_range_start is not None and self._play_range_end is not None:
+            return self._play_range_start, self._play_range_end
+        return None
+
+    def _refresh_segment_play_range(self) -> None:
+        """Keep the displayed cue range synchronized with live segment timing."""
+        row = self._active_segment_play_row()
+        if row < 0:
+            return
+        segment = self.segment_model.segments[row]
+        if segment.end_ms > segment.start_ms:
+            self.spectrogram.set_selection(segment.start_ms, segment.end_ms)
+        else:
+            self.spectrogram.clear_selection()
+
+    def _audio_seek_requested(self, milliseconds: int) -> None:
+        self._clear_play_range()
         self._seek_local(milliseconds)
 
     def _audio_time_activated(self, milliseconds: int, row: int, _modifiers: int = 0) -> None:
         """A click always seeks first and only then changes the current cue."""
-        self._play_range_end = None
+        # Qt sends the first click of a double-click through this handler. Some
+        # multimedia backends briefly report Paused while processing its seek,
+        # so remember the state before that seek for the double-click handler.
+        self._recent_audio_click_at = time.monotonic()
+        self._recent_audio_click_row = row
+        self._recent_audio_click_was_playing = (
+            self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        self._clear_play_range()
         self._manual_selection_until = time.monotonic() + 0.35
         self._seek_local(milliseconds)
         if row >= 0:
@@ -3581,16 +3686,26 @@ class MainWindow(QMainWindow):
         if not (0 <= row < len(self.segment_model.segments)):
             return
         was_playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        if (
+            milliseconds is not None
+            and self._recent_audio_click_row == row
+            and time.monotonic() - self._recent_audio_click_at
+            <= max(0.5, QApplication.doubleClickInterval() / 1000 + 0.15)
+        ):
+            was_playing = was_playing or self._recent_audio_click_was_playing
+        self._recent_audio_click_at = 0.0
+        self._recent_audio_click_row = -1
+        self._recent_audio_click_was_playing = False
         segment = self.segment_model.segments[row]
         target = segment.start_ms if milliseconds is None else max(segment.start_ms, min(segment.end_ms, milliseconds))
-        self._play_range_end = None
+        self._clear_play_range()
         self._manual_selection_until = time.monotonic() + 0.35
         self._seek_local(target)
         self._select_segment_row(row)
         self.spectrogram.select_segment(row)
         self.spectrogram.set_selection(segment.start_ms, segment.end_ms)
         if was_playing and segment.end_ms > target:
-            self._play_range_end = segment.end_ms
+            self._set_segment_play_range(row)
             self.spectrogram.restore_follow()
             self.player.play()
 
@@ -3604,6 +3719,7 @@ class MainWindow(QMainWindow):
         self._pending_seek_target = milliseconds
         self._pending_seek_deadline = time.monotonic() + 2.0
         self.spectrogram.set_playhead(milliseconds)
+        self.overview.set_playhead(milliseconds)
         for link, asset, path, local_start, local_end in self.current_parts:
             if local_start <= milliseconds <= local_end:
                 was_playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
@@ -3618,7 +3734,7 @@ class MainWindow(QMainWindow):
         self.player.setPosition(offset + milliseconds)
 
     def seek_relative(self, amount_ms: int) -> None:
-        self._play_range_end = None
+        self._clear_play_range()
         self._seek_local(max(0, self._local_position() + amount_ms))
 
     def _local_position(self) -> int:
@@ -3631,13 +3747,16 @@ class MainWindow(QMainWindow):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
-            self._play_range_end = None
+            self._clear_play_range()
             self.player.play()
 
     def play_selection(self) -> None:
         if self.spectrogram.selection:
-            self._seek_local(self.spectrogram.selection.start_ms)
+            self._play_range_segment_id = None
+            self._play_range_segment_row = None
+            self._play_range_start = self.spectrogram.selection.start_ms
             self._play_range_end = self.spectrogram.selection.end_ms
+            self._seek_local(self._play_range_start)
             self.spectrogram.restore_follow()
             self.player.play()
 
@@ -3652,7 +3771,7 @@ class MainWindow(QMainWindow):
         self.spectrogram.set_selection(segment.start_ms, segment.end_ms)
         self.spectrogram.restore_follow()
         self._seek_local(segment.start_ms)
-        self._play_range_end = segment.end_ms
+        self._set_segment_play_range(row)
         self.player.play()
 
     def play_current_segment(self) -> None:
@@ -3810,15 +3929,15 @@ class MainWindow(QMainWindow):
                 return
             else:
                 self._pending_seek_target = None
-        if self._play_range_end is not None and local >= self._play_range_end:
-            selection = self.spectrogram.selection
-            if self._loop_selection and selection and selection.end_ms > selection.start_ms:
-                self._seek_local(selection.start_ms)
+        play_bounds = self._active_play_bounds()
+        if play_bounds is not None and local >= play_bounds[1]:
+            if self._loop_selection:
+                self._seek_local(play_bounds[0])
                 self.player.play()
                 return
             self.player.pause()
-            local = self._play_range_end
-            self._play_range_end = None
+            local = play_bounds[1]
+            self._clear_play_range()
         if self.current_link and absolute_ms >= self.current_link.source_end_ms:
             current_index = next((index for index, part in enumerate(self.current_parts) if part[0] is self.current_link), -1)
             if 0 <= current_index + 1 < len(self.current_parts):
@@ -3828,12 +3947,8 @@ class MainWindow(QMainWindow):
                 return
             self.player.pause()
             local = duration
-        selection = self.spectrogram.selection
-        if self._loop_selection and selection and local >= selection.end_ms:
-            self._seek_local(selection.start_ms)
-            self.player.play()
-            return
         self.spectrogram.follow_playhead(local)
+        self.overview.set_playhead(local)
         self.time_label.setText(f"{_time(local)} / {_time(duration)} · {self.playback_rate:.2f}×")
         row = self.segment_model.row_for_time(local)
         if time.monotonic() < self._manual_selection_until:
