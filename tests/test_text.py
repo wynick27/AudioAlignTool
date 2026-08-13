@@ -83,7 +83,7 @@ class TextTests(unittest.TestCase):
             self.assertEqual("第一章", chapters[0].title)
             self.assertIn("正文内容", chapters[0].text)
 
-    def test_epub_merges_styled_title_page_with_following_body(self) -> None:
+    def test_epub_merges_duplicate_title_page_without_losing_spoken_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             epub = Path(temporary) / "japanese.epub"
             with zipfile.ZipFile(epub, "w") as archive:
@@ -108,7 +108,40 @@ class TextTests(unittest.TestCase):
             chapters = import_epub(epub)
             self.assertEqual(1, len(chapters))
             self.assertEqual("第１章　生き残った男の子", chapters[0].title)
+            self.assertIn("第１章　生き残った男の子", chapters[0].text)
             self.assertIn("これは十分に長い本文", chapters[0].text)
+
+    def test_epub_merges_spoken_chapter_label_and_excludes_head_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            epub = Path(temporary) / "english.epub"
+            with zipfile.ZipFile(epub, "w") as archive:
+                archive.writestr(
+                    "META-INF/container.xml",
+                    '<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>',
+                )
+                archive.writestr(
+                    "OEBPS/content.opf",
+                    '<package><manifest><item id="label" href="label.xhtml"/>'
+                    '<item id="body" href="body.xhtml"/></manifest><spine>'
+                    '<itemref idref="label"/><itemref idref="body"/></spine></package>',
+                )
+                archive.writestr(
+                    "OEBPS/label.xhtml",
+                    "<html><head><title>Book - Chapter 13</title></head>"
+                    "<body><h1>CHAPTER THIRTEEN</h1></body></html>",
+                )
+                archive.writestr(
+                    "OEBPS/body.xhtml",
+                    "<html><head><title>Book - Chapter 13</title></head><body>"
+                    "<h1>Nicolas Flamel</h1><p>" + "Long visible body text. " * 30
+                    + "</p></body></html>",
+                )
+            chapters = import_epub(epub)
+            self.assertEqual(1, len(chapters))
+            self.assertEqual(2, len(chapters[0].source_parts))
+            self.assertIn("CHAPTER THIRTEEN", chapters[0].text)
+            self.assertIn("Nicolas Flamel", chapters[0].text)
+            self.assertNotIn("Book - Chapter 13", chapters[0].text)
 
 
 if __name__ == "__main__":

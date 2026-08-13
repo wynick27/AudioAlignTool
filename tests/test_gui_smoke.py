@@ -16,9 +16,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PySide6.QtCore import QRect, Qt
-    from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtGui import QColor, QImage, QPainter
     from PySide6.QtWidgets import QApplication, QMessageBox
-    from audioalign.core.models import ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentOverlapPolicy, SegmentStatus, TaskLane, TextSegment
+    from audioalign.core.models import ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentOverlapPolicy, SegmentStatus, TaskLane, TextAudioAnchor, TextSegment
     from audioalign.core.paths import ApplicationPaths
     from audioalign.core.spectrogram import build_spectrogram_cache_from_slices
     from audioalign.core.storage import ProjectSession
@@ -31,6 +31,7 @@ try:
         WORKFLOW_QWEN_FORCED,
     )
     from audioalign.gui.mapping_dialog import ChapterAudioMappingDialog
+    from audioalign.gui.segment_model import SegmentTableModel
     from audioalign.gui.spectrogram_editor import (
         AudioVisualizerEditor,
         AudioVisualizerOverview,
@@ -63,12 +64,106 @@ class GuiSmokeTests(unittest.TestCase):
                 (window.spectrogram.selection.start_ms, window.spectrogram.selection.end_ms),
             )
 
+            # A selection/play range originating from this cue follows a live
+            # boundary edit, so replay never uses the stale old endpoint.
+            window._clear_play_range()
+            window.spectrogram.set_segment_selection(1_000, 2_500)
+            window._play_range_start = 1_000
+            window._play_range_end = 2_500
+            window._boundary_moved(0, "end", 2_200, False)
+            self.assertEqual(
+                (1_000, 2_200),
+                (window.spectrogram.selection.start_ms, window.spectrogram.selection.end_ms),
+            )
+            self.assertEqual((1_000, 2_200), window._active_play_bounds())
+            self.assertTrue(window.spectrogram.selection_tracks_segment)
+            self.assertTrue(all(not pane.selection.isVisible() for pane in window.spectrogram._panes))
+
+            # An independently drawn range is deliberately not attached to a
+            # cue and therefore remains fixed across later cue edits.
             window._clear_play_range()
             window.spectrogram.set_selection(5_000, 7_000)
             window._play_range_start = 5_000
             window._play_range_end = 7_000
             window.segment_model.segments[0].end_ms = 2_000
             self.assertEqual((5_000, 7_000), window._active_play_bounds())
+            self.assertFalse(window.spectrogram.selection_tracks_segment)
+            self.assertTrue(any(pane.selection.isVisible() for pane in window.spectrogram._panes))
+            window.close()
+
+    def test_unmatched_zero_time_row_does_not_mark_timed_neighbours_as_conflicts(self) -> None:
+        model = SegmentTableModel()
+        model.set_segments([
+            TextSegment(None, 1, 0, "前句", 1_000, 2_000, status=SegmentStatus.MANUAL),
+            TextSegment(None, 1, 1, "已删除时间的原文", 0, 0, status=SegmentStatus.UNMATCHED),
+            TextSegment(None, 1, 2, "后句", 2_000, 3_000, status=SegmentStatus.MANUAL),
+            TextSegment(None, 1, 3, "再后一句", 3_000, 4_000, status=SegmentStatus.MANUAL),
+        ])
+
+        conflict = QColor(230, 55, 70, 65)
+        unmatched = QColor(220, 60, 90, 40)
+        self.assertNotEqual(conflict, model.data(model.index(0, 0), Qt.ItemDataRole.BackgroundRole))
+        self.assertEqual(unmatched, model.data(model.index(1, 0), Qt.ItemDataRole.BackgroundRole))
+        self.assertNotEqual(conflict, model.data(model.index(2, 0), Qt.ItemDataRole.BackgroundRole))
+        self.assertNotEqual(conflict, model.data(model.index(3, 0), Qt.ItemDataRole.BackgroundRole))
+
+        editor = AudioVisualizerEditor()
+        editor.set_segments(model.segments)
+        self.assertNotEqual((230, 55, 70, 105), editor._cue_colour(0))
+        self.assertEqual((220, 65, 90, 82), editor._cue_colour(1))
+        self.assertNotEqual((230, 55, 70, 105), editor._cue_colour(2))
+
+    def test_selecting_a_segment_does_not_recenter_audio_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("selection-no-jump", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(
+                chapter_id,
+                [
+                    TextSegment(None, chapter_id, 0, "first", 1_000, 2_000),
+                    TextSegment(None, chapter_id, 1, "second", 20_000, 21_000),
+                ],
+            )
+            window = MainWindow()
+            window._set_session(session)
+            original_range = (window.spectrogram.view_start, window.spectrogram.view_end)
+            with patch.object(window.spectrogram, "focus_time") as focus:
+                window._select_segment_row(1)
+                self.app.processEvents()
+                focus.assert_not_called()
+            self.assertEqual(
+                original_range,
+                (window.spectrogram.view_start, window.spectrogram.view_end),
+            )
+            window.close()
+
+    def test_sentence_double_click_locates_only_when_start_is_offscreen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("double-click-locate", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(
+                chapter_id,
+                [
+                    TextSegment(None, chapter_id, 0, "visible", 2_000, 3_000),
+                    TextSegment(None, chapter_id, 1, "offscreen", 20_000, 21_000),
+                ],
+            )
+            window = MainWindow()
+            window._set_session(session)
+            window.spectrogram.set_cache(None, 30_000)
+            window.spectrogram.set_time_range(0, 10_000)
+
+            with patch.object(window.spectrogram, "focus_time") as focus:
+                window._segment_double_activated(0)
+                focus.assert_not_called()
+                window._segment_double_activated(1)
+                focus.assert_called_once_with(20_000, 10_000)
+
+            # A single click in the lower audio editor seeks/selects but must
+            # never invoke sentence-style centring.
+            with patch.object(window.spectrogram, "focus_time") as focus:
+                window._audio_time_activated(20_500, 1)
+                focus.assert_not_called()
             window.close()
 
     def test_audio_double_click_preserves_pre_seek_playing_state(self) -> None:
@@ -143,6 +238,70 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn("日本語です。", transcript_text)
         self.assertNotIn("日本 語", transcript_text)
         self.assertGreaterEqual(transcript_text.count("\n"), 1)
+
+    def test_asr_word_click_seeks_and_centres_audio_view(self) -> None:
+        window = MainWindow()
+        window.spectrogram.view_start = 10_000
+        window.spectrogram.view_end = 30_000
+        with patch.object(window, "_seek_local") as seek, patch.object(
+            window.spectrogram, "focus_time"
+        ) as focus:
+            window._asr_word_seek(42_500)
+            seek.assert_called_once_with(42_500)
+            focus.assert_called_once_with(42_500, 20_000)
+        window.close()
+
+    def test_punctuation_split_uses_asr_character_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("anchor-split", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            text = "First sentence. Second sentence."
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(
+                    None, chapter_id, 0, text, 0, 2_000,
+                    source_start_char=0, source_end_char=len(text),
+                )
+            ])
+            segment = session.repository.segments(chapter_id)[0]
+            session.repository.replace_anchors(chapter_id, [
+                TextAudioAnchor(None, chapter_id, segment.id, 0, 14, 100, 500, 1.0, "asr-word"),
+                TextAudioAnchor(None, chapter_id, segment.id, 16, 31, 900, 1_500, 1.0, "asr-word"),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            window._select_segment_row(0)
+            window.split_segment_by_punctuation()
+            self.assertEqual(2, window.segment_model.rowCount())
+            self.assertEqual(900, window.segment_model.segments[0].end_ms)
+            self.assertEqual(900, window.segment_model.segments[1].start_ms)
+            window.close()
+
+    def test_binding_updates_existing_row_without_rebuilding_chapter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("fast-bind", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(
+                chapter_id, [TextSegment(None, chapter_id, 0, "sentence", 100, 500)],
+            )
+            window = MainWindow()
+            window._set_session(session)
+            window._select_segment_row(0)
+            window.spectrogram.set_selection(700, 1_100)
+            with patch.object(
+                session.repository, "replace_chapter_edit_state",
+                wraps=session.repository.replace_chapter_edit_state,
+            ) as replace, patch.object(
+                session.repository, "update_segments",
+                wraps=session.repository.update_segments,
+            ) as update:
+                window.bind_selection()
+                replace.assert_not_called()
+                update.assert_called_once()
+            self.assertEqual((700, 1_100), (
+                session.repository.segments(chapter_id)[0].start_ms,
+                session.repository.segments(chapter_id)[0].end_ms,
+            ))
+            window.close()
 
     def test_inference_and_media_lanes_run_concurrently(self) -> None:
         manager = TaskManager()
@@ -241,6 +400,30 @@ class GuiSmokeTests(unittest.TestCase):
         editor.follow_playhead(20_001)
         centre = (editor.view_start + editor.view_end) / 2
         self.assertAlmostEqual(centre / 1000, editor.wave_pane.play_line.value())
+
+    def test_shared_boundary_uses_pointer_side_and_press_ignores_stale_hover(self) -> None:
+        editor = AudioVisualizerEditor()
+        editor.resize(1000, 300)
+        editor.set_cache(None, 10_000)
+        editor.set_time_range(0, 10_000)
+        editor.set_segments([
+            TextSegment(None, 1, 0, "前一句", 0, 5_000),
+            TextSegment(None, 1, 1, "后一句", 5_000, 10_000),
+        ])
+
+        left = editor._nearest_target(4_990)
+        self.assertEqual(("end", 0), (left.kind, left.segment_index))
+        right = editor._nearest_target(5_010)
+        self.assertEqual(("start", 1), (right.kind, right.segment_index))
+        exact = editor._nearest_target(5_000)
+        self.assertEqual(("start", 1), (exact.kind, exact.segment_index))
+
+        # A delayed hover event from the left side must not override the real
+        # press position after the pointer has crossed to the following cue.
+        editor._hover_target = left
+        editor._hover_position = 4_990
+        editor._drag_start(5.010, 0)
+        self.assertEqual(("start", 1), (editor._drag.kind, editor._drag.segment_index))
 
     def test_empty_audio_timeline_keeps_one_fixed_scale(self) -> None:
         editor = AudioVisualizerEditor()
@@ -603,6 +786,46 @@ class GuiSmokeTests(unittest.TestCase):
             transcript_scroll.setRange(0, 200)
             source_scroll.setValue(50)
             self.assertEqual(100, transcript_scroll.value())
+            window.close()
+
+    def test_undo_never_crosses_project_or_chapter_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = ProjectSession.create("first", root / "first")
+            first_chapter = first.repository.add_chapter(Chapter(None, "first chapter", 0))
+            first.repository.replace_segments(
+                first_chapter, [TextSegment(None, first_chapter, 0, "first original")],
+            )
+            second = ProjectSession.create("second", root / "second")
+            second_chapter = second.repository.add_chapter(Chapter(None, "second chapter", 0))
+            second.repository.replace_segments(
+                second_chapter, [TextSegment(None, second_chapter, 0, "second original")],
+            )
+            other_chapter = second.repository.add_chapter(Chapter(None, "other chapter", 1))
+            second.repository.replace_segments(
+                other_chapter, [TextSegment(None, other_chapter, 0, "other original")],
+            )
+
+            window = MainWindow()
+            window._set_session(first)
+            window._push_history()
+            window.segment_model.segments[0].text = "first changed"
+            window._persist_current_segments()
+
+            window._set_session(second)
+            window.undo()
+            self.assertEqual("second original", second.repository.segments(second_chapter)[0].text)
+
+            window._push_history()
+            window.segment_model.segments[0].text = "second changed"
+            window._persist_current_segments()
+            window._load_segment_editor(0)
+            window.chapter_list.setCurrentRow(1)
+            window.undo()
+            self.assertEqual("other original", second.repository.segments(other_chapter)[0].text)
+            window.chapter_list.setCurrentRow(0)
+            window.undo()
+            self.assertEqual("second original", second.repository.segments(second_chapter)[0].text)
             window.close()
 
 

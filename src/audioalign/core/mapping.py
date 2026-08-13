@@ -13,6 +13,18 @@ _NON_BODY = re.compile(
     re.IGNORECASE,
 )
 _NUMBER = re.compile(r"(?:chapter|cap[i\u00ed]tulo|chapitre|\u7b2c)?\s*(\d+|[ivxlcdm]+)", re.IGNORECASE)
+_ENGLISH_NUMBERS = {
+    name: str(number)
+    for number, name in enumerate((
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+        "seventeen", "eighteen", "nineteen", "twenty", "twentyone", "twentytwo",
+        "twentythree", "twentyfour", "twentyfive", "twentysix", "twentyseven",
+        "twentyeight", "twentynine", "thirty", "thirtyone", "thirtytwo", "thirtythree",
+        "thirtyfour", "thirtyfive", "thirtysix", "thirtyseven", "thirtyeight",
+        "thirtynine", "forty",
+    ))
+}
 
 
 def normalize_title(value: str) -> str:
@@ -22,11 +34,25 @@ def normalize_title(value: str) -> str:
 
 
 def is_probably_body(chapter: Chapter) -> bool:
-    return not bool(_NON_BODY.search(chapter.title))
+    visible = "".join(
+        character for character in unicodedata.normalize("NFKC", chapter.title)
+        if unicodedata.category(character) != "Cf"
+    )
+    return not bool(_NON_BODY.search(visible))
 
 
 def _chapter_number(value: str) -> str:
-    match = _NUMBER.search(value)
+    visible = "".join(
+        character for character in unicodedata.normalize("NFKC", value)
+        if unicodedata.category(character) != "Cf"
+    )
+    compact = "".join(character for character in visible.casefold() if character.isalnum())
+    chapter_suffix = compact.split("chapter", 1)[1] if "chapter" in compact else ""
+    if chapter_suffix:
+        for word in sorted(_ENGLISH_NUMBERS, key=len, reverse=True):
+            if chapter_suffix.startswith(word):
+                return _ENGLISH_NUMBERS[word]
+    match = _NUMBER.search(visible)
     if not match:
         return ""
     number = match.group(1).casefold()

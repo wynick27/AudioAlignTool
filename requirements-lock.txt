@@ -5,6 +5,7 @@ pyqtgraph==0.14.0
 av==18.0.0
 EbookLib==0.19
 beautifulsoup4==4.13.4
+markdown-it-py==4.2.0
 faster-whisper==1.2.1
 ctranslate2==4.8.1
 tokenizers==0.22.2

@@ -18,6 +18,15 @@ for package in (
     binaries += package_binaries
     hiddenimports += package_hidden
 
+# Styled source-book reader dependencies. Explicit entries make collection of
+# the WebEngine helper/resources deterministic in local and CI builds.
+hiddenimports += [
+    "markdown_it",
+    "PySide6.QtWebChannel",
+    "PySide6.QtWebEngineCore",
+    "PySide6.QtWebEngineWidgets",
+]
+
 for distribution in (
     "faster-whisper",
     "ctranslate2",

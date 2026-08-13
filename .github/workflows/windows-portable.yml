@@ -47,7 +47,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed to install locked build dependencies." }
           python -m pip install --no-deps -e .
           if ($LASTEXITCODE -ne 0) { throw "Failed to install AudioAlignTool." }
-          python -c "import numpy, PySide6, av, faster_whisper, qwen_asr; print('Runtime import check passed')"
+          python -c "import numpy, PySide6, av, faster_whisper, qwen_asr, markdown_it; from PySide6 import QtWebChannel, QtWebEngineCore, QtWebEngineWidgets; print('Runtime import check passed')"
           if ($LASTEXITCODE -ne 0) { throw "Runtime dependency import check failed." }
 
       - name: Select package version

@@ -25,6 +25,8 @@ from .models import (
     RecognitionRun,
     SegmentOrigin,
     SegmentStatus,
+    SourceDocument,
+    SourceDocumentKind,
     SourceFragment,
     TextAudioAnchor,
     TextSegment,
@@ -79,7 +81,35 @@ CREATE TABLE IF NOT EXISTS audio_assets (
     sample_rate INTEGER NOT NULL DEFAULT 0,
     channels INTEGER NOT NULL DEFAULT 0,
     format TEXT NOT NULL DEFAULT '',
-    title TEXT NOT NULL DEFAULT ''
+    title TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS source_documents (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    original_path TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    entry_path TEXT NOT NULL DEFAULT '',
+    resource_root TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS chapter_source_documents (
+    chapter_id INTEGER PRIMARY KEY REFERENCES chapters(id) ON DELETE CASCADE,
+    document_id INTEGER NOT NULL REFERENCES source_documents(id) ON DELETE CASCADE,
+    entry_path TEXT NOT NULL DEFAULT '',
+    selector TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS chapter_source_parts (
+    chapter_id INTEGER NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    document_id INTEGER NOT NULL REFERENCES source_documents(id) ON DELETE CASCADE,
+    entry_path TEXT NOT NULL DEFAULT '',
+    selector TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(chapter_id, position)
+);
+CREATE TABLE IF NOT EXISTS source_fragment_locators (
+    fragment_id INTEGER PRIMARY KEY REFERENCES source_fragments(id) ON DELETE CASCADE,
+    dom_locator TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS audio_chapters (
     id INTEGER PRIMARY KEY,
@@ -99,6 +129,11 @@ CREATE TABLE IF NOT EXISTS chapter_audio_links (
     source_end_ms INTEGER NOT NULL DEFAULT 0,
     confidence REAL NOT NULL DEFAULT 0,
     UNIQUE(chapter_id, position)
+);
+CREATE TABLE IF NOT EXISTS chapter_media_state (
+    chapter_id INTEGER PRIMARY KEY REFERENCES chapters(id) ON DELETE CASCADE,
+    mapping_signature TEXT NOT NULL DEFAULT '',
+    needs_review INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS text_audio_anchors (
     id INTEGER PRIMARY KEY,
@@ -282,6 +317,14 @@ def fingerprint_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def full_fingerprint_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 class ProjectExistsError(FileExistsError):
     pass
 
@@ -314,6 +357,16 @@ class ProjectRepository:
         for name, declaration in extensions.items():
             if name not in columns:
                 self.connection.execute(f"ALTER TABLE text_segments ADD COLUMN {name} {declaration}")
+        audio_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(audio_assets)")}
+        if "position" not in audio_columns:
+            self.connection.execute("ALTER TABLE audio_assets ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
+            self.connection.execute("UPDATE audio_assets SET position=id - 1")
+        # This index must be created after the idempotent column extension.
+        # Otherwise executescript fails before ALTER TABLE can run for a schema
+        # v2 project created before media ordering was introduced.
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_position ON audio_assets(position, id)"
+        )
         self.connection.commit()
         self._initialize_missing_source_fragments()
 
@@ -422,6 +475,110 @@ class ProjectRepository:
             (chapter_id,),
         )]
 
+    def add_source_document(self, document: SourceDocument) -> int:
+        cursor = self.connection.execute(
+            """INSERT INTO source_documents
+            (kind,original_path,stored_path,fingerprint,entry_path,resource_root)
+            VALUES (?,?,?,?,?,?)""",
+            (document.kind.value, document.original_path, document.stored_path,
+             document.fingerprint, document.entry_path, document.resource_root),
+        )
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def source_document(self, document_id: int) -> SourceDocument | None:
+        row = self.connection.execute(
+            "SELECT * FROM source_documents WHERE id=?", (document_id,)
+        ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["kind"] = SourceDocumentKind(data["kind"])
+        return SourceDocument(**data)
+
+    def set_chapter_source_document(
+        self, chapter_id: int, document_id: int, *, entry_path: str = "", selector: str = "",
+    ) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO chapter_source_documents(chapter_id,document_id,entry_path,selector)
+                VALUES (?,?,?,?) ON CONFLICT(chapter_id) DO UPDATE SET
+                document_id=excluded.document_id,entry_path=excluded.entry_path,selector=excluded.selector""",
+                (chapter_id, document_id, entry_path, selector),
+            )
+            connection.execute(
+                """INSERT INTO chapter_source_parts(chapter_id,position,document_id,entry_path,selector)
+                VALUES (?,?,?,?,?) ON CONFLICT(chapter_id,position) DO UPDATE SET
+                document_id=excluded.document_id,entry_path=excluded.entry_path,selector=excluded.selector""",
+                (chapter_id, 0, document_id, entry_path, selector),
+            )
+
+    def set_chapter_source_parts(
+        self, chapter_id: int, document_id: int, parts: Sequence[tuple[str, str]],
+    ) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM chapter_source_parts WHERE chapter_id=?", (chapter_id,))
+            connection.executemany(
+                """INSERT INTO chapter_source_parts
+                (chapter_id,position,document_id,entry_path,selector) VALUES (?,?,?,?,?)""",
+                [
+                    (chapter_id, position, document_id, entry_path, selector)
+                    for position, (entry_path, selector) in enumerate(parts)
+                ],
+            )
+
+    def chapter_source_parts(
+        self, chapter_id: int,
+    ) -> list[tuple[SourceDocument, str, str]]:
+        rows = self.connection.execute(
+            """SELECT d.*,p.entry_path AS part_entry_path,p.selector AS part_selector
+            FROM chapter_source_parts p JOIN source_documents d ON d.id=p.document_id
+            WHERE p.chapter_id=? ORDER BY p.position""",
+            (chapter_id,),
+        )
+        return [
+            (
+                SourceDocument(**{key: row[key] for key in (
+                    "id", "kind", "original_path", "stored_path", "fingerprint",
+                    "entry_path", "resource_root",
+                )} | {"kind": SourceDocumentKind(row["kind"])}),
+                row["part_entry_path"], row["part_selector"],
+            )
+            for row in rows
+        ]
+
+    def chapter_source_document(self, chapter_id: int) -> tuple[SourceDocument, str, str] | None:
+        row = self.connection.execute(
+            """SELECT d.*,c.entry_path AS chapter_entry_path,c.selector
+            FROM chapter_source_documents c JOIN source_documents d ON d.id=c.document_id
+            WHERE c.chapter_id=?""", (chapter_id,),
+        ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        entry_path = data.pop("chapter_entry_path")
+        selector = data.pop("selector")
+        data["kind"] = SourceDocumentKind(data["kind"])
+        return SourceDocument(**data), entry_path, selector
+
+    def set_fragment_locator(self, fragment_id: int, locator: str) -> None:
+        self.connection.execute(
+            """INSERT INTO source_fragment_locators(fragment_id,dom_locator) VALUES (?,?)
+            ON CONFLICT(fragment_id) DO UPDATE SET dom_locator=excluded.dom_locator""",
+            (fragment_id, locator),
+        )
+        self.connection.commit()
+
+    def fragment_locators(self, chapter_id: int) -> dict[int, str]:
+        return {
+            int(row["fragment_id"]): row["dom_locator"]
+            for row in self.connection.execute(
+                """SELECT l.fragment_id,l.dom_locator FROM source_fragment_locators l
+                JOIN source_fragments f ON f.id=l.fragment_id WHERE f.chapter_id=?""",
+                (chapter_id,),
+            )
+        }
+
     def chapters(self) -> list[Chapter]:
         chapters = [Chapter(**dict(row)) for row in self.connection.execute("SELECT * FROM chapters ORDER BY position,id")]
         for chapter in chapters:
@@ -442,6 +599,109 @@ class ProjectRepository:
                      s.source_start_char, s.source_end_char)
                     for s in segments
                 ],
+            )
+
+    def replace_chapter_edit_state(
+        self,
+        chapter_id: int,
+        segments: Sequence[TextSegment],
+        anchors: Sequence[TextAudioAnchor],
+    ) -> None:
+        """Atomically restore one chapter without borrowing identity from another.
+
+        Segment row ids are database-local and can change after a split/merge.
+        Anchors are therefore rebound through the old-id/position map first and
+        source character ranges second.
+        """
+        if any(segment.chapter_id != chapter_id for segment in segments):
+            raise ValueError("Chapter edit state contains segments from another chapter")
+        if any(anchor.chapter_id != chapter_id for anchor in anchors):
+            raise ValueError("Chapter edit state contains anchors from another chapter")
+        old_positions = {
+            segment.id: position for position, segment in enumerate(segments)
+            if segment.id is not None
+        }
+        with self.transaction() as connection:
+            current_ids = [
+                int(row["id"]) for row in connection.execute(
+                    "SELECT id FROM text_segments WHERE chapter_id=? ORDER BY position,id",
+                    (chapter_id,),
+                )
+            ]
+            target_ids = [segment.id for segment in segments]
+            if target_ids and all(value is not None for value in target_ids) and target_ids == current_ids:
+                # The edit changed text/timing only.  Keep stable row ids instead
+                # of deleting and reinserting an entire audiobook chapter.
+                connection.executemany(
+                    """UPDATE text_segments SET position=?,text=?,start_ms=?,end_ms=?,
+                    confidence=?,status=?,locked=?,origin=?,source_fragment_id=?,
+                    source_start_char=?,source_end_char=? WHERE id=? AND chapter_id=?""",
+                    [
+                        (
+                            position, segment.text, segment.start_ms, segment.end_ms,
+                            segment.confidence, segment.status.value, int(segment.locked),
+                            segment.origin.value, segment.source_fragment_id,
+                            segment.source_start_char, segment.source_end_char,
+                            segment.id, chapter_id,
+                        )
+                        for position, segment in enumerate(segments)
+                    ],
+                )
+                connection.execute(
+                    "DELETE FROM text_audio_anchors WHERE chapter_id=?", (chapter_id,),
+                )
+                connection.executemany(
+                    """INSERT INTO text_audio_anchors
+                    (chapter_id,segment_id,source_start_char,source_end_char,start_ms,end_ms,confidence,method)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    [
+                        (
+                            chapter_id, anchor.segment_id, anchor.source_start_char,
+                            anchor.source_end_char, anchor.start_ms, anchor.end_ms,
+                            anchor.confidence, anchor.method,
+                        )
+                        for anchor in anchors
+                    ],
+                )
+                return
+            connection.execute("DELETE FROM text_audio_anchors WHERE chapter_id=?", (chapter_id,))
+            connection.execute("DELETE FROM text_segments WHERE chapter_id=?", (chapter_id,))
+            inserted: list[tuple[int, TextSegment]] = []
+            for position, segment in enumerate(segments):
+                cursor = connection.execute(
+                    """INSERT INTO text_segments
+                    (chapter_id,position,text,start_ms,end_ms,confidence,status,locked,origin,
+                     source_fragment_id,source_start_char,source_end_char)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (chapter_id, position, segment.text, segment.start_ms, segment.end_ms,
+                     segment.confidence, segment.status.value, int(segment.locked),
+                     segment.origin.value, segment.source_fragment_id,
+                     segment.source_start_char, segment.source_end_char),
+                )
+                inserted.append((int(cursor.lastrowid), segment))
+            anchor_rows = []
+            for anchor in anchors:
+                target_id = None
+                old_position = old_positions.get(anchor.segment_id)
+                if old_position is not None and old_position < len(inserted):
+                    target_id = inserted[old_position][0]
+                if target_id is None:
+                    target_id = next((
+                        row_id for row_id, segment in inserted
+                        if segment.source_start_char is not None
+                        and segment.source_end_char is not None
+                        and segment.source_start_char <= anchor.source_start_char
+                        and anchor.source_end_char <= segment.source_end_char
+                    ), None)
+                anchor_rows.append((
+                    chapter_id, target_id, anchor.source_start_char, anchor.source_end_char,
+                    anchor.start_ms, anchor.end_ms, anchor.confidence, anchor.method,
+                ))
+            connection.executemany(
+                """INSERT INTO text_audio_anchors
+                (chapter_id,segment_id,source_start_char,source_end_char,start_ms,end_ms,confidence,method)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                anchor_rows,
             )
 
     def segments(self, chapter_id: int) -> list[TextSegment]:
@@ -517,11 +777,20 @@ class ProjectRepository:
             )
 
     def add_audio(self, asset: AudioAsset) -> int:
+        existing = self.audio_by_path(asset.absolute_path)
+        if existing is not None and existing.id is not None:
+            return existing.id
+        position = asset.position
+        if position <= 0:
+            position = int(self.connection.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM audio_assets"
+            ).fetchone()[0])
         cursor = self.connection.execute(
             """INSERT INTO audio_assets
-            (absolute_path,relative_path,fingerprint,duration_ms,sample_rate,channels,format,title)
-            VALUES (?,?,?,?,?,?,?,?)""",
-            (asset.absolute_path, asset.relative_path, asset.fingerprint, asset.duration_ms, asset.sample_rate, asset.channels, asset.format, asset.title),
+            (absolute_path,relative_path,fingerprint,duration_ms,sample_rate,channels,format,title,position)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
+            (asset.absolute_path, asset.relative_path, asset.fingerprint, asset.duration_ms,
+             asset.sample_rate, asset.channels, asset.format, asset.title, position),
         )
         self.connection.commit()
         return int(cursor.lastrowid)
@@ -531,7 +800,207 @@ class ProjectRepository:
         return AudioAsset(**dict(row)) if row else None
 
     def all_audio(self) -> list[AudioAsset]:
-        return [AudioAsset(**dict(row)) for row in self.connection.execute("SELECT * FROM audio_assets ORDER BY id")]
+        return [AudioAsset(**dict(row)) for row in self.connection.execute(
+            "SELECT * FROM audio_assets ORDER BY position,id"
+        )]
+
+    def audio_by_path(self, path: str | Path) -> AudioAsset | None:
+        key = os.path.normcase(os.path.abspath(os.fspath(path)))
+        for asset in self.all_audio():
+            if os.path.normcase(os.path.abspath(asset.absolute_path)) == key:
+                return asset
+        return None
+
+    def audio_by_fingerprint(self, fingerprint: str) -> list[AudioAsset]:
+        if not fingerprint:
+            return []
+        return [AudioAsset(**dict(row)) for row in self.connection.execute(
+            "SELECT * FROM audio_assets WHERE fingerprint=? ORDER BY position,id", (fingerprint,)
+        )]
+
+    def update_audio(self, asset: AudioAsset) -> None:
+        if asset.id is None:
+            raise ValueError("Cannot update an unstored media asset")
+        self.connection.execute(
+            """UPDATE audio_assets SET absolute_path=?,relative_path=?,fingerprint=?,duration_ms=?,
+            sample_rate=?,channels=?,format=?,title=?,position=? WHERE id=?""",
+            (asset.absolute_path, asset.relative_path, asset.fingerprint, asset.duration_ms,
+             asset.sample_rate, asset.channels, asset.format, asset.title, asset.position, asset.id),
+        )
+        self.connection.commit()
+
+    def reorder_audio(self, ordered_ids: Sequence[int]) -> None:
+        with self.transaction() as connection:
+            connection.executemany(
+                "UPDATE audio_assets SET position=? WHERE id=?",
+                [(position, int(audio_id)) for position, audio_id in enumerate(ordered_ids)],
+            )
+
+    def audio_usage(self, audio_id: int) -> list[ChapterAudioLink]:
+        return [ChapterAudioLink(**dict(row)) for row in self.connection.execute(
+            "SELECT * FROM chapter_audio_links WHERE audio_id=? ORDER BY chapter_id,position", (audio_id,)
+        )]
+
+    def remove_audio(self, audio_id: int, *, unlink: bool = False) -> None:
+        with self.transaction() as connection:
+            usage = int(connection.execute(
+                "SELECT count(*) FROM chapter_audio_links WHERE audio_id=?", (audio_id,)
+            ).fetchone()[0])
+            if usage and not unlink:
+                raise ValueError("Media asset is still linked to one or more chapters")
+            if unlink:
+                connection.execute("DELETE FROM chapter_audio_links WHERE audio_id=?", (audio_id,))
+            connection.execute("DELETE FROM audio_assets WHERE id=?", (audio_id,))
+            rows = connection.execute("SELECT id FROM audio_assets ORDER BY position,id").fetchall()
+            connection.executemany(
+                "UPDATE audio_assets SET position=? WHERE id=?",
+                [(position, row["id"]) for position, row in enumerate(rows)],
+            )
+
+    def replace_media_library(
+        self,
+        assets: Sequence[AudioAsset],
+        markers: dict[int, Sequence[AudioChapterMarker]],
+        links: Sequence[ChapterAudioLink],
+        new_chapters: Sequence[Chapter] = (),
+    ) -> dict[int, int]:
+        """Apply a staged media library and all mappings in one transaction.
+
+        Negative asset ids identify rows that only exist in the dialog draft.
+        The returned map resolves those temporary ids to database ids.
+        """
+        normalized_paths: dict[str, int | None] = {}
+        for asset in assets:
+            path_key = os.path.normcase(os.path.abspath(asset.absolute_path))
+            if path_key in normalized_paths:
+                raise ValueError("The staged media library contains the same path more than once")
+            normalized_paths[path_key] = asset.id
+        existing_ids = {
+            int(row[0]) for row in self.connection.execute("SELECT id FROM audio_assets")
+        }
+        staged_existing = {int(asset.id) for asset in assets if asset.id is not None and asset.id > 0}
+        unknown = staged_existing - existing_ids
+        if unknown:
+            raise ValueError(f"Unknown media ids in staged library: {sorted(unknown)}")
+        id_map: dict[int, int] = {}
+        chapter_map: dict[int, int] = {}
+        with self.transaction() as connection:
+            old_mapping: dict[int, tuple[tuple[str, int, int], ...]] = {}
+            for row in connection.execute(
+                """SELECT links.chapter_id,assets.fingerprint,
+                links.source_start_ms,links.source_end_ms
+                FROM chapter_audio_links AS links
+                JOIN audio_assets AS assets ON assets.id=links.audio_id
+                ORDER BY links.chapter_id,links.position"""
+            ):
+                old_mapping.setdefault(int(row["chapter_id"]), tuple())
+                old_mapping[int(row["chapter_id"])] += ((
+                    str(row["fingerprint"]), int(row["source_start_ms"]), int(row["source_end_ms"]),
+                ),)
+            next_position = int(connection.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM chapters"
+            ).fetchone()[0])
+            for chapter in new_chapters:
+                if chapter.id is None or chapter.id >= 0:
+                    raise ValueError("New staged chapters must have temporary negative ids")
+                cursor = connection.execute(
+                    "INSERT INTO chapters(title,position,source_html) VALUES (?,?,?)",
+                    (chapter.title, next_position, chapter.source_html),
+                )
+                chapter_map[int(chapter.id)] = int(cursor.lastrowid)
+                next_position += 1
+            for position, asset in enumerate(assets):
+                if asset.id is not None and asset.id > 0:
+                    connection.execute(
+                        """UPDATE audio_assets SET absolute_path=?,relative_path=?,fingerprint=?,
+                        duration_ms=?,sample_rate=?,channels=?,format=?,title=?,position=? WHERE id=?""",
+                        (asset.absolute_path, asset.relative_path, asset.fingerprint,
+                         asset.duration_ms, asset.sample_rate, asset.channels, asset.format,
+                         asset.title, position, asset.id),
+                    )
+                    id_map[int(asset.id)] = int(asset.id)
+                else:
+                    cursor = connection.execute(
+                        """INSERT INTO audio_assets
+                        (absolute_path,relative_path,fingerprint,duration_ms,sample_rate,channels,format,title,position)
+                        VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (asset.absolute_path, asset.relative_path, asset.fingerprint,
+                         asset.duration_ms, asset.sample_rate, asset.channels, asset.format,
+                         asset.title, position),
+                    )
+                    if asset.id is None:
+                        raise ValueError("New staged media must have a temporary negative id")
+                    id_map[int(asset.id)] = int(cursor.lastrowid)
+
+            removed = existing_ids - staged_existing
+            connection.execute("DELETE FROM chapter_audio_links")
+            for audio_id in removed:
+                connection.execute("DELETE FROM audio_assets WHERE id=?", (audio_id,))
+
+            for source_id, items in markers.items():
+                target_id = id_map.get(int(source_id))
+                if target_id is None:
+                    continue
+                connection.execute("DELETE FROM audio_chapters WHERE audio_id=?", (target_id,))
+                connection.executemany(
+                    """INSERT INTO audio_chapters(audio_id,position,title,start_ms,end_ms)
+                    VALUES (?,?,?,?,?)""",
+                    [(target_id, item.position, item.title, item.start_ms, item.end_ms) for item in items],
+                )
+
+            positions: dict[int, int] = {}
+            for link in links:
+                target_audio_id = id_map.get(int(link.audio_id))
+                if target_audio_id is None:
+                    raise ValueError("A chapter mapping references removed media")
+                target_chapter_id = chapter_map.get(link.chapter_id, link.chapter_id)
+                position = positions.get(target_chapter_id, 0)
+                positions[target_chapter_id] = position + 1
+                connection.execute(
+                    """INSERT INTO chapter_audio_links
+                    (chapter_id,audio_id,position,source_start_ms,source_end_ms,confidence)
+                    VALUES (?,?,?,?,?,?)""",
+                    (target_chapter_id, target_audio_id, position,
+                     max(0, link.source_start_ms), max(link.source_start_ms, link.source_end_ms),
+                     link.confidence),
+                )
+            new_mapping: dict[int, tuple[tuple[str, int, int], ...]] = {}
+            for row in connection.execute(
+                """SELECT links.chapter_id,assets.fingerprint,
+                links.source_start_ms,links.source_end_ms
+                FROM chapter_audio_links AS links
+                JOIN audio_assets AS assets ON assets.id=links.audio_id
+                ORDER BY links.chapter_id,links.position"""
+            ):
+                new_mapping.setdefault(int(row["chapter_id"]), tuple())
+                new_mapping[int(row["chapter_id"])] += ((
+                    str(row["fingerprint"]), int(row["source_start_ms"]), int(row["source_end_ms"]),
+                ),)
+            for chapter_id in set(old_mapping) | set(new_mapping):
+                signature = hashlib.sha256(repr(new_mapping.get(chapter_id, ())).encode("utf-8")).hexdigest()
+                changed = bool(old_mapping.get(chapter_id)) and old_mapping.get(chapter_id) != new_mapping.get(chapter_id)
+                connection.execute(
+                    """INSERT INTO chapter_media_state(chapter_id,mapping_signature,needs_review)
+                    VALUES (?,?,?) ON CONFLICT(chapter_id) DO UPDATE SET
+                    mapping_signature=excluded.mapping_signature,
+                    needs_review=MAX(chapter_media_state.needs_review,excluded.needs_review)""",
+                    (chapter_id, signature, int(changed)),
+                )
+        return id_map
+
+    def chapter_media_needs_review(self, chapter_id: int) -> bool:
+        row = self.connection.execute(
+            "SELECT needs_review FROM chapter_media_state WHERE chapter_id=?", (chapter_id,)
+        ).fetchone()
+        return bool(row and row[0])
+
+    def set_chapter_media_review(self, chapter_id: int, needs_review: bool) -> None:
+        self.connection.execute(
+            """INSERT INTO chapter_media_state(chapter_id,needs_review) VALUES (?,?)
+            ON CONFLICT(chapter_id) DO UPDATE SET needs_review=excluded.needs_review""",
+            (chapter_id, int(needs_review)),
+        )
+        self.connection.commit()
 
     def add_audio_chapters(self, markers: Sequence[AudioChapterMarker]) -> None:
         if not markers:
@@ -807,7 +1276,6 @@ class ProjectRepository:
                 VALUES (?,?,?,?,?,?,?,?)""",
                 anchor_rows,
             )
-
     def replace_recognition_alignment(
         self,
         chapter_id: int,
@@ -858,6 +1326,10 @@ class ProjectRepository:
                 (chapter_id,segment_id,source_start_char,source_end_char,start_ms,end_ms,confidence,method)
                 VALUES (?,?,?,?,?,?,?,?)""",
                 anchor_rows,
+            )
+            connection.execute(
+                "UPDATE chapter_media_state SET needs_review=0 WHERE chapter_id=?",
+                (chapter_id,),
             )
 
 

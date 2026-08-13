@@ -21,6 +21,7 @@ class AudioProbe:
     format: str
     title: str = ""
     chapters: list[tuple[str, int, int]] = field(default_factory=list)
+    codec: str = ""
 
 
 def decode_audio_mono(
@@ -131,13 +132,19 @@ def probe_audio(path: str | Path) -> AudioProbe:
                 chapter_data.append((title, int(chapter.start * time_base * 1000), int(chapter.end * time_base * 1000)))
             title = container.metadata.get("title", "")
             format_name = source.suffix.lower().lstrip(".") or container.format.name
-            return AudioProbe(int(float(duration or 0) * 1000), rate, channels, format_name, title, chapter_data)
+            return AudioProbe(
+                int(float(duration or 0) * 1000), rate, channels, format_name, title,
+                chapter_data, getattr(stream.codec_context, "name", "") or "",
+            )
         finally:
             container.close()
     except ImportError:
         with wave.open(str(source), "rb") as handle:
             rate = handle.getframerate()
-            return AudioProbe(int(handle.getnframes() / rate * 1000), rate, handle.getnchannels(), "wav", source.stem)
+            return AudioProbe(
+                int(handle.getnframes() / rate * 1000), rate, handle.getnchannels(),
+                "wav", source.stem, codec="pcm_s16le",
+            )
 
 
 def create_m4a_proxy(source: str | Path, destination: str | Path) -> Path:

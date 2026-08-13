@@ -16,6 +16,7 @@ from audioalign.core.models import (
     SegmentStatus,
     SelectionRange,
     TextSegment,
+    segment_has_time_conflict,
 )
 from audioalign.core.spectrogram import AudioVisualizationCache
 
@@ -207,6 +208,7 @@ class AudioVisualizerEditor(QWidget):
         self.view_end = EMPTY_TIMELINE_MS
         self.playhead = 0
         self.selection: SelectionRange | None = None
+        self.selection_tracks_segment = False
         self.segments: list[TextSegment] = []
         self.silences: list[BoundaryCandidate] = []
         self.silences_visible = True
@@ -355,16 +357,25 @@ class AudioVisualizerEditor(QWidget):
         for pane in self._panes:
             pane.play_line.setValue(self.playhead / 1000)
 
-    def set_selection(self, start_ms: int, end_ms: int) -> None:
+    def set_selection(self, start_ms: int, end_ms: int, *, tracks_segment: bool = False) -> None:
         normalized = SelectionRange(start_ms, end_ms).normalized()
         self.selection = normalized
+        self.selection_tracks_segment = bool(tracks_segment)
         for pane in self._panes:
             pane.selection.setRegion((normalized.start_ms / 1000, normalized.end_ms / 1000))
-            pane.selection.setVisible(normalized.end_ms > normalized.start_ms)
+            # A cue's live playback bounds are represented by the cue itself.
+            # Only an independently drawn time selection uses the cyan fill.
+            pane.selection.setVisible(
+                normalized.end_ms > normalized.start_ms and not self.selection_tracks_segment
+            )
         self.selectionChanged.emit(normalized.start_ms, normalized.end_ms)
+
+    def set_segment_selection(self, start_ms: int, end_ms: int) -> None:
+        self.set_selection(start_ms, end_ms, tracks_segment=True)
 
     def clear_selection(self) -> None:
         self.selection = None
+        self.selection_tracks_segment = False
         for pane in self._panes:
             pane.selection.setVisible(False)
         self.selectionChanged.emit(0, 0)
@@ -478,11 +489,7 @@ class AudioVisualizerEditor(QWidget):
         # Recreating every region and text label here made long chapters stall
         # for one or two seconds.  Only recolour the affected existing regions.
         for changed_index in previous.symmetric_difference(self.selected_segments):
-            colour = self._cue_colour(changed_index)
-            for pane in self._panes:
-                region = pane.cue_regions.get(changed_index)
-                if region is not None:
-                    region.setBrush(pg.mkBrush(*colour))
+            self._apply_cue_style(changed_index)
 
     def _render_visible(self) -> None:
         if not self.cache:
@@ -542,22 +549,18 @@ class AudioVisualizerEditor(QWidget):
             for index, segment in enumerate(self.segments):
                 if segment.end_ms <= segment.start_ms:
                     continue
-                conflict = (
-                    (index > 0 and self.segments[index - 1].end_ms > segment.start_ms)
-                    or (index + 1 < len(self.segments) and segment.end_ms > self.segments[index + 1].start_ms)
-                )
+                conflict = segment_has_time_conflict(self.segments, index)
                 colour = self._cue_colour(index)
                 item = pg.LinearRegionItem(
                     values=(segment.start_ms / 1000, segment.end_ms / 1000), movable=False,
                     brush=pg.mkBrush(*colour),
                     pen=pg.mkPen((235, 65, 80, 220) if conflict else (80, 160, 245, 180), width=1),
                 )
-                item.lines[0].setPen(pg.mkPen("#42d36b", width=2))
-                item.lines[1].setPen(pg.mkPen("#ff6659", width=2))
                 item.setZValue(5)
                 pane.plot.addItem(item)
                 pane.cues.append(item)
                 pane.cue_regions[index] = item
+                self._apply_cue_style(index, panes=(pane,))
                 if pane is self.wave_pane or self.mode == AudioVisualizationMode.SPECTROGRAM:
                     label = pg.TextItem(
                         text=segment.text.replace("\n", " ")[:42], color=(235, 240, 250, 225),
@@ -573,12 +576,7 @@ class AudioVisualizerEditor(QWidget):
         if not 0 <= index < len(self.segments):
             return (72, 125, 230, 68)
         segment = self.segments[index]
-        conflict = (
-            (index > 0 and self.segments[index - 1].end_ms > segment.start_ms)
-            or (index + 1 < len(self.segments) and segment.end_ms > self.segments[index + 1].start_ms)
-        )
-        if index in self.selected_segments:
-            return (75, 180, 255, 125)
+        conflict = segment_has_time_conflict(self.segments, index)
         if conflict:
             return (230, 55, 70, 105)
         if segment.status == SegmentStatus.LOW_CONFIDENCE:
@@ -586,6 +584,23 @@ class AudioVisualizerEditor(QWidget):
         if segment.status == SegmentStatus.UNMATCHED:
             return (220, 65, 90, 82)
         return (72, 125, 230, 68)
+
+    def _apply_cue_style(self, index: int, *, panes=None) -> None:
+        if not 0 <= index < len(self.segments):
+            return
+        selected = index in self.selected_segments
+        colour = self._cue_colour(index)
+        for pane in panes or self._panes:
+            region = pane.cue_regions.get(index)
+            if region is None:
+                continue
+            region.setBrush(pg.mkBrush(*colour))
+            if selected:
+                region.lines[0].setPen(pg.mkPen("#56e8ff", width=4))
+                region.lines[1].setPen(pg.mkPen("#56e8ff", width=4))
+            else:
+                region.lines[0].setPen(pg.mkPen("#42d36b", width=2))
+                region.lines[1].setPen(pg.mkPen("#ff6659", width=2))
 
     def preview_segment(self, index: int) -> None:
         """Update only the edited cue and its conflict neighbours during a drag."""
@@ -600,11 +615,64 @@ class AudioVisualizerEditor(QWidget):
             if label is not None:
                 label.setPos(segment.start_ms / 1000, 0.92 if pane.kind == "waveform" else 7600)
         for changed_index in range(max(0, index - 1), min(len(self.segments), index + 2)):
-            colour = self._cue_colour(changed_index)
+            self._apply_cue_style(changed_index)
+
+    def update_segments(self, segments: list[TextSegment], changed_indices: list[int]) -> None:
+        """Refresh non-structural cue edits without recreating every graphics item."""
+        if len(segments) != len(self.segments):
+            self.set_segments(segments)
+            return
+        self.segments = segments
+        for index in sorted(set(changed_indices)):
+            if not 0 <= index < len(self.segments):
+                continue
+            segment = self.segments[index]
+            valid = segment.end_ms > segment.start_ms
             for pane in self._panes:
-                region = pane.cue_regions.get(changed_index)
-                if region is not None:
-                    region.setBrush(pg.mkBrush(*colour))
+                region = pane.cue_regions.get(index)
+                label = pane.cue_labels.get(index)
+                if valid and region is None:
+                    colour = self._cue_colour(index)
+                    region = pg.LinearRegionItem(
+                        values=(segment.start_ms / 1000, segment.end_ms / 1000),
+                        movable=False, brush=pg.mkBrush(*colour),
+                        pen=pg.mkPen((80, 160, 245, 180), width=1),
+                    )
+                    region.setZValue(5)
+                    pane.plot.addItem(region)
+                    pane.cues.append(region)
+                    pane.cue_regions[index] = region
+                    if pane is self.wave_pane or self.mode == AudioVisualizationMode.SPECTROGRAM:
+                        label = pg.TextItem(
+                            text=segment.text.replace("\n", " ")[:42],
+                            color=(235, 240, 250, 225), anchor=(0, 0),
+                            fill=pg.mkBrush(8, 12, 22, 135),
+                        )
+                        label.setZValue(7)
+                        pane.plot.addItem(label)
+                        pane.cues.append(label)
+                        pane.cue_labels[index] = label
+                elif not valid and region is not None:
+                    pane.plot.removeItem(region)
+                    if region in pane.cues:
+                        pane.cues.remove(region)
+                    pane.cue_regions.pop(index, None)
+                    if label is not None:
+                        pane.plot.removeItem(label)
+                        if label in pane.cues:
+                            pane.cues.remove(label)
+                        pane.cue_labels.pop(index, None)
+                    continue
+                if valid and region is not None:
+                    region.setRegion((segment.start_ms / 1000, segment.end_ms / 1000))
+                if label is not None:
+                    label.setText(segment.text.replace("\n", " ")[:42])
+                    label.setPos(
+                        segment.start_ms / 1000,
+                        0.92 if pane.kind == "waveform" else 7600,
+                    )
+            for neighbour in range(max(0, index - 1), min(len(self.segments), index + 2)):
+                self._apply_cue_style(neighbour)
 
     def _render_silences(self) -> None:
         for pane in self._panes:
@@ -629,11 +697,24 @@ class AudioVisualizerEditor(QWidget):
 
     def _nearest_target(self, milliseconds: int) -> _DragTarget:
         tolerance = max(60, int((self.view_end - self.view_start) / max(1, self.width()) * 8))
+        boundaries: list[tuple[int, int, int, str, int]] = []
         for index, segment in enumerate(self.segments):
-            if abs(segment.start_ms - milliseconds) <= tolerance:
-                return _DragTarget("start", index)
-            if abs(segment.end_ms - milliseconds) <= tolerance:
-                return _DragTarget("end", index)
+            start_distance = abs(segment.start_ms - milliseconds)
+            if start_distance <= tolerance:
+                # At a shared boundary, a pointer on its right belongs to the
+                # following cue's start handle.  Exact hits prefer that start
+                # as well, matching the visual left-to-right editing model.
+                start_side = 0 if milliseconds >= segment.start_ms else 1
+                boundaries.append((start_distance, start_side, 0, "start", index))
+            end_distance = abs(segment.end_ms - milliseconds)
+            if end_distance <= tolerance:
+                # Conversely, the left side of a shared boundary edits the
+                # preceding cue's end handle.
+                end_side = 0 if milliseconds < segment.end_ms else 1
+                boundaries.append((end_distance, end_side, 1, "end", index))
+        if boundaries:
+            _distance, _side, _kind_order, kind, index = min(boundaries)
+            return _DragTarget(kind, index)
         index = self._segment_at(milliseconds)
         return _DragTarget("body", index) if index >= 0 else _DragTarget("selection")
 
@@ -681,13 +762,10 @@ class AudioVisualizerEditor(QWidget):
             return
         milliseconds = max(0, min(self.duration_ms, round(seconds * 1000)))
         self._drag_origin = milliseconds
+        # Always lock the target from the actual button-down coordinate.
+        # Hover delivery can lag behind a fast boundary crossing, especially
+        # while the centred-follow view is moving underneath the pointer.
         target = self._nearest_target(milliseconds)
-        tolerance = max(60, int((self.view_end - self.view_start) / max(1, self.width()) * 8))
-        if (
-            self._hover_target.kind in {"start", "end"}
-            and abs(self._hover_position - milliseconds) <= tolerance
-        ):
-            target = self._hover_target
         self._drag = target
         self._drag_changed = False
         self.suspend_follow("edit")

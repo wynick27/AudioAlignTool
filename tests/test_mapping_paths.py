@@ -40,6 +40,13 @@ class MappingPathTests(unittest.TestCase):
         self.assertEqual([1, 2], [link.audio_id for link in links])
         self.assertEqual("capitulo1", normalize_title("CAPÍTULO 1"))
 
+    def test_soft_hyphen_chapter_word_matches_numeric_audio(self) -> None:
+        chapter = Chapter(1, "�� CHAP\u00adTER THIRTEEN �� — Nicolas Flamel", 0)
+        choice = AudioSlice(9, "13 Nicolas Flamel", "13.mp3", 0, 10_000, 0)
+        links = automatic_links([chapter], [choice], {1: 5000})
+        self.assertEqual([(1, 9)], [(link.chapter_id, link.audio_id) for link in links])
+        self.assertGreater(links[0].confidence, 0.7)
+
     def test_short_front_matter_does_not_consume_first_audiobook_chapter(self) -> None:
         chapters = [
             Chapter(1, "章节 1", 0),
@@ -70,6 +77,58 @@ class MappingPathTests(unittest.TestCase):
                 links = session.repository.chapter_links(chapter_id)
                 self.assertEqual([0, 1], [link.position for link in links])
                 self.assertEqual([(5_000, 15_000), (0, 20_000)], [(link.source_start_ms, link.source_end_ms) for link in links])
+            finally:
+                session.close()
+
+    def test_staged_media_library_commits_assets_and_links_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("media-transaction", Path(temporary) / "project")
+            try:
+                chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+                staged = AudioAsset(-1, str(Path(temporary) / "video.mkv"), fingerprint="fingerprint", duration_ms=5000)
+                id_map = session.repository.replace_media_library(
+                    [staged], {-1: []},
+                    [ChapterAudioLink(None, chapter_id, -1, 0, 1000, 4000, 1.0)],
+                )
+                self.assertGreater(id_map[-1], 0)
+                self.assertEqual(id_map[-1], session.repository.chapter_links(chapter_id)[0].audio_id)
+                duplicate_id = session.repository.add_audio(
+                    AudioAsset(None, str(Path(temporary) / "video.mkv"), fingerprint="another")
+                )
+                self.assertEqual(id_map[-1], duplicate_id)
+                self.assertEqual(1, len(session.repository.all_audio()))
+                with self.assertRaises(ValueError):
+                    session.repository.replace_media_library(
+                        [], {}, [ChapterAudioLink(None, chapter_id, id_map[-1], 0, 0, 1000, 1.0)],
+                    )
+                self.assertEqual(1, len(session.repository.all_audio()))
+            finally:
+                session.close()
+
+    def test_changed_media_content_marks_existing_timeline_for_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("media-review", Path(temporary) / "project")
+            try:
+                chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+                staged = AudioAsset(-1, str(Path(temporary) / "first.mp3"), fingerprint="first", duration_ms=5000)
+                media_id = session.repository.replace_media_library(
+                    [staged], {-1: []},
+                    [ChapterAudioLink(None, chapter_id, -1, 0, 0, 5000, 1.0)],
+                )[-1]
+                self.assertFalse(session.repository.chapter_media_needs_review(chapter_id))
+
+                replacement = AudioAsset(
+                    media_id, str(Path(temporary) / "replacement.mp3"),
+                    fingerprint="different-content", duration_ms=5000,
+                )
+                session.repository.replace_media_library(
+                    [replacement], {media_id: []},
+                    [ChapterAudioLink(None, chapter_id, media_id, 0, 0, 5000, 1.0)],
+                )
+                self.assertTrue(session.repository.chapter_media_needs_review(chapter_id))
+
+                session.repository.replace_recognition_alignment(chapter_id, [], [], [])
+                self.assertFalse(session.repository.chapter_media_needs_review(chapter_id))
             finally:
                 session.close()
 

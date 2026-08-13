@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,11 +14,66 @@ from audioalign.core.models import (
     SegmentOrigin, SegmentStatus, SourceFragment, TextSegment,
 )
 from audioalign.core.storage import (
-    ProjectSession, UnsupportedProjectError, migrate_manifest, write_recognition_chunk,
+    ProjectRepository, ProjectSession, UnsupportedProjectError, migrate_manifest,
+    write_recognition_chunk,
 )
 
 
 class StorageExportTests(unittest.TestCase):
+    def test_non_structural_chapter_restore_preserves_segment_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("stable-undo", Path(temporary) / "project")
+            try:
+                chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+                session.repository.replace_segments(
+                    chapter_id, [TextSegment(None, chapter_id, 0, "one", 100, 500)],
+                )
+                original = session.repository.segments(chapter_id)
+                original_id = original[0].id
+                changed = session.repository.segments(chapter_id)
+                changed[0].start_ms = 300
+                session.repository.update_segments(changed)
+                session.repository.replace_chapter_edit_state(chapter_id, original, [])
+                restored = session.repository.segments(chapter_id)
+                self.assertEqual(original_id, restored[0].id)
+                self.assertEqual(100, restored[0].start_ms)
+            finally:
+                session.close()
+
+    def test_schema_v2_project_adds_media_position_before_its_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "project.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                PRAGMA user_version=2;
+                CREATE TABLE audio_assets (
+                    id INTEGER PRIMARY KEY,
+                    absolute_path TEXT NOT NULL,
+                    relative_path TEXT,
+                    fingerprint TEXT NOT NULL DEFAULT '',
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    sample_rate INTEGER NOT NULL DEFAULT 0,
+                    channels INTEGER NOT NULL DEFAULT 0,
+                    format TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO audio_assets(absolute_path,title) VALUES ('first.mp3','first');
+                INSERT INTO audio_assets(absolute_path,title) VALUES ('second.mp3','second');
+                """
+            )
+            connection.close()
+
+            repository = ProjectRepository(database)
+            try:
+                self.assertEqual([0, 1], [asset.position for asset in repository.all_audio()])
+                indexes = {
+                    row[1] for row in repository.connection.execute("PRAGMA index_list(audio_assets)")
+                }
+                self.assertIn("idx_audio_position", indexes)
+            finally:
+                repository.close()
+
     def test_source_fragment_and_segment_provenance_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("source-test", Path(temporary) / "project")

@@ -5,8 +5,14 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPalette
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
-from audioalign.core.models import AudioVisualizationMode, SegmentStatus, TextSegment
+from audioalign.core.models import (
+    AudioVisualizationMode,
+    SegmentStatus,
+    TextSegment,
+    segment_has_time_conflict,
+)
 from audioalign.core.spectrogram import AudioVisualizationCache
+from audioalign.core.timecode import format_time_ms
 
 
 class SegmentTableModel(QAbstractTableModel):
@@ -42,7 +48,7 @@ class SegmentTableModel(QAbstractTableModel):
         segment = self.segments[index.row()]
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             if index.column() == 0:
-                return f"{segment.start_ms / 1000:.3f} – {segment.end_ms / 1000:.3f}"
+                return f"{format_time_ms(segment.start_ms)} – {format_time_ms(segment.end_ms)}"
             if index.column() == 1:
                 return segment.text
             if index.column() == 2:
@@ -58,9 +64,7 @@ class SegmentTableModel(QAbstractTableModel):
             return segment
         if role == Qt.ItemDataRole.BackgroundRole:
             row = index.row()
-            previous = self.segments[row - 1] if row > 0 else None
-            following = self.segments[row + 1] if row + 1 < len(self.segments) else None
-            if (previous and previous.end_ms > segment.start_ms) or (following and segment.end_ms > following.start_ms):
+            if segment_has_time_conflict(self.segments, row):
                 return QColor(230, 55, 70, 65)
             if segment.status == SegmentStatus.LOW_CONFIDENCE:
                 return QColor(255, 190, 60, 45)

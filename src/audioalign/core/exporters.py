@@ -9,6 +9,7 @@ from pathlib import Path
 from .alignment import enforce_monotonic
 from .models import SegmentOverlapPolicy, SegmentStatus, TextSegment
 from .storage import ProjectSession
+from .timecode import format_srt_time, format_time_ms
 
 
 def _safe_name(value: str, fallback: str) -> str:
@@ -17,14 +18,11 @@ def _safe_name(value: str, fallback: str) -> str:
 
 
 def _srt_time(milliseconds: int) -> str:
-    hours, remainder = divmod(max(0, milliseconds), 3_600_000)
-    minutes, remainder = divmod(remainder, 60_000)
-    seconds, millis = divmod(remainder, 1000)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+    return format_srt_time(milliseconds)
 
 
 def _vtt_time(milliseconds: int) -> str:
-    return _srt_time(milliseconds).replace(",", ".")
+    return format_time_ms(milliseconds)
 
 
 def export_subtitles(session: ProjectSession, output: str | Path, kind: str) -> list[Path]:

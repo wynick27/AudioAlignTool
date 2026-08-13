@@ -19,6 +19,7 @@ dependencies = [
   "modelscope>=1.33",
   "ebooklib>=0.18",
   "beautifulsoup4>=4.12",
+  "markdown-it-py>=3,<5",
 ]
 
 [project.optional-dependencies]

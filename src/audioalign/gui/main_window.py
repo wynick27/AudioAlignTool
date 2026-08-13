@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import traceback
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable
 
@@ -22,7 +23,10 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -73,18 +77,21 @@ from audioalign.core.asr import (
     runtime_status,
     transcriber_for_options,
 )
-from audioalign.core.audio import create_m4a_proxy, decode_audio_mono, detect_silence_candidates, probe_audio
+from audioalign.core.audio import create_m4a_proxy, decode_audio_mono, detect_silence_candidates
+from audioalign.core.epub_media_overlay import EpubMediaOverlayOptions, export_epub_media_overlay
 from audioalign.core.exporters import export_html, export_json, export_subtitles
 from audioalign.core.models import (
     AlignmentMode,
     ASRBackendId,
+    AudioConversionPolicy,
     AudioVisualizationMode,
     AudioAsset,
-    AudioChapterMarker,
     BookWorkPlan,
     Chapter,
     ChapterAudioLink,
+    ChapterEditSnapshot,
     PlaybackFollowState,
+    ProjectContextKey,
     RecognitionChunk,
     SegmentOrigin,
     SegmentOverlapPolicy,
@@ -92,6 +99,8 @@ from audioalign.core.models import (
     SilenceAlignmentOptions,
     SilenceSettings,
     SourceFragment,
+    SourceDocument,
+    SourceDocumentKind,
     TaskHandle,
     TaskLane,
     TextAudioAnchor,
@@ -111,16 +120,22 @@ from audioalign.core.storage import (
     fingerprint_file,
     write_recognition_chunk,
 )
+from audioalign.core.timecode import format_time_ms
 from audioalign.core.text import (
+    collect_local_html_resources,
+    collect_local_markdown_resources,
     cursor_split_offset,
     import_book,
+    normalize_for_match,
     preferred_split_offset,
     split_sentences_with_offsets,
 )
+from audioalign.core.subtitles import import_srt
 
 from .article_spectrogram import ArticleSpectrogramView
 from .asr_comparison import ASRComparisonView
 from .mapping_dialog import ChapterAudioMappingDialog
+from .original_book_view import OriginalBookView
 from .segment_model import MiniSpectrogramDelegate, SegmentTableModel
 from .spectrogram_editor import AudioVisualizerEditor, AudioVisualizerOverview
 
@@ -365,9 +380,7 @@ class TaskManager(QObject):
 
 
 def _time(milliseconds: int) -> str:
-    milliseconds = max(0, milliseconds)
-    seconds, ms = divmod(milliseconds, 1000)
-    return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}.{ms:03d}"
+    return format_time_ms(milliseconds)
 
 
 class SegmentTextEdit(QPlainTextEdit):
@@ -421,7 +434,10 @@ class ShortcutSafeLineEdit(QLineEdit):
 
 
 class MainWindow(QMainWindow):
-    AUDIO_FILTER = "音频 (*.mp3 *.m4a *.m4b *.aac *.wav *.flac *.ogg *.opus);;所有文件 (*.*)"
+    AUDIO_FILTER = (
+        "媒体 (*.mp3 *.m4a *.m4b *.aac *.wav *.flac *.ogg *.opus "
+        "*.mp4 *.mkv *.mov *.webm);;所有文件 (*.*)"
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -442,8 +458,12 @@ class MainWindow(QMainWindow):
         self.current_cache: AudioVisualizationCache | None = None
         self.current_parts: list[tuple[ChapterAudioLink, AudioAsset, Path, int, int]] = []
         self.silence_candidates = []
-        self._history: list[list[TextSegment]] = []
-        self._future: list[list[TextSegment]] = []
+        self._history: dict[int, list[ChapterEditSnapshot]] = {}
+        self._future: dict[int, list[ChapterEditSnapshot]] = {}
+        self._media_revision = 0
+        self._article_content_dirty = False
+        self._asr_content_dirty = False
+        self._original_book_content_dirty = False
         self._task_started_at = 0.0
         self._task_fraction = 0.0
         self._media_task_fraction = 0.0
@@ -515,6 +535,11 @@ class MainWindow(QMainWindow):
         self.editor_commit_timer.setInterval(350)
         self.editor_commit_timer.timeout.connect(self._commit_segment_editor)
 
+        self.original_book_refresh_timer = QTimer(self)
+        self.original_book_refresh_timer.setSingleShot(True)
+        self.original_book_refresh_timer.setInterval(180)
+        self.original_book_refresh_timer.timeout.connect(self._refresh_original_book)
+
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setInterval(1500)
         self.autosave_timer.timeout.connect(self._autosave)
@@ -533,8 +558,9 @@ class MainWindow(QMainWindow):
         self.save_action = QAction("保存", self, shortcut=QKeySequence.StandardKey.Save, triggered=self.save_project)
         self.save_archive_action = QAction("另存为 .aatproj…", self, triggered=self.save_as_archive)
         self.save_folder_action = QAction("另存为文件夹…", self, triggered=self.save_as_folder)
-        self.import_book_action = QAction("导入 TXT/EPUB…", self, triggered=self.import_text)
-        self.import_audio_action = QAction("导入音频/M4B…", self, triggered=self.import_audio)
+        self.import_book_action = QAction("导入 TXT/MD/HTML/EPUB…", self, triggered=self.import_text)
+        self.import_srt_action = QAction("导入 SRT…", self, triggered=self.import_srt)
+        self.import_audio_action = QAction("导入音频/视频/M4B…", self, triggered=self.import_audio)
         self.mapping_action = QAction("章节与音频配对…", self, triggered=self.edit_mappings)
         self.recognize_action = QAction("识别并对齐当前章节", self, triggered=self.recognize_current)
         self.recognize_book_action = QAction(
@@ -552,6 +578,9 @@ class MainWindow(QMainWindow):
         self.export_srt_action = QAction("导出 SRT…", self, triggered=lambda: self.export_output("srt"))
         self.export_vtt_action = QAction("导出 VTT…", self, triggered=lambda: self.export_output("vtt"))
         self.export_json_action = QAction("导出 JSON…", self, triggered=lambda: self.export_output("json"))
+        self.export_epub_action = QAction(
+            "导出 EPUB 3 Media Overlays…", self, triggered=self.export_epub_media_overlays,
+        )
         self.undo_action = QAction("撤销", self, shortcut=QKeySequence.StandardKey.Undo, triggered=self.undo)
         self.redo_action = QAction("重做", self, shortcut=QKeySequence.StandardKey.Redo, triggered=self.redo)
         defaults = {
@@ -691,9 +720,12 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addActions([self.save_action, self.save_archive_action, self.save_folder_action])
         file_menu.addSeparator()
-        file_menu.addActions([self.import_book_action, self.import_audio_action])
+        file_menu.addActions([self.import_book_action, self.import_srt_action, self.import_audio_action])
         export_menu = file_menu.addMenu("导出")
-        export_menu.addActions([self.export_html_action, self.export_srt_action, self.export_vtt_action, self.export_json_action])
+        export_menu.addActions([
+            self.export_html_action, self.export_srt_action, self.export_vtt_action,
+            self.export_json_action, self.export_epub_action,
+        ])
         edit_menu = self.menuBar().addMenu("编辑")
         edit_menu.addActions([self.undo_action, self.redo_action, self.mapping_action])
         recognize_menu = self.menuBar().addMenu("识别")
@@ -819,9 +851,13 @@ class MainWindow(QMainWindow):
         self.content_tabs = QTabWidget()
         self.content_tabs.addTab(self.segment_table, "字幕表格")
         self.content_tabs.addTab(self.article_view, "文章频谱")
+        self.original_book_view = OriginalBookView()
+        self.original_book_view.segmentActivated.connect(self._original_book_segment_activated)
+        self.content_tabs.addTab(self.original_book_view, "原书")
         self.asr_comparison = ASRComparisonView()
-        self.asr_comparison.seekRequested.connect(self._seek_local)
+        self.asr_comparison.seekRequested.connect(self._asr_word_seek)
         self.content_tabs.addTab(self.asr_comparison, "ASR 对比")
+        self.content_tabs.currentChanged.connect(self._content_tab_changed)
         self.segment_table.setColumnHidden(2, not self.list_audio_action.isChecked())
         self.article_view.set_audio_visible(self.article_audio_action.isChecked())
         center_layout.addWidget(self.content_tabs)
@@ -1135,26 +1171,35 @@ class MainWindow(QMainWindow):
 
     def _build_status_bar(self) -> None:
         bar = QStatusBar(self)
+        bar.setSizeGripEnabled(False)
         self.setStatusBar(bar)
         self.status_stage = QLabel()
-        self.status_stage.setMinimumWidth(280)
+        self.status_stage.setFixedWidth(300)
+        self.status_stage.setToolTip("当前任务阶段")
         self.status_progress = QProgressBar()
-        self.status_progress.setFixedWidth(220)
+        self.status_progress.setFixedWidth(180)
         self.status_progress.setRange(0, 100)
         self.status_progress.setValue(0)
         self.status_chapters = QLabel("章节 0/0")
+        self.status_chapters.setFixedWidth(92)
         self.status_time = QLabel("耗时 00:00 · 剩余 --:--")
+        self.status_time.setFixedWidth(158)
         self.queue_label = QLabel("队列 0")
+        self.queue_label.setFixedWidth(120)
         self.pause_button = QPushButton("暂停")
+        self.pause_button.setFixedWidth(48)
         self.pause_button.clicked.connect(self.pause_tasks)
         self.cancel_button = QPushButton("取消")
+        self.cancel_button.setFixedWidth(48)
         self.cancel_button.clicked.connect(lambda: self.tasks.cancel_lane(TaskLane.INFERENCE))
         self.media_status = QLabel("媒体空闲")
+        self.media_status.setFixedWidth(135)
         self.media_progress = QProgressBar()
         self.media_progress.setFixedWidth(90)
         self.media_progress.setRange(0, 100)
         self.media_progress.setValue(0)
         self.media_cancel = QToolButton()
+        self.media_cancel.setFixedWidth(26)
         self.media_cancel.setText("×")
         self.media_cancel.setToolTip("取消波形/频谱与媒体缓存任务")
         self.media_cancel.clicked.connect(lambda: self.tasks.cancel_lane(TaskLane.MEDIA))
@@ -1193,20 +1238,45 @@ class MainWindow(QMainWindow):
             return False
 
     def _set_session(self, session: ProjectSession) -> None:
+        if self.session and self.session is not session and hasattr(self, "editor_commit_timer"):
+            self.editor_commit_timer.stop()
+            self._commit_segment_editor()
         self._session_generation += 1
         self.tasks.set_session_generation(self._session_generation)
         if self.session and self.session is not session:
-            if hasattr(self, "editor_commit_timer"):
-                self.editor_commit_timer.stop()
             self.player.stop()
             self.player.setSource(QUrl())
+            if hasattr(self, "original_book_view"):
+                self.original_book_view.clear_book(self._session_generation)
+            self._release_current_cache()
             self.session.close()
         self.session = session
+        self._history.clear()
+        self._future.clear()
+        self._media_revision = 0
         self.current_chapter_id = None
         self._clear_play_range()
         self._sync_settings_from_manifest()
         self._reload_chapters()
         self._update_title()
+        self._update_undo_actions()
+
+    def _release_current_cache(self) -> None:
+        if self.current_cache:
+            self.mini_delegate.set_cache(None)
+            self.spectrogram.set_cache(None)
+            self.overview.set_cache(None)
+            self.current_cache.close()
+        self.current_cache = None
+
+    def _project_context(self) -> ProjectContextKey | None:
+        if not self.session:
+            return None
+        return ProjectContextKey(
+            str(self.session.repository.database.resolve()),
+            self.session.manifest.project_id,
+            self._session_generation,
+        )
 
     def _update_title(self) -> None:
         if not self.session:
@@ -1222,8 +1292,10 @@ class MainWindow(QMainWindow):
         self.chapter_list.clear()
         chapters = self.session.repository.chapters() if self.session else []
         for chapter in chapters:
-            links = self.session.repository.chapter_links(chapter.id or 0)
-            self.chapter_list.addItem(("♫ " if links else "□ ") + chapter.title)
+            chapter_id = chapter.id or 0
+            links = self.session.repository.chapter_links(chapter_id)
+            prefix = "⚠ " if self.session.repository.chapter_media_needs_review(chapter_id) else ("♫ " if links else "□ ")
+            self.chapter_list.addItem(prefix + chapter.title)
         self.chapter_list.blockSignals(False)
         self.status_chapters.setText(f"章节 {min(select + 1, len(chapters)) if chapters else 0}/{len(chapters)}")
         if chapters:
@@ -1231,6 +1303,7 @@ class MainWindow(QMainWindow):
         else:
             self.segment_model.set_segments([])
             self.article_view.set_content([], [], None)
+            self.original_book_view.clear_book(self._session_generation)
 
     def _chapter_selected(self, row: int) -> None:
         if not self.session or row < 0:
@@ -1246,7 +1319,13 @@ class MainWindow(QMainWindow):
         self.status_chapters.setText(f"章节 {row + 1}/{len(chapters)}")
         segments = self.session.repository.segments(chapter.id or 0)
         self.segment_model.set_segments(segments)
+        self.original_book_view.set_chapter(
+            self.session, chapter.id or 0, segments, self._session_generation,
+        )
         self.asr_comparison.set_content(segments, self.session.repository.asr_tokens(chapter.id or 0))
+        self._article_content_dirty = False
+        self._asr_content_dirty = False
+        self._original_book_content_dirty = False
         self._editing_row = -1
         if not segments:
             self._load_segment_editor(-1)
@@ -1255,12 +1334,7 @@ class MainWindow(QMainWindow):
         self.spectrogram.set_silences([])
         self.overview.set_silences([])
         self.silence_candidates = []
-        if self.current_cache:
-            self.mini_delegate.set_cache(None)
-            self.spectrogram.set_cache(None)
-            self.overview.set_cache(None)
-            self.current_cache.close()
-        self.current_cache = None
+        self._release_current_cache()
         self.current_asset = None
         self.current_link = None
         self.current_parts = []
@@ -1272,6 +1346,7 @@ class MainWindow(QMainWindow):
             self.article_view.set_content(segments, self.session.repository.anchors(chapter.id or 0), None)
             if segments:
                 self._select_segment_row(0)
+            self._update_undo_actions()
             return
         local_cursor = 0
         slices: list[tuple[Path, int, int]] = []
@@ -1346,6 +1421,7 @@ class MainWindow(QMainWindow):
             )
         if segments:
             self._select_segment_row(0)
+        self._update_undo_actions()
 
     def _load_visualization(self, cache_dir: Path, duration: int) -> None:
         if not cache_dir.exists():
@@ -1410,6 +1486,31 @@ class MainWindow(QMainWindow):
             self._open_project(path)
 
     def _open_project(self, path: str) -> None:
+        self._commit_segment_editor()
+        if self.session and self.session.dirty:
+            if self.session.archive_path:
+                choice = QMessageBox.question(
+                    self,
+                    "保存当前项目",
+                    "当前压缩项目有尚未写回的修改，是否先保存？",
+                    QMessageBox.StandardButton.Save
+                    | QMessageBox.StandardButton.Discard
+                    | QMessageBox.StandardButton.Cancel,
+                )
+                if choice == QMessageBox.StandardButton.Cancel:
+                    return
+                if choice == QMessageBox.StandardButton.Save:
+                    try:
+                        self.session.save()
+                    except Exception as exc:
+                        self._show_error(str(exc))
+                        return
+            else:
+                try:
+                    self.session.save()
+                except Exception as exc:
+                    self._show_error(str(exc))
+                    return
         try:
             self._set_session(ProjectSession.open(path))
         except Exception as exc:
@@ -1454,86 +1555,250 @@ class MainWindow(QMainWindow):
                 self._show_error(str(exc))
 
     def import_text(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "导入文本或电子书", "", "电子书 (*.txt *.epub)")
-        if not path or not self._ensure_project(Path(path).stem):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "导入文本或电子书（可多选）", "",
+            "书籍与文档 (*.txt *.md *.markdown *.html *.htm *.epub)",
+        )
+        if not paths or not self._ensure_project(Path(paths[0]).stem):
             return
         try:
-            imported = import_book(path)
-            destination = self.session.root / "source" / Path(path).name
-            shutil.copy2(path, destination)
-            self.session.manifest.source_name = destination.name
+            prepared: list[tuple[Path, list, list[Path], list[str]]] = []
+            one_per_file = len(paths) > 1
+            for path in paths:
+                source = Path(path).resolve()
+                imported = import_book(
+                    source,
+                    one_chapter=one_per_file and source.suffix.lower() != ".epub",
+                )
+                if source.suffix.lower() in {".html", ".htm"}:
+                    resources, warnings = collect_local_html_resources(source)
+                elif source.suffix.lower() in {".md", ".markdown"}:
+                    resources, warnings = collect_local_markdown_resources(source)
+                else:
+                    resources, warnings = [], []
+                prepared.append((source, imported, resources, warnings))
+
             base = len(self.session.repository.chapters())
-            for position, item in enumerate(imported):
-                chapter_id = self.session.repository.add_chapter(Chapter(None, item.title, base + position, item.source_html))
-                fragments = [
-                    SourceFragment(
-                        None, chapter_id, fragment.position, fragment.kind, fragment.text,
-                        fragment.source_start_char, fragment.source_end_char,
+            next_position = base
+            all_warnings: list[str] = []
+            for source, imported, resources, warnings in prepared:
+                token = fingerprint_file(source)[:10]
+                document_root = self.session.root / "source" / f"{sanitize_project_name(source.stem)}-{token}"
+                document_root.mkdir(parents=True, exist_ok=True)
+                destination = document_root / source.name
+                if not destination.exists():
+                    shutil.copy2(source, destination)
+                for resource in resources:
+                    relative = resource.relative_to(source.parent)
+                    target = document_root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(resource, target)
+                kind = imported[0].source_kind if imported else SourceDocumentKind.TXT
+                document_id = self.session.repository.add_source_document(SourceDocument(
+                    None, kind, str(source), str(destination.relative_to(self.session.root)),
+                    fingerprint_file(source), source.name,
+                    str(document_root.relative_to(self.session.root)),
+                ))
+                if not self.session.manifest.source_name:
+                    self.session.manifest.source_name = str(destination.relative_to(self.session.root))
+                for item in imported:
+                    chapter_id = self.session.repository.add_chapter(
+                        Chapter(None, item.title, next_position, item.source_html)
                     )
-                    for fragment in item.fragments
-                ]
-                self.session.repository.replace_source_fragments(chapter_id, fragments)
-                stored_fragments = self.session.repository.source_fragments(chapter_id)
-                segments: list[TextSegment] = []
-                for fragment in stored_fragments:
-                    for text, start, end in split_sentences_with_offsets(fragment.text):
-                        segments.append(TextSegment(
-                            None, chapter_id, len(segments), text,
-                            origin=SegmentOrigin.SOURCE,
-                            source_fragment_id=fragment.id,
-                            source_start_char=fragment.source_start_char + start,
-                            source_end_char=fragment.source_start_char + end,
-                        ))
-                self.session.repository.replace_segments(chapter_id, segments)
+                    next_position += 1
+                    self.session.repository.set_chapter_source_document(
+                        chapter_id, document_id, entry_path=item.entry_path, selector=item.selector,
+                    )
+                    if item.source_parts:
+                        self.session.repository.set_chapter_source_parts(
+                            chapter_id, document_id,
+                            [(part.entry_path, part.selector) for part in item.source_parts],
+                        )
+                    fragments = [
+                        SourceFragment(
+                            None, chapter_id, fragment.position, fragment.kind, fragment.text,
+                            fragment.source_start_char, fragment.source_end_char,
+                        )
+                        for fragment in item.fragments
+                    ]
+                    self.session.repository.replace_source_fragments(chapter_id, fragments)
+                    stored_fragments = self.session.repository.source_fragments(chapter_id)
+                    for fragment in stored_fragments:
+                        self.session.repository.set_fragment_locator(fragment.id or 0, f"block:{fragment.position}")
+                    segments: list[TextSegment] = []
+                    for fragment in stored_fragments:
+                        for text, start, end in split_sentences_with_offsets(fragment.text):
+                            segments.append(TextSegment(
+                                None, chapter_id, len(segments), text,
+                                origin=SegmentOrigin.SOURCE,
+                                source_fragment_id=fragment.id,
+                                source_start_char=fragment.source_start_char + start,
+                                source_end_char=fragment.source_start_char + end,
+                            ))
+                    self.session.repository.replace_segments(chapter_id, segments)
+                all_warnings.extend(f"{source.name}：{warning}" for warning in warnings)
             self._mark_dirty()
             self._reload_chapters(base)
+            if all_warnings:
+                QMessageBox.warning(self, "部分资源未导入", "\n".join(all_warnings[:20]))
         except Exception as exc:
             self._show_error(str(exc))
 
-    def import_audio(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(self, "导入音频或 M4B", "", self.AUDIO_FILTER)
-        if not files or not self._ensure_project(Path(files[0]).stem):
+    def import_srt(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "导入 SRT（可多选；多选时每个文件建立一章）", "", "SubRip 字幕 (*.srt)"
+        )
+        if not paths or not self._ensure_project(Path(paths[0]).stem):
             return
         try:
-            existing_chapters = self.session.repository.chapters()
-            available = [chapter for chapter in existing_chapters if not self.session.repository.chapter_links(chapter.id or 0)]
-            available_cursor = 0
-            for file_name in files:
-                path = Path(file_name)
-                probe = probe_audio(path)
-                asset_id = self.session.repository.add_audio(
-                    AudioAsset(
-                        None,
-                        str(path.resolve()),
-                        None,
-                        fingerprint_file(path),
-                        probe.duration_ms,
-                        probe.sample_rate,
-                        probe.channels,
-                        probe.format,
-                        probe.title or path.stem,
-                    )
-                )
-                markers = [AudioChapterMarker(None, asset_id, index, title, start, end) for index, (title, start, end) in enumerate(probe.chapters)]
-                self.session.repository.add_audio_chapters(markers)
-                slices = markers or [AudioChapterMarker(None, asset_id, 0, probe.title or path.stem, 0, probe.duration_ms)]
-                for marker in slices:
-                    if available_cursor < len(available):
-                        chapter = available[available_cursor]
-                        available_cursor += 1
-                    else:
-                        chapter_id = self.session.repository.add_chapter(
-                            Chapter(None, marker.title or path.stem, len(self.session.repository.chapters()))
-                        )
-                        chapter = Chapter(chapter_id, marker.title or path.stem, len(self.session.repository.chapters()) - 1)
-                    self.session.repository.set_chapter_links(
-                        chapter.id or 0,
-                        [ChapterAudioLink(None, chapter.id or 0, asset_id, 0, marker.start_ms, marker.end_ms, 1.0)],
-                    )
-            self._mark_dirty()
-            self._reload_chapters()
+            imported_files = [(Path(path).resolve(), import_srt(path)) for path in paths]
         except Exception as exc:
             self._show_error(str(exc))
+            return
+        path, cues = imported_files[0]
+        modes = ["新增为章节", "匹配到当前章节", "替换当前章节"]
+        if len(imported_files) > 1:
+            mode, ok = "新增为章节", True
+        else:
+            mode, ok = QInputDialog.getItem(self, "SRT 导入方式", "处理方式：", modes, 0, False)
+            if not ok:
+                return
+        if mode != "新增为章节" and self.current_chapter_id is not None:
+            message = (
+                f"将用 {len(cues)} 条 SRT 字幕替换当前章节句段。原始来源片段仍会保留，是否继续？"
+                if mode == "替换当前章节"
+                else f"将预览匹配 {len(cues)} 条 SRT 字幕到当前章节并写入匹配到的时间，是否继续？"
+            )
+            if QMessageBox.question(
+                self, mode, message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+        source = Path(path).resolve()
+        if len(imported_files) > 1:
+            base = len(self.session.repository.chapters())
+            for source, cues in imported_files:
+                self._import_srt_as_chapter(source, cues)
+            self._mark_dirty()
+            self._reload_chapters(base)
+            return
+        token = fingerprint_file(source)[:10]
+        document_root = self.session.root / "source" / f"{sanitize_project_name(source.stem)}-{token}"
+        document_root.mkdir(parents=True, exist_ok=True)
+        destination = document_root / source.name
+        if not destination.exists():
+            shutil.copy2(source, destination)
+        document_id = self.session.repository.add_source_document(SourceDocument(
+            None, SourceDocumentKind.SRT, str(source), str(destination.relative_to(self.session.root)),
+            fingerprint_file(source), source.name, str(document_root.relative_to(self.session.root)),
+        ))
+        if mode == "新增为章节" or self.current_chapter_id is None:
+            chapter_position = len(self.session.repository.chapters())
+            chapter_id = self.session.repository.add_chapter(Chapter(None, source.stem, chapter_position))
+            self.session.repository.set_chapter_source_document(chapter_id, document_id, entry_path=source.name)
+            cursor = 0
+            fragments: list[SourceFragment] = []
+            segments: list[TextSegment] = []
+            for position, cue in enumerate(cues):
+                end = cursor + len(cue.text)
+                fragments.append(SourceFragment(None, chapter_id, position, "subtitle", cue.text, cursor, end))
+                cursor = end
+            self.session.repository.replace_source_fragments(chapter_id, fragments)
+            stored = self.session.repository.source_fragments(chapter_id)
+            for position, (cue, fragment) in enumerate(zip(cues, stored)):
+                self.session.repository.set_fragment_locator(fragment.id or 0, f"cue:{cue.index}")
+                segments.append(TextSegment(
+                    None, chapter_id, position, cue.text, cue.start_ms, cue.end_ms, 1.0,
+                    SegmentStatus.MANUAL, False, SegmentOrigin.SUBTITLE, fragment.id,
+                    fragment.source_start_char, fragment.source_end_char,
+                ))
+            self.session.repository.replace_segments(chapter_id, segments)
+            self._mark_dirty()
+            self._reload_chapters(chapter_position)
+            return
+
+        chapter_id = self.current_chapter_id
+        current = copy.deepcopy(self.segment_model.segments)
+        self._push_history()
+        if mode == "替换当前章节":
+            replacement = [TextSegment(
+                None, chapter_id, position, cue.text, cue.start_ms, cue.end_ms, 1.0,
+                SegmentStatus.MANUAL, False, SegmentOrigin.SUBTITLE,
+            ) for position, cue in enumerate(cues)]
+            self._replace_segments(replacement, [])
+        else:
+            cue_cursor = 0
+            anchors = copy.deepcopy(self.session.repository.anchors(chapter_id))
+            for segment in current:
+                best_index, best_score = -1, 0.0
+                target = normalize_for_match(segment.text)
+                for index in range(cue_cursor, min(len(cues), cue_cursor + 8)):
+                    score = SequenceMatcher(None, target, normalize_for_match(cues[index].text)).ratio()
+                    if score > best_score:
+                        best_index, best_score = index, score
+                if best_index < 0 or best_score < 0.35:
+                    continue
+                cue = cues[best_index]
+                cue_cursor = best_index + 1
+                segment.start_ms, segment.end_ms = cue.start_ms, cue.end_ms
+                segment.confidence = best_score
+                segment.status = SegmentStatus.MANUAL if best_score >= 0.7 else SegmentStatus.LOW_CONFIDENCE
+                if segment.source_start_char is not None and segment.source_end_char is not None:
+                    anchors.append(TextAudioAnchor(
+                        None, chapter_id, segment.id, segment.source_start_char,
+                        segment.source_end_char, cue.start_ms, cue.end_ms, best_score, "srt-match",
+                    ))
+            self._replace_segments(current, anchors)
+        self._mark_dirty()
+
+    def _import_srt_as_chapter(self, source: Path, cues) -> int:
+        """Import one already-validated SRT as one immutable source chapter."""
+        token = fingerprint_file(source)[:10]
+        document_root = self.session.root / "source" / f"{sanitize_project_name(source.stem)}-{token}"
+        document_root.mkdir(parents=True, exist_ok=True)
+        destination = document_root / source.name
+        if not destination.exists():
+            shutil.copy2(source, destination)
+        document_id = self.session.repository.add_source_document(SourceDocument(
+            None, SourceDocumentKind.SRT, str(source), str(destination.relative_to(self.session.root)),
+            fingerprint_file(source), source.name, str(document_root.relative_to(self.session.root)),
+        ))
+        chapter_position = len(self.session.repository.chapters())
+        chapter_id = self.session.repository.add_chapter(Chapter(None, source.stem, chapter_position))
+        self.session.repository.set_chapter_source_document(chapter_id, document_id, entry_path=source.name)
+        cursor = 0
+        fragments: list[SourceFragment] = []
+        for position, cue in enumerate(cues):
+            end = cursor + len(cue.text)
+            fragments.append(SourceFragment(None, chapter_id, position, "subtitle", cue.text, cursor, end))
+            cursor = end
+        self.session.repository.replace_source_fragments(chapter_id, fragments)
+        stored = self.session.repository.source_fragments(chapter_id)
+        segments = []
+        for position, (cue, fragment) in enumerate(zip(cues, stored)):
+            self.session.repository.set_fragment_locator(fragment.id or 0, f"cue:{cue.index}")
+            segments.append(TextSegment(
+                None, chapter_id, position, cue.text, cue.start_ms, cue.end_ms, 1.0,
+                SegmentStatus.MANUAL, False, SegmentOrigin.SUBTITLE, fragment.id,
+                fragment.source_start_char, fragment.source_end_char,
+            ))
+        self.session.repository.replace_segments(chapter_id, segments)
+        return chapter_id
+
+    def import_audio(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "导入音频或视频", "", self.AUDIO_FILTER)
+        if not files or not self._ensure_project(Path(files[0]).stem):
+            return
+        dialog = ChapterAudioMappingDialog(self.session, self)
+        try:
+            dialog.add_files(files=files)
+        except Exception as exc:
+            self._show_error(str(exc))
+            return
+        if dialog.exec():
+            self._media_graph_changed()
+            self._reload_chapters(max(0, self.chapter_list.currentRow()))
+            self._mark_dirty()
 
     def edit_mappings(self) -> None:
         if not self.session:
@@ -1541,8 +1806,19 @@ class MainWindow(QMainWindow):
         current = max(0, self.chapter_list.currentRow())
         dialog = ChapterAudioMappingDialog(self.session, self)
         if dialog.exec():
+            self._media_graph_changed()
             self._reload_chapters(current)
             self._mark_dirty()
+
+    def _media_graph_changed(self) -> None:
+        """Invalidate every callback and edit snapshot based on the old media graph."""
+        self._media_revision += 1
+        self._session_generation += 1
+        self.tasks.set_session_generation(self._session_generation)
+        self._history.clear()
+        self._future.clear()
+        self._clear_play_range()
+        self._update_undo_actions()
 
     def _asr_options(self) -> ASROptions:
         link = self.current_link
@@ -1603,6 +1879,14 @@ class MainWindow(QMainWindow):
 
     def _recognition_audio_signature(self) -> str:
         return self._parts_audio_signature(self.current_parts)
+
+    @staticmethod
+    def _chapter_cache_key(repository, cache_key: str, chapter_id: int) -> str:
+        """Keep identical media slices reusable without cross-chapter cache aliasing."""
+        existing = repository.recognition_run(cache_key)
+        if existing is None or existing.chapter_id == chapter_id:
+            return cache_key
+        return hashlib.sha256(f"{cache_key}|chapter={chapter_id}".encode("utf-8")).hexdigest()
 
     def _confirm_qwen_cpu_run(self, operation: str, duration_ms: int) -> bool:
         """Allow Qwen on CPU, but make the potentially very long wait explicit."""
@@ -1667,6 +1951,7 @@ class MainWindow(QMainWindow):
         parts = list(self.current_parts)
         audio_signature = self._recognition_audio_signature()
         cache_key, parameters_json = recognition_cache_key(audio_signature, options)
+        cache_key = self._chapter_cache_key(self.session.repository, cache_key, chapter_id)
         if force:
             self.session.repository.reset_recognition_run(cache_key)
         run = self.session.repository.ensure_recognition_run(
@@ -1840,6 +2125,7 @@ class MainWindow(QMainWindow):
             candidates = self.session.repository.silence_candidates(chapter_id, silence_signature)
             audio_signature = self._parts_audio_signature(parts)
             cache_key, _parameters_json = recognition_cache_key(audio_signature, options)
+            cache_key = self._chapter_cache_key(self.session.repository, cache_key, chapter_id)
             existing_run = self.session.repository.recognition_run(cache_key)
             preserve_existing_plan = bool(
                 existing_run
@@ -1912,6 +2198,7 @@ class MainWindow(QMainWindow):
                     )
                     audio_signature = self._parts_audio_signature(parts)
                     cache_key, parameters_json = recognition_cache_key(audio_signature, options)
+                    cache_key = self._chapter_cache_key(repository, cache_key, chapter_id)
                     if force:
                         repository.reset_recognition_run(cache_key)
                     run = repository.ensure_recognition_run(
@@ -2910,6 +3197,7 @@ class MainWindow(QMainWindow):
         segment = self.segment_model.segments[row]
         if segment.locked:
             return
+        selection_follows, manual_play_follows = self._ranges_follow_segment(segment)
         value = self._nearest_silence(milliseconds) if snap else milliseconds
         if kind == "start":
             segment.start_ms = max(0, min(segment.end_ms, value))
@@ -2921,6 +3209,7 @@ class MainWindow(QMainWindow):
         self.spectrogram.preview_segment(row)
         for changed in self._drag_changed_rows - {row}:
             self.spectrogram.preview_segment(changed)
+        self._sync_ranges_to_segment(segment, selection_follows, manual_play_follows)
 
     def _shift_segment(self, row: int, delta_ms: int) -> None:
         if not (0 <= row < len(self.segment_model.segments)) or not delta_ms:
@@ -2928,6 +3217,7 @@ class MainWindow(QMainWindow):
         segment = self.segment_model.segments[row]
         if segment.locked:
             return
+        selection_follows, manual_play_follows = self._ranges_follow_segment(segment)
         duration = max(0, segment.end_ms - segment.start_ms)
         chapter_end = self.current_parts[-1][4] if self.current_parts else max(segment.end_ms, 0)
         start = max(0, min(max(0, chapter_end - duration), segment.start_ms + delta_ms))
@@ -2944,6 +3234,37 @@ class MainWindow(QMainWindow):
         self.spectrogram.preview_segment(row)
         for changed in self._drag_changed_rows - {row}:
             self.spectrogram.preview_segment(changed)
+        self._sync_ranges_to_segment(segment, selection_follows, manual_play_follows)
+
+    def _ranges_follow_segment(self, segment: TextSegment) -> tuple[bool, bool]:
+        """Identify cue-derived ranges before mutating the cue's timestamps."""
+        selection = self.spectrogram.selection
+        selection_follows = bool(
+            selection
+            and self.spectrogram.selection_tracks_segment
+            and selection.start_ms == segment.start_ms
+            and selection.end_ms == segment.end_ms
+        )
+        manual_play_follows = bool(
+            self._play_range_segment_id is None
+            and self._play_range_segment_row is None
+            and self._play_range_start == segment.start_ms
+            and self._play_range_end == segment.end_ms
+        )
+        return selection_follows, manual_play_follows
+
+    def _sync_ranges_to_segment(
+        self, segment: TextSegment, selection_follows: bool, manual_play_follows: bool,
+    ) -> None:
+        """Move only cue-derived selection/play ranges; preserve manual ranges."""
+        if selection_follows:
+            if segment.end_ms > segment.start_ms:
+                self.spectrogram.set_segment_selection(segment.start_ms, segment.end_ms)
+            else:
+                self.spectrogram.clear_selection()
+        if manual_play_follows:
+            self._play_range_start = segment.start_ms
+            self._play_range_end = segment.end_ms
 
     def _commit_dragged_segment(self, row: int) -> None:
         """Commit one drag atomically after mouse release, not once per pixel."""
@@ -2983,13 +3304,13 @@ class MainWindow(QMainWindow):
         selection = self.spectrogram.selection
         if not rows or not selection:
             return
-        self._push_history()
         segment = self.segment_model.segments[rows[0]]
         if segment.locked:
             return
+        self._push_history()
         segment.start_ms, segment.end_ms = selection.start_ms, selection.end_ms
         segment.status = SegmentStatus.MANUAL
-        self._persist_current_segments()
+        self._persist_current_segments([rows[0]])
 
     def distribute_selection(self, proportional: bool = False) -> None:
         rows = self._selected_rows()
@@ -3006,7 +3327,7 @@ class MainWindow(QMainWindow):
             if not segment.locked:
                 segment.start_ms, segment.end_ms, segment.status = cursor, end, SegmentStatus.MANUAL
             cursor = end
-        self._persist_current_segments()
+        self._persist_current_segments(rows)
 
     def new_segment_from_selection(self) -> None:
         if self.current_chapter_id is None or not self.spectrogram.selection:
@@ -3047,7 +3368,58 @@ class MainWindow(QMainWindow):
                 if not following.locked:
                     following.start_ms += delta
                     following.end_ms += delta
-        self._persist_current_segments()
+        changed_rows = list(range(row, len(self.segment_model.segments))) if shift_following else [row]
+        if self._drag_changed_rows:
+            changed_rows.extend(self._drag_changed_rows)
+        self._persist_current_segments(sorted(set(changed_rows)))
+
+    def _time_for_text_offset(
+        self, source: TextSegment, text: str, text_offset: int, fallback_ms: int,
+    ) -> int:
+        """Map a textual split boundary through ASR/forced-aligner anchors."""
+        if source.end_ms - source.start_ms < 2:
+            return 0
+        result = int(fallback_ms)
+        if (
+            self.session and self.current_chapter_id is not None
+            and source.source_start_char is not None
+            and source.source_end_char is not None
+        ):
+            source_span = max(1, source.source_end_char - source.source_start_char)
+            mapped_character = source.source_start_char + round(
+                source_span * text_offset / max(1, len(text))
+            )
+            anchors = [
+                anchor for anchor in self.session.repository.anchors(self.current_chapter_id)
+                if anchor.source_end_char >= source.source_start_char
+                and anchor.source_start_char <= source.source_end_char
+            ]
+            containing = [
+                anchor for anchor in anchors
+                if anchor.source_start_char <= mapped_character <= anchor.source_end_char
+            ]
+            if containing:
+                anchor = min(
+                    containing,
+                    key=lambda item: item.source_end_char - item.source_start_char,
+                )
+                ratio = (
+                    (mapped_character - anchor.source_start_char)
+                    / max(1, anchor.source_end_char - anchor.source_start_char)
+                )
+                result = round(anchor.start_ms + ratio * (anchor.end_ms - anchor.start_ms))
+            elif anchors:
+                # A punctuation boundary commonly falls in the character gap
+                # between two word anchors.  Use the nearest word edge.
+                edges = [
+                    (abs(mapped_character - anchor.source_start_char), anchor.start_ms)
+                    for anchor in anchors
+                ] + [
+                    (abs(mapped_character - anchor.source_end_char), anchor.end_ms)
+                    for anchor in anchors
+                ]
+                result = min(edges, key=lambda item: item[0])[1]
+        return max(source.start_ms + 1, min(source.end_ms - 1, int(result)))
 
     def split_segment(self) -> None:
         rows = self._selected_rows()
@@ -3130,30 +3502,12 @@ class MainWindow(QMainWindow):
         has_timing = source.end_ms - source.start_ms >= 2
         split_time = 0
         if has_timing:
-            split_time = source.start_ms + round(
+            fallback_time = source.start_ms + round(
                 (source.end_ms - source.start_ms) * text_offset / max(1, len(text))
             )
-            if source.source_start_char is not None and source.source_end_char is not None:
-                source_span = max(1, source.source_end_char - source.source_start_char)
-                mapped_character = source.source_start_char + round(
-                    source_span * text_offset / max(1, len(text))
-                )
-                anchors = self.session.repository.anchors(self.current_chapter_id)
-                matching = [
-                    anchor for anchor in anchors
-                    if anchor.source_start_char <= mapped_character <= anchor.source_end_char
-                ]
-                if matching:
-                    anchor = min(
-                        matching,
-                        key=lambda item: item.source_end_char - item.source_start_char,
-                    )
-                    ratio = (
-                        (mapped_character - anchor.source_start_char)
-                        / max(1, anchor.source_end_char - anchor.source_start_char)
-                    )
-                    split_time = round(anchor.start_ms + ratio * (anchor.end_ms - anchor.start_ms))
-            split_time = max(source.start_ms + 1, min(source.end_ms - 1, split_time))
+            split_time = self._time_for_text_offset(
+                source, text, text_offset, fallback_time,
+            )
 
         source_start = source.source_start_char
         source_end = source.source_end_char
@@ -3202,16 +3556,31 @@ class MainWindow(QMainWindow):
         if source.locked or len(pieces) < 2:
             return
         duration = max(0, source.end_ms - source.start_ms)
+        has_timing = duration >= len(pieces)
         replacement: list[TextSegment] = []
+        previous_end = source.start_ms if has_timing else 0
         for index, (text, start, end) in enumerate(pieces):
-            piece_start = source.start_ms + round(duration * start / max(1, len(source.text)))
-            piece_end = source.end_ms if index == len(pieces) - 1 else source.start_ms + round(
-                duration * end / max(1, len(source.text))
-            )
+            piece_start = previous_end if has_timing else 0
+            if not has_timing:
+                piece_end = 0
+            elif index == len(pieces) - 1:
+                piece_end = source.end_ms
+            else:
+                fallback_end = source.start_ms + round(
+                    duration * end / max(1, len(source.text))
+                )
+                piece_end = self._time_for_text_offset(
+                    source, source.text, end, fallback_end,
+                )
+                latest = source.end_ms - (len(pieces) - index - 1)
+                piece_end = min(latest, max(piece_start + 1, piece_end))
+            previous_end = piece_end
             base = source.source_start_char
             replacement.append(TextSegment(
                 None, self.current_chapter_id, 0, text, piece_start, piece_end,
-                source.confidence, SegmentStatus.MANUAL, origin=source.origin,
+                source.confidence,
+                SegmentStatus.MANUAL if has_timing else SegmentStatus.UNMATCHED,
+                origin=source.origin,
                 source_fragment_id=source.source_fragment_id,
                 source_start_char=None if base is None else base + start,
                 source_end_char=None if base is None else base + end,
@@ -3402,13 +3771,78 @@ class MainWindow(QMainWindow):
         self.status_stage.setText(f"已移除 {len(editable)} 个时间匹配，原文已保留为未匹配")
         self._mark_dirty()
 
-    def _refresh_segment_views(self) -> None:
-        self.spectrogram.set_segments(self.segment_model.segments)
-        self.overview.set_segments(self.segment_model.segments)
-        anchors = self.session.repository.anchors(self.current_chapter_id or 0) if self.session else []
-        tokens = self.session.repository.asr_tokens(self.current_chapter_id or 0) if self.session else []
-        self.article_view.set_content(self.segment_model.segments, anchors, self.current_cache)
-        self.asr_comparison.set_content(self.segment_model.segments, tokens)
+    def _refresh_segment_views(
+        self, *, defer_hidden: bool = False, refresh_audio: bool = True,
+    ) -> None:
+        if refresh_audio:
+            self.spectrogram.set_segments(self.segment_model.segments)
+            self.overview.set_segments(self.segment_model.segments)
+        if not defer_hidden or self.content_tabs.currentWidget() is self.article_view:
+            anchors = (
+                self.session.repository.anchors(self.current_chapter_id or 0)
+                if self.session else []
+            )
+            self.article_view.set_content(self.segment_model.segments, anchors, self.current_cache)
+            self._article_content_dirty = False
+        else:
+            self._article_content_dirty = True
+        if not defer_hidden or self.content_tabs.currentWidget() is self.asr_comparison:
+            tokens = (
+                self.session.repository.asr_tokens(self.current_chapter_id or 0)
+                if self.session else []
+            )
+            self.asr_comparison.set_content(self.segment_model.segments, tokens)
+            self._asr_content_dirty = False
+        else:
+            self._asr_content_dirty = True
+        if not defer_hidden or self.content_tabs.currentWidget() is self.original_book_view:
+            self.original_book_refresh_timer.start()
+            self._original_book_content_dirty = False
+        else:
+            self._original_book_content_dirty = True
+
+    def _content_tab_changed(self, _index: int) -> None:
+        if not self.session or self.current_chapter_id is None:
+            return
+        current = self.content_tabs.currentWidget()
+        if current is self.article_view and self._article_content_dirty:
+            self.article_view.set_content(
+                self.segment_model.segments,
+                self.session.repository.anchors(self.current_chapter_id),
+                self.current_cache,
+            )
+            self._article_content_dirty = False
+        elif current is self.asr_comparison and self._asr_content_dirty:
+            self.asr_comparison.set_content(
+                self.segment_model.segments,
+                self.session.repository.asr_tokens(self.current_chapter_id),
+            )
+            self._asr_content_dirty = False
+        elif current is self.original_book_view and self._original_book_content_dirty:
+            self._refresh_original_book()
+            self._original_book_content_dirty = False
+
+    def _refresh_original_book(self) -> None:
+        if self.session and self.current_chapter_id is not None:
+            self.original_book_view.set_chapter(
+                self.session, self.current_chapter_id,
+                self.segment_model.segments, self._session_generation,
+            )
+
+    def _original_book_segment_activated(self, segment_id: int, generation: int) -> None:
+        if generation != self._session_generation:
+            return
+        row = next((
+            index for index, segment in enumerate(self.segment_model.segments)
+            if segment.id == segment_id
+        ), -1)
+        if row < 0:
+            return
+        segment = self.segment_model.segments[row]
+        if segment.end_ms > segment.start_ms:
+            self._segment_double_activated(row, segment.start_ms)
+        else:
+            self._select_segment_row(row)
 
     def toggle_lock(self) -> None:
         rows = self._selected_rows()
@@ -3420,30 +3854,70 @@ class MainWindow(QMainWindow):
             segment = self.segment_model.segments[row]
             segment.locked = lock
             segment.status = SegmentStatus.LOCKED if lock else SegmentStatus.MANUAL
-        self._persist_current_segments()
+        self._persist_current_segments(rows)
         current = self.segment_table.currentIndex().row()
         if current >= 0:
             self._load_segment_editor(current)
 
-    def _replace_segments(self, segments: list[TextSegment]) -> None:
+    def _replace_segments(
+        self, segments: list[TextSegment], anchors: list[TextAudioAnchor] | None = None,
+    ) -> None:
         if not self.session or self.current_chapter_id is None:
             return
+        chapter_id = self.current_chapter_id
         for index, segment in enumerate(segments):
             segment.position = index
-            segment.chapter_id = self.current_chapter_id
-        self.session.repository.replace_segments(self.current_chapter_id, segments)
-        self.segment_model.set_segments(self.session.repository.segments(self.current_chapter_id))
-        self.spectrogram.set_segments(self.segment_model.segments)
-        self.overview.set_segments(self.segment_model.segments)
-        self.article_view.set_content(self.segment_model.segments, self.session.repository.anchors(self.current_chapter_id), self.current_cache)
-        self.asr_comparison.set_content(
-            self.segment_model.segments, self.session.repository.asr_tokens(self.current_chapter_id),
+            if segment.chapter_id != chapter_id:
+                raise ValueError("Refusing to write a segment snapshot from another chapter")
+        current = self.segment_model.segments
+        same_structure = (
+            len(current) == len(segments)
+            and all(
+                left.id is not None and left.id == right.id
+                for left, right in zip(current, segments)
+            )
+        )
+        changed_rows = [
+            index for index, (left, right) in enumerate(zip(current, segments))
+            if left != right
+        ] if same_structure else []
+        if anchors is None:
+            anchors = self.session.repository.anchors(chapter_id)
+        self.session.repository.replace_chapter_edit_state(chapter_id, segments, anchors)
+        self.segment_model.set_segments(self.session.repository.segments(chapter_id))
+        if same_structure:
+            self.spectrogram.update_segments(self.segment_model.segments, changed_rows)
+            self.overview.set_segments(self.segment_model.segments)
+        self._refresh_segment_views(
+            defer_hidden=True, refresh_audio=not same_structure,
         )
         self._refresh_segment_play_range()
         self._mark_dirty()
 
-    def _persist_current_segments(self) -> None:
-        self._replace_segments(self.segment_model.segments)
+    def _persist_current_segments(self, changed_rows: list[int] | None = None) -> None:
+        """Persist non-structural edits without rebuilding the whole chapter."""
+        if not self.session or self.current_chapter_id is None:
+            return
+        rows = sorted(set(
+            range(len(self.segment_model.segments)) if changed_rows is None else changed_rows
+        ))
+        rows = [row for row in rows if 0 <= row < len(self.segment_model.segments)]
+        if not rows:
+            return
+        self.session.repository.update_segments(
+            [self.segment_model.segments[row] for row in rows]
+        )
+        first = self.segment_model.index(max(0, rows[0] - 1), 0)
+        last = self.segment_model.index(
+            min(self.segment_model.rowCount() - 1, rows[-1] + 1),
+            self.segment_model.columnCount() - 1,
+        )
+        self.segment_model.dataChanged.emit(first, last)
+        self.spectrogram.update_segments(self.segment_model.segments, rows)
+        self.overview.set_segments(self.segment_model.segments)
+        self._refresh_segment_views(defer_hidden=True, refresh_audio=False)
+        self._refresh_segment_play_range()
+        self._mark_dirty()
 
     def _segment_edited(self, segment: TextSegment) -> None:
         if self.session:
@@ -3457,25 +3931,79 @@ class MainWindow(QMainWindow):
             self.asr_comparison.set_content(
                 self.segment_model.segments, self.session.repository.asr_tokens(self.current_chapter_id or 0),
             )
+            self.original_book_refresh_timer.start()
             self._refresh_segment_play_range()
             self._mark_dirty()
 
     def _push_history(self) -> None:
-        self._history.append(copy.deepcopy(self.segment_model.segments))
-        self._history = self._history[-100:]
-        self._future.clear()
+        context = self._project_context()
+        chapter_id = self.current_chapter_id
+        if not context or chapter_id is None or not self.session:
+            return
+        snapshot = ChapterEditSnapshot(
+            context,
+            chapter_id,
+            copy.deepcopy(self.segment_model.segments),
+            copy.deepcopy(self.session.repository.anchors(chapter_id)),
+        )
+        history = self._history.setdefault(chapter_id, [])
+        history.append(snapshot)
+        del history[:-100]
+        self._future.setdefault(chapter_id, []).clear()
+        self._update_undo_actions()
+
+    def _current_edit_snapshot(self) -> ChapterEditSnapshot | None:
+        context = self._project_context()
+        chapter_id = self.current_chapter_id
+        if not context or chapter_id is None or not self.session:
+            return None
+        return ChapterEditSnapshot(
+            context, chapter_id, copy.deepcopy(self.segment_model.segments),
+            copy.deepcopy(self.session.repository.anchors(chapter_id)),
+        )
+
+    def _snapshot_matches_current(self, snapshot: ChapterEditSnapshot) -> bool:
+        return snapshot.context == self._project_context() and snapshot.chapter_id == self.current_chapter_id
+
+    def _update_undo_actions(self) -> None:
+        chapter_id = self.current_chapter_id
+        if hasattr(self, "undo_action"):
+            self.undo_action.setEnabled(bool(chapter_id is not None and self._history.get(chapter_id)))
+            self.redo_action.setEnabled(bool(chapter_id is not None and self._future.get(chapter_id)))
 
     def undo(self) -> None:
-        if not self._history:
+        chapter_id = self.current_chapter_id
+        history = self._history.get(chapter_id or -1, [])
+        current = self._current_edit_snapshot()
+        if not history or current is None:
             return
-        self._future.append(copy.deepcopy(self.segment_model.segments))
-        self._replace_segments(self._history.pop())
+        target = history[-1]
+        if not self._snapshot_matches_current(target):
+            history.clear()
+            self._update_undo_actions()
+            self.status_stage.setText("撤销记录不属于当前项目或章节，已安全丢弃")
+            return
+        history.pop()
+        self._future.setdefault(chapter_id or 0, []).append(current)
+        self._replace_segments(copy.deepcopy(target.segments), copy.deepcopy(target.anchors))
+        self._update_undo_actions()
 
     def redo(self) -> None:
-        if not self._future:
+        chapter_id = self.current_chapter_id
+        future = self._future.get(chapter_id or -1, [])
+        current = self._current_edit_snapshot()
+        if not future or current is None:
             return
-        self._history.append(copy.deepcopy(self.segment_model.segments))
-        self._replace_segments(self._future.pop())
+        target = future[-1]
+        if not self._snapshot_matches_current(target):
+            future.clear()
+            self._update_undo_actions()
+            self.status_stage.setText("重做记录不属于当前项目或章节，已安全丢弃")
+            return
+        future.pop()
+        self._history.setdefault(chapter_id or 0, []).append(current)
+        self._replace_segments(copy.deepcopy(target.segments), copy.deepcopy(target.anchors))
+        self._update_undo_actions()
 
     def _segment_selected(self, current, _previous) -> None:
         if not current.isValid():
@@ -3489,11 +4017,12 @@ class MainWindow(QMainWindow):
             row,
             ensure_visible=(not self._playback_row_update or self.content_tabs.currentWidget() is self.article_view),
         )
-        self._load_segment_editor(row)
         segment = self.segment_model.segments[row]
-        if (segment.end_ms > segment.start_ms
-                and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState):
-            self.spectrogram.focus_time((segment.start_ms + segment.end_ms) // 2)
+        self.original_book_view.focus_segment(
+            segment.id,
+            ensure_visible=(self._playback_row_update or self.content_tabs.currentWidget() is self.original_book_view),
+        )
+        self._load_segment_editor(row)
 
     def _load_segment_editor(self, row: int) -> None:
         self.editor_commit_timer.stop()
@@ -3570,11 +4099,16 @@ class MainWindow(QMainWindow):
             self.status_stage.setText("结束时间不能早于开始时间")
             self._load_segment_editor(self._editing_row)
             return
+        edited_text = self.editor_text.toPlainText().replace("\r\n", "\n").replace("\r", "\n")
+        if (start, end, edited_text) == (segment.start_ms, segment.end_ms, segment.text):
+            self._last_editor_values = (start, end, end - start)
+            self._editor_history_pushed = False
+            return
         if not self._editor_history_pushed:
             self._push_history()
             self._editor_history_pushed = True
         segment.start_ms, segment.end_ms = start, end
-        segment.text = self.editor_text.toPlainText().replace("\r\n", "\n").replace("\r", "\n")
+        segment.text = edited_text
         segment.status = SegmentStatus.MANUAL
         self.session.repository.update_segment(segment)
         index = self.segment_model.index(self._editing_row, 0)
@@ -3589,6 +4123,7 @@ class MainWindow(QMainWindow):
         self.asr_comparison.set_content(
             self.segment_model.segments, self.session.repository.asr_tokens(self.current_chapter_id or 0),
         )
+        self.original_book_refresh_timer.start()
         self._last_editor_values = (start, end, end - start)
         self._editor_loading = True
         self.editor_end.setText(_time(end))
@@ -3611,6 +4146,14 @@ class MainWindow(QMainWindow):
         self._audio_seek_requested(milliseconds)
         self.spectrogram.suspend_follow("article")
         self.spectrogram.focus_time(milliseconds, self.spectrogram.view_end - self.spectrogram.view_start)
+
+    def _asr_word_seek(self, milliseconds: int) -> None:
+        """A clicked ASR word is an explicit seek-and-centre command."""
+        self._clear_play_range()
+        self._seek_local(milliseconds)
+        self.spectrogram.suspend_follow("asr-comparison")
+        span = max(500, self.spectrogram.view_end - self.spectrogram.view_start)
+        self.spectrogram.focus_time(milliseconds, span)
 
     def _clear_play_range(self) -> None:
         self._play_range_start = None
@@ -3656,7 +4199,7 @@ class MainWindow(QMainWindow):
             return
         segment = self.segment_model.segments[row]
         if segment.end_ms > segment.start_ms:
-            self.spectrogram.set_selection(segment.start_ms, segment.end_ms)
+            self.spectrogram.set_segment_selection(segment.start_ms, segment.end_ms)
         else:
             self.spectrogram.clear_selection()
 
@@ -3703,11 +4246,19 @@ class MainWindow(QMainWindow):
         self._seek_local(target)
         self._select_segment_row(row)
         self.spectrogram.select_segment(row)
-        self.spectrogram.set_selection(segment.start_ms, segment.end_ms)
+        self.spectrogram.set_segment_selection(segment.start_ms, segment.end_ms)
+        self._locate_segment_start_if_outside(segment)
         if was_playing and segment.end_ms > target:
             self._set_segment_play_range(row)
             self.spectrogram.restore_follow()
             self.player.play()
+
+    def _locate_segment_start_if_outside(self, segment: TextSegment) -> None:
+        """Explicit sentence activation locates only an off-screen cue start."""
+        if self.spectrogram.view_start <= segment.start_ms <= self.spectrogram.view_end:
+            return
+        span = max(500, self.spectrogram.view_end - self.spectrogram.view_start)
+        self.spectrogram.focus_time(segment.start_ms, span)
 
     def _move_row(self, amount: int) -> None:
         row = self.segment_table.currentIndex().row() if self.segment_table.currentIndex().isValid() else 0
@@ -3768,7 +4319,7 @@ class MainWindow(QMainWindow):
             self.status_stage.setText("当前句没有有效的音频时间")
             return
         self._select_segment_row(row)
-        self.spectrogram.set_selection(segment.start_ms, segment.end_ms)
+        self.spectrogram.set_segment_selection(segment.start_ms, segment.end_ms)
         self.spectrogram.restore_follow()
         self._seek_local(segment.start_ms)
         self._set_segment_play_range(row)
@@ -3784,7 +4335,7 @@ class MainWindow(QMainWindow):
             row = self.segment_table.currentIndex().row() if self.segment_table.currentIndex().isValid() else -1
             if 0 <= row < len(self.segment_model.segments):
                 segment = self.segment_model.segments[row]
-                self.spectrogram.set_selection(segment.start_ms, segment.end_ms)
+                self.spectrogram.set_segment_selection(segment.start_ms, segment.end_ms)
                 self.play_segment(row)
 
     def _set_loop(self, enabled: bool) -> None:
@@ -4018,6 +4569,106 @@ class MainWindow(QMainWindow):
             self.status_stage.setText(f"{kind.upper()} 导出完成")
         except Exception as exc:
             self._show_error(str(exc))
+
+    def export_epub_media_overlays(self) -> None:
+        if not self.session:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出 EPUB 3 Media Overlays",
+            f"{self.session.manifest.title}-audio.epub", "EPUB (*.epub)",
+        )
+        if not path:
+            return
+
+        labels = ["自动兼容（推荐）", "强制 AAC-LC / M4A", "强制 MP3"]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("EPUB 3 Media Overlays 导出选项")
+        dialog.setMinimumWidth(460)
+        form = QFormLayout(dialog)
+
+        audio_policy_combo = QComboBox(dialog)
+        audio_policy_combo.addItems(labels)
+        form.addRow("音频处理方式：", audio_policy_combo)
+
+        extend_ends = QCheckBox("自动延长句段结束到下一句开始（推荐）", dialog)
+        extend_ends.setChecked(True)
+        extend_ends.setToolTip(
+            "保留相邻句之间的短暂停顿；不会改动项目时间轴，也不会跨过未匹配句段。"
+        )
+        form.addRow(extend_ends)
+
+        maximum_extension = QSpinBox(dialog)
+        maximum_extension.setRange(100, 60_000)
+        maximum_extension.setSingleStep(100)
+        maximum_extension.setValue(2_000)
+        maximum_extension.setSuffix(" 毫秒")
+        maximum_extension.setToolTip("超过此长度的空白保持原样，防止吞掉长停顿。")
+        form.addRow("最长补齐空隙：", maximum_extension)
+        extend_ends.toggled.connect(maximum_extension.setEnabled)
+
+        note = QLabel(
+            "仅补齐两个相邻且已有时间的句段之间的空隙；重叠、未匹配段和章节末尾不处理。",
+            dialog,
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("导出")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        label = audio_policy_combo.currentText()
+        policy = {
+            labels[0]: AudioConversionPolicy.AUTO_COMPATIBLE,
+            labels[1]: AudioConversionPolicy.FORCE_AAC,
+            labels[2]: AudioConversionPolicy.FORCE_MP3,
+        }[label]
+        options = EpubMediaOverlayOptions(
+            audio_policy=policy,
+            extend_segment_ends=extend_ends.isChecked(),
+            max_end_extension_ms=maximum_extension.value(),
+        )
+        session = self.session
+        generation = self._session_generation
+
+        def job(progress):
+            worker_session = ProjectSession(session.root, copy.deepcopy(session.manifest))
+            try:
+                result = export_epub_media_overlay(
+                    worker_session, path, options,
+                    progress=lambda value, message: progress(value, message),
+                )
+                return result, list(options.warnings)
+            finally:
+                worker_session.close()
+
+        def finished(payload) -> None:
+            result, warnings = payload
+            if generation == self._session_generation:
+                if warnings:
+                    self.status_stage.setText(
+                        f"EPUB 导出完成 · 已跳过 {len(warnings)} 个未映射句段：{result}"
+                    )
+                    QMessageBox.warning(
+                        self, "EPUB 已部分导出",
+                        f"EPUB 已生成，但跳过了 {len(warnings)} 个无法映射或超出媒体范围的句段。\n\n"
+                        + "\n".join(warnings[:20]),
+                    )
+                else:
+                    self.status_stage.setText(f"EPUB 3 Media Overlays 导出完成：{result}")
+
+        self.tasks.submit(
+            "导出 EPUB 3 Media Overlays", job, finished,
+            lane=TaskLane.MEDIA, priority=30, session_generation=generation,
+        )
 
     def _settings_changed(self, *_args) -> None:
         if not self.session:
@@ -4305,6 +4956,7 @@ class MainWindow(QMainWindow):
         self._task_started_at = time.monotonic()
         self._task_fraction = 0.0
         self.status_stage.setText(name)
+        self.status_stage.setToolTip(name)
         self.status_progress.setRange(0, 100)
         self.status_progress.setValue(0)
 
@@ -4316,27 +4968,32 @@ class MainWindow(QMainWindow):
             )
         if fraction < 0:
             self.status_stage.setText(message)
+            self.status_stage.setToolTip(message)
             return
         self._task_fraction = max(self._task_fraction, max(0.0, min(1.0, fraction)))
         self.status_progress.setRange(0, 100)
         self.status_progress.setValue(round(self._task_fraction * 100))
         self.status_stage.setText(message)
+        self.status_stage.setToolTip(message)
 
     def _task_completed(self, name: str) -> None:
         self.status_progress.setRange(0, 100)
         self.status_progress.setValue(100)
         self.status_stage.setText(f"{name}完成")
+        self.status_stage.setToolTip(f"{name}完成")
 
     def _task_failed(self, name: str, details: str) -> None:
         self.status_progress.setRange(0, 100)
         self.status_progress.setValue(0)
         self.status_stage.setText(f"{name}失败")
+        self.status_stage.setToolTip(f"{name}失败")
         self._show_error(details)
 
     def _task_cancelled(self, name: str) -> None:
         self.status_progress.setRange(0, 100)
         self.status_progress.setValue(0)
         self.status_stage.setText(f"{name}已取消")
+        self.status_stage.setToolTip(f"{name}已取消")
 
     def _update_task_clock(self) -> None:
         if not self.tasks.current:

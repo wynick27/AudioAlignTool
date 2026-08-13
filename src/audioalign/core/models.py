@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 class SegmentStatus(StrEnum):
@@ -33,6 +33,12 @@ class AudioVisualizationMode(StrEnum):
     COMBINED = "combined"
 
 
+class AudioConversionPolicy(StrEnum):
+    AUTO_COMPATIBLE = "auto_compatible"
+    FORCE_AAC = "force_aac"
+    FORCE_MP3 = "force_mp3"
+
+
 class PlaybackFollowState(StrEnum):
     DISABLED = "disabled"
     FOLLOWING = "following"
@@ -51,6 +57,16 @@ class SegmentOrigin(StrEnum):
     SOURCE = "source"
     ASR = "asr"
     USER = "user"
+    SUBTITLE = "subtitle"
+
+
+class SourceDocumentKind(StrEnum):
+    TXT = "txt"
+    MARKDOWN = "markdown"
+    HTML = "html"
+    EPUB = "epub"
+    SRT = "srt"
+    GENERATED = "generated"
 
 
 class TaskLane(StrEnum):
@@ -124,6 +140,7 @@ class AudioAsset:
     channels: int = 0
     format: str = ""
     title: str = ""
+    position: int = 0
 
     @property
     def path(self) -> Path:
@@ -151,6 +168,32 @@ class TextSegment:
             raise ValueError("Invalid segment time range")
 
 
+def segment_has_timing(segment: TextSegment | None) -> bool:
+    """Return whether a segment occupies a real interval on the timeline."""
+    return bool(segment and segment.end_ms > segment.start_ms)
+
+
+def segment_has_time_conflict(segments: Sequence[TextSegment], index: int) -> bool:
+    """Compare with the nearest timed neighbours, skipping unmatched 0–0 rows."""
+    if not 0 <= index < len(segments) or not segment_has_timing(segments[index]):
+        return False
+    current = segments[index]
+    previous = next(
+        (segments[position] for position in range(index - 1, -1, -1)
+         if segment_has_timing(segments[position])),
+        None,
+    )
+    following = next(
+        (segments[position] for position in range(index + 1, len(segments))
+         if segment_has_timing(segments[position])),
+        None,
+    )
+    return bool(
+        (previous and previous.end_ms > current.start_ms)
+        or (following and current.end_ms > following.start_ms)
+    )
+
+
 @dataclass(slots=True)
 class SourceFragment:
     id: int | None
@@ -160,6 +203,17 @@ class SourceFragment:
     text: str
     source_start_char: int
     source_end_char: int
+
+
+@dataclass(slots=True)
+class SourceDocument:
+    id: int | None
+    kind: SourceDocumentKind
+    original_path: str
+    stored_path: str
+    fingerprint: str = ""
+    entry_path: str = ""
+    resource_root: str = ""
 
 
 @dataclass(slots=True)
@@ -265,6 +319,21 @@ class TextAudioAnchor:
     end_ms: int
     confidence: float = 0.0
     method: str = "asr"
+
+
+@dataclass(slots=True, frozen=True)
+class ProjectContextKey:
+    database_path: str
+    project_id: str
+    session_generation: int
+
+
+@dataclass(slots=True)
+class ChapterEditSnapshot:
+    context: ProjectContextKey
+    chapter_id: int
+    segments: list[TextSegment]
+    anchors: list[TextAudioAnchor]
 
 
 @dataclass(slots=True)

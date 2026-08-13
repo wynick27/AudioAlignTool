@@ -5,11 +5,13 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .main_window import MainWindow
+from .original_book_view import register_book_scheme
 
 
 def run(argv: list[str]) -> int:
     QCoreApplication.setOrganizationName("AudioAlignTool")
     QCoreApplication.setApplicationName("AudioAlignTool")
+    register_book_scheme()
     app = QApplication(argv)
     app.setStyle("Fusion")
     font = QFont()

@@ -38,6 +38,8 @@ class PortablePackagingTests(unittest.TestCase):
         self.assertIn("requirements-lock.txt", workflow_text)
         self.assertIn("Failed to install locked build dependencies.", workflow_text)
         self.assertIn("import numpy, PySide6, av, faster_whisper, qwen_asr", workflow_text)
+        self.assertIn("markdown_it", workflow_text)
+        self.assertIn("QtWebEngineWidgets", workflow_text)
         self.assertNotIn("- name: Run tests", workflow_text)
         self.assertIn("-SkipInstall -SkipTests -Clean", workflow_text)
 
