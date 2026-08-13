@@ -2,6 +2,8 @@
 
 AudioAlignTool 是用于电子书文本与有声书时间轴对齐的 Windows 桌面编辑器。它也支持完全没有原文的工作流：直接导入音频或 M4B，由所选 ASR 模型生成文本与句段，再人工校正。
 
+<img width="1229" height="728" alt="image" src="https://github.com/user-attachments/assets/973dc116-930b-4ab2-a8d2-e33a957b9d78" />
+
 ## 功能介绍
 
 ### 音频可视化与播放
