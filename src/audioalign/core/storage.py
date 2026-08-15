@@ -742,6 +742,125 @@ class ProjectRepository:
                 ],
             )
 
+    def replace_one_segment(
+        self,
+        chapter_id: int,
+        original_id: int,
+        replacements: Sequence[TextSegment],
+    ) -> None:
+        """Replace one cue locally while preserving unrelated rows and anchors."""
+        values = list(replacements)
+        if not values or any(item.chapter_id != chapter_id for item in values):
+            raise ValueError("Invalid local segment replacement")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT position FROM text_segments WHERE id=? AND chapter_id=?",
+                (original_id, chapter_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("The segment no longer exists")
+            position = int(row["position"])
+            delta = len(values) - 1
+            if delta:
+                connection.execute(
+                    "UPDATE text_segments SET position=position+? WHERE chapter_id=? AND position>?",
+                    (delta, chapter_id, position),
+                )
+
+            first = values[0]
+            connection.execute(
+                """UPDATE text_segments SET position=?,text=?,start_ms=?,end_ms=?,confidence=?,
+                status=?,locked=?,origin=?,source_fragment_id=?,source_start_char=?,source_end_char=?
+                WHERE id=? AND chapter_id=?""",
+                (
+                    position, first.text, first.start_ms, first.end_ms, first.confidence,
+                    first.status.value, int(first.locked), first.origin.value,
+                    first.source_fragment_id, first.source_start_char, first.source_end_char,
+                    original_id, chapter_id,
+                ),
+            )
+            inserted_ids = [original_id]
+            for offset, segment in enumerate(values[1:], 1):
+                cursor = connection.execute(
+                    """INSERT INTO text_segments
+                    (chapter_id,position,text,start_ms,end_ms,confidence,status,locked,origin,
+                     source_fragment_id,source_start_char,source_end_char)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        chapter_id, position + offset, segment.text, segment.start_ms,
+                        segment.end_ms, segment.confidence, segment.status.value,
+                        int(segment.locked), segment.origin.value, segment.source_fragment_id,
+                        segment.source_start_char, segment.source_end_char,
+                    ),
+                )
+                inserted_ids.append(int(cursor.lastrowid))
+
+            if len(inserted_ids) > 1:
+                anchors = connection.execute(
+                    "SELECT id,source_start_char,source_end_char,start_ms,end_ms "
+                    "FROM text_audio_anchors WHERE chapter_id=? AND segment_id=?",
+                    (chapter_id, original_id),
+                ).fetchall()
+                updates = []
+                for anchor in anchors:
+                    character_midpoint = (
+                        int(anchor["source_start_char"]) + int(anchor["source_end_char"])
+                    ) / 2
+                    time_midpoint = (int(anchor["start_ms"]) + int(anchor["end_ms"])) / 2
+                    target = 0
+                    for index, segment in enumerate(values):
+                        if (
+                            segment.source_start_char is not None
+                            and segment.source_end_char is not None
+                            and segment.source_start_char <= character_midpoint <= segment.source_end_char
+                        ):
+                            target = index
+                            break
+                        if segment.start_ms <= time_midpoint <= segment.end_ms:
+                            target = index
+                    updates.append((inserted_ids[target], int(anchor["id"])))
+                connection.executemany(
+                    "UPDATE text_audio_anchors SET segment_id=? WHERE id=?", updates,
+                )
+
+    def merge_adjacent_segments(
+        self, chapter_id: int, left_id: int, right_id: int, merged: TextSegment,
+    ) -> None:
+        """Merge adjacent rows without rewriting the chapter-sized anchor table."""
+        if merged.chapter_id != chapter_id:
+            raise ValueError("Invalid merged segment chapter")
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT id,position FROM text_segments WHERE id IN (?,?) AND chapter_id=? ORDER BY position",
+                (left_id, right_id, chapter_id),
+            ).fetchall()
+            if len(rows) != 2 or int(rows[1]["position"]) != int(rows[0]["position"]) + 1:
+                raise ValueError("Segments are no longer adjacent")
+            left_id, right_id = int(rows[0]["id"]), int(rows[1]["id"])
+            position = int(rows[0]["position"])
+            connection.execute(
+                """UPDATE text_segments SET position=?,text=?,start_ms=?,end_ms=?,confidence=?,
+                status=?,locked=?,origin=?,source_fragment_id=?,source_start_char=?,source_end_char=?
+                WHERE id=? AND chapter_id=?""",
+                (
+                    position, merged.text, merged.start_ms, merged.end_ms, merged.confidence,
+                    merged.status.value, int(merged.locked), merged.origin.value,
+                    merged.source_fragment_id, merged.source_start_char, merged.source_end_char,
+                    left_id, chapter_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE text_audio_anchors SET segment_id=? WHERE chapter_id=? AND segment_id=?",
+                (left_id, chapter_id, right_id),
+            )
+            connection.execute(
+                "DELETE FROM text_segments WHERE id=? AND chapter_id=?", (right_id, chapter_id),
+            )
+            connection.execute(
+                "UPDATE text_segments SET position=position-1 WHERE chapter_id=? AND position>?",
+                (chapter_id, position + 1),
+            )
+
     def mark_segments_unmatched(self, segment_ids: Sequence[int]) -> None:
         """Remove audio timing while preserving the source text and row identity."""
         ids = [int(value) for value in segment_ids if value is not None]

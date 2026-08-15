@@ -28,6 +28,36 @@ from audioalign.gui.original_book_view import annotate_html
 
 
 class ImportAndEpubTests(unittest.TestCase):
+    def test_epub_mapping_tolerates_a_small_wording_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("fuzzy", Path(temporary) / "project")
+            try:
+                chapter_id = session.repository.add_chapter(Chapter(None, "One", 0))
+                session.repository.replace_segments(chapter_id, [
+                    TextSegment(
+                        None, chapter_id, 0,
+                        "She learnt a new word yesterday.", 100, 900,
+                    ),
+                ])
+                audio_id = session.repository.add_audio(AudioAsset(
+                    None, str(Path(temporary) / "audio.opus"), duration_ms=1_000,
+                    sample_rate=48_000, channels=1, format="opus",
+                ))
+                session.repository.set_chapter_links(chapter_id, [
+                    ChapterAudioLink(None, chapter_id, audio_id, 0, 0, 1_000, 1.0),
+                ])
+                chapter = next(item for item in session.repository.chapters() if item.id == chapter_id)
+                matched: set[int] = set()
+                _rendered, units, errors = _annotate_for_overlay(
+                    "<html><body><p>She learned a new word yesterday.</p></body></html>",
+                    session, chapter, matched_positions=matched,
+                )
+                self.assertEqual([], errors)
+                self.assertEqual({0}, matched)
+                self.assertEqual(1, len(units))
+            finally:
+                session.close()
+
     def test_epub_end_extension_only_fills_safe_adjacent_short_gaps(self) -> None:
         segments = [
             TextSegment(None, 1, 0, "one", 100, 300),
@@ -178,18 +208,85 @@ class ImportAndEpubTests(unittest.TestCase):
             finally:
                 session.close()
 
+    def test_local_split_and_merge_preserve_unrelated_rows_and_word_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("local-edit", Path(temporary) / "project")
+            try:
+                chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+                session.repository.replace_segments(chapter_id, [
+                    TextSegment(None, chapter_id, 0, "uno dos", 100, 500),
+                    TextSegment(None, chapter_id, 1, "tres", 500, 800),
+                ])
+                original = session.repository.segments(chapter_id)
+                untouched_id = original[1].id
+                session.repository.replace_anchors(chapter_id, [
+                    TextAudioAnchor(None, chapter_id, original[0].id, 0, 3, 100, 250, 1.0, "asr-word"),
+                    TextAudioAnchor(None, chapter_id, original[0].id, 4, 7, 300, 500, 1.0, "asr-word"),
+                ])
+                session.repository.replace_one_segment(chapter_id, original[0].id or 0, [
+                    TextSegment(None, chapter_id, 0, "uno", 100, 275, source_start_char=0, source_end_char=3),
+                    TextSegment(None, chapter_id, 1, "dos", 275, 500, source_start_char=4, source_end_char=7),
+                ])
+                split = session.repository.segments(chapter_id)
+                anchors = session.repository.anchors(chapter_id)
+                self.assertEqual(untouched_id, split[2].id)
+                self.assertEqual(split[0].id, anchors[0].segment_id)
+                self.assertEqual(split[1].id, anchors[1].segment_id)
+
+                merged = TextSegment(
+                    None, chapter_id, 0, "uno dos", 100, 500,
+                    source_start_char=0, source_end_char=7,
+                )
+                session.repository.merge_adjacent_segments(
+                    chapter_id, split[0].id or 0, split[1].id or 0, merged,
+                )
+                final = session.repository.segments(chapter_id)
+                self.assertEqual(["uno dos", "tres"], [item.text for item in final])
+                self.assertEqual(untouched_id, final[1].id)
+                self.assertEqual(
+                    {final[0].id},
+                    {item.segment_id for item in session.repository.anchors(chapter_id)},
+                )
+            finally:
+                session.close()
+
     def test_original_book_annotation_preserves_markup_and_styles(self) -> None:
         source = (
             "<html><head><style>.lead{color:red}</style></head><body>"
-            "<p class='lead'>Hello <em>world</em>.</p></body></html>"
+            "<p class='lead'><span class='dropcap'>H</span>ello <em>world</em>.</p></body></html>"
         )
         rendered = annotate_html(
             source, [TextSegment(42, 1, 0, "Hello world.", 0, 1000)], "aatbook://book/source/",
         )
         self.assertIn(".lead{color:red}", rendered)
         self.assertIn('class="lead"', rendered)
+        self.assertIn('class="dropcap"', rendered)
         self.assertIn("<em>", rendered)
-        self.assertGreaterEqual(rendered.count('data-aat-segment="42"'), 2)
+        self.assertGreaterEqual(rendered.count('data-aat-segment="42"'), 3)
+        self.assertIn("targets.forEach(target=>target.classList.add('aat-active'))", rendered)
+
+    def test_original_book_annotation_allows_small_text_difference_and_two_click_modes(self) -> None:
+        rendered = annotate_html(
+            "<html><body><p>She learned a new word.</p><img src='../cover.jpg'></body></html>",
+            [TextSegment(7, 1, 0, "She learnt a new word.", 100, 500)],
+            "file:///project/OEBPS/Text/",
+        )
+        soup = BeautifulSoup(rendered, "html.parser")
+        self.assertIsNotNone(soup.find(attrs={"data-aat-segment": "7"}))
+        self.assertEqual("file:///project/OEBPS/Text/", soup.base.get("href"))
+        self.assertEqual("../cover.jpg", soup.img.get("src"))
+        self.assertIn("activateSegment(target.dataset.aatSegment,false)", rendered)
+        self.assertIn("activateSegment(target.dataset.aatSegment,true)", rendered)
+
+    def test_original_book_annotation_preserves_svg_cover(self) -> None:
+        source = (
+            "<html><head><title>Cover</title></head><body><svg viewBox='0 0 10 10'>"
+            "<image href='../images/cover.jpg'/></svg></body></html>"
+        )
+        rendered = annotate_html(source, [], "aatbook://book/text/")
+        self.assertIn("<svg", rendered)
+        self.assertIn("<image", rendered)
+        self.assertIn("../images/cover.jpg", rendered)
 
     def test_generated_epub_contains_media_overlays(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

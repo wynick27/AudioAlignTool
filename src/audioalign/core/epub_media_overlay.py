@@ -186,6 +186,49 @@ def _match_projection(value: str) -> tuple[str, list[int]]:
     return "".join(characters), raw_offsets
 
 
+def _fuzzy_projection_match(
+    document: str, target: str, cursor: int,
+) -> tuple[int, int] | None:
+    """Find a small, local textual variation without breaking source order.
+
+    Media Overlay export must tolerate an edited spelling or an omitted short
+    word, but a global fuzzy search can attach a repeated sentence to the wrong
+    paragraph.  Candidate starts therefore come from matching blocks in a
+    bounded forward window and must pass a deliberately high similarity bar.
+    """
+    if len(target) < 8 or cursor >= len(document):
+        return None
+    window_end = min(len(document), cursor + max(900, len(target) * 4))
+    window = document[cursor:window_end]
+    matcher = SequenceMatcher(None, target, window, autojunk=False)
+    blocks = sorted(matcher.get_matching_blocks(), key=lambda item: item.size, reverse=True)
+    minimum_block = max(3, min(12, len(target) // 5))
+    starts = {cursor + block.b - block.a for block in blocks if block.size >= minimum_block}
+    starts = {max(cursor, value) for value in starts if value < window_end}
+    if not starts:
+        return None
+
+    variance = max(2, min(24, round(len(target) * 0.12)))
+    candidate_lengths = {
+        max(1, len(target) - variance), len(target), len(target) + variance,
+    }
+    best: tuple[float, int, int] | None = None
+    for start in starts:
+        for length in candidate_lengths:
+            end = min(window_end, start + length)
+            if end <= start:
+                continue
+            score = SequenceMatcher(
+                None, target, document[start:end], autojunk=False,
+            ).ratio()
+            if best is None or score > best[0]:
+                best = score, start, end
+    threshold = 0.90 if len(target) < 20 else 0.88
+    if best is None or best[0] < threshold:
+        return None
+    return best[1], best[2]
+
+
 def _audio_chunks(session: ProjectSession, chapter_id: int, start_ms: int, end_ms: int):
     cursor = 0
     result = []
@@ -262,22 +305,26 @@ def _annotate_for_overlay(
         target = " ".join(segment.text.split())
         start = document.find(target, cursor) if target else -1
         if start < 0 and target:
-            start = document.find(target)
-        if start < 0 and target:
             projected_target, _unused = _match_projection(target)
             projected_cursor = bisect_left(projected_offsets, cursor)
             projected_start = (
                 projected_document.find(projected_target, projected_cursor)
                 if projected_target else -1
             )
-            if projected_start < 0 and projected_target:
-                projected_start = projected_document.find(projected_target)
             if projected_start >= 0:
                 start = projected_offsets[projected_start]
                 projected_end = projected_start + len(projected_target) - 1
                 end = projected_offsets[projected_end] + 1
             else:
-                end = -1
+                fuzzy = _fuzzy_projection_match(
+                    projected_document, projected_target, projected_cursor,
+                ) if projected_target else None
+                if fuzzy:
+                    projected_start, projected_end = fuzzy
+                    start = projected_offsets[projected_start]
+                    end = projected_offsets[projected_end - 1] + 1
+                else:
+                    end = -1
         else:
             end = start + len(target) if start >= 0 else -1
         if start < 0:

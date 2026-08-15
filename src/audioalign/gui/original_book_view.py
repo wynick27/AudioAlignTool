@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import mimetypes
 import html
-import re
 import shutil
 import zipfile
+from bisect import bisect_left
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 from bs4 import BeautifulSoup, NavigableString
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QUrl, Signal, Slot
@@ -19,10 +19,12 @@ from PySide6.QtWebEngineCore import (
     QWebEngineUrlRequestJob,
     QWebEngineUrlScheme,
     QWebEngineUrlSchemeHandler,
+    QWebEngineSettings,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from audioalign.core.models import SourceDocumentKind, TextSegment
+from audioalign.core.epub_media_overlay import _fuzzy_projection_match, _match_projection
 from audioalign.core.storage import ProjectSession
 from audioalign.core.text import html_to_text, normalize_for_match
 
@@ -48,8 +50,26 @@ def register_book_scheme() -> None:
 
 
 class _BookRequestInterceptor(QWebEngineUrlRequestInterceptor):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.root: Path | None = None
+
+    def set_root(self, root: Path | None) -> None:
+        self.root = root.resolve() if root else None
+
     def interceptRequest(self, info) -> None:  # noqa: N802 - Qt API
-        if info.requestUrl().scheme() not in {"aatbook", "qrc", "data", "about"}:
+        url = info.requestUrl()
+        if url.scheme() == "file":
+            if self.root is None:
+                info.block(True)
+                return
+            candidate = Path(url.toLocalFile()).resolve()
+            try:
+                candidate.relative_to(self.root)
+            except ValueError:
+                info.block(True)
+            return
+        if url.scheme() not in {"aatbook", "qrc", "data", "about"}:
             info.block(True)
 
 
@@ -83,12 +103,12 @@ class _BookSchemeHandler(QWebEngineUrlSchemeHandler):
 
 
 class _BookBridge(QObject):
-    activated = Signal(int)
+    activated = Signal(int, bool)
 
-    @Slot(str)
-    def activateSegment(self, segment_id: str) -> None:  # noqa: N802 - JS API
+    @Slot(str, bool)
+    def activateSegment(self, segment_id: str, jump: bool = False) -> None:  # noqa: N802 - JS API
         try:
-            self.activated.emit(int(segment_id))
+            self.activated.emit(int(segment_id), bool(jump))
         except ValueError:
             return
 
@@ -139,6 +159,9 @@ def annotate_html(source_html: str, segments: list[TextSegment], base_href: str)
     soup = BeautifulSoup(source_html, "html.parser")
     for tag in soup.find_all(["script", "noscript"]):
         tag.decompose()
+    for meta in soup.find_all("meta"):
+        if str(meta.get("http-equiv", "")).casefold() == "content-security-policy":
+            meta.decompose()
     if soup.head is None:
         head = soup.new_tag("head")
         if soup.html:
@@ -160,6 +183,7 @@ def annotate_html(source_html: str, segments: list[TextSegment], base_href: str)
         if node.parent and node.parent.name not in {"style", "script", "title", "svg"}
     ]
     document, mapping = _normalized_with_mapping(nodes)
+    projected_document, projected_offsets = _match_projection(document)
     cursor = 0
     ranges: dict[int, list[tuple[int, int, str]]] = {}
     for segment in segments:
@@ -170,10 +194,28 @@ def annotate_html(source_html: str, segments: list[TextSegment], base_href: str)
             continue
         start = document.find(target, cursor)
         if start < 0:
-            start = document.find(target)
-        if start < 0:
-            continue
-        end = start + len(target)
+            projected_target, _unused = _match_projection(target)
+            projected_cursor = bisect_left(projected_offsets, cursor)
+            projected_start = (
+                projected_document.find(projected_target, projected_cursor)
+                if projected_target else -1
+            )
+            if projected_start < 0 and projected_target:
+                fuzzy = _fuzzy_projection_match(
+                    projected_document, projected_target, projected_cursor,
+                )
+                if fuzzy:
+                    projected_start, projected_end = fuzzy
+                else:
+                    projected_end = -1
+            else:
+                projected_end = projected_start + len(projected_target)
+            if projected_start < 0 or projected_end <= projected_start:
+                continue
+            start = projected_offsets[projected_start]
+            end = projected_offsets[projected_end - 1] + 1
+        else:
+            end = start + len(target)
         cursor = end
         per_node: dict[int, list[int]] = {}
         for item in mapping[start:end]:
@@ -210,13 +252,18 @@ def annotate_html(source_html: str, segments: list[TextSegment], base_href: str)
         const selection=window.getSelection();
         if(selection && !selection.isCollapsed)return;
         const target=event.target.closest('[data-aat-segment]');
-        if(target && aatBridge)aatBridge.activateSegment(target.dataset.aatSegment);
+        if(target && aatBridge)aatBridge.activateSegment(target.dataset.aatSegment,false);
+      });
+      document.addEventListener('dblclick',function(event){
+        const target=event.target.closest('[data-aat-segment]');
+        if(target && aatBridge)aatBridge.activateSegment(target.dataset.aatSegment,true);
       });
       document.addEventListener('wheel',function(){aatFollow=false;},{passive:true});
       window.aatSetActive=function(id,follow){
         document.querySelectorAll('.aat-active').forEach(e=>e.classList.remove('aat-active'));
-        const target=document.querySelector('[data-aat-segment="'+id+'"]');
-        if(target){target.classList.add('aat-active');if(follow&&aatFollow)target.scrollIntoView({block:'center'});}
+        const targets=document.querySelectorAll('[data-aat-segment="'+id+'"]');
+        targets.forEach(target=>target.classList.add('aat-active'));
+        if(targets.length&&follow&&aatFollow)targets[0].scrollIntoView({block:'center'});
       };
       window.aatResumeFollow=function(){aatFollow=true;};
     """
@@ -225,34 +272,69 @@ def annotate_html(source_html: str, segments: list[TextSegment], base_href: str)
 
 
 class OriginalBookView(QWebEngineView):
-    segmentActivated = Signal(int, int)
+    segmentActivated = Signal(int, int, bool)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._generation = 0
         self._current_segment_id: int | None = None
+        self._current_ensure_visible = True
+        self._page_ready = False
+        self._fallback_html = ""
+        self._fallback_path: Path | None = None
+        self._fallback_attempted = False
         self._handler = _BookSchemeHandler(self)
         profile = QWebEngineProfile(self)
         profile.installUrlSchemeHandler(b"aatbook", self._handler)
         self._interceptor = _BookRequestInterceptor(profile)
         profile.setUrlRequestInterceptor(self._interceptor)
         self.setPage(QWebEnginePage(profile, self))
+        self.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True,
+        )
+        self.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False,
+        )
         self._bridge = _BookBridge(self)
-        self._bridge.activated.connect(lambda segment_id: self.segmentActivated.emit(segment_id, self._generation))
+        self._bridge.activated.connect(
+            lambda segment_id, jump: self.segmentActivated.emit(
+                segment_id, self._generation, jump,
+            )
+        )
         self._channel = QWebChannel(self.page())
         self._channel.registerObject("aatBridge", self._bridge)
         self.page().setWebChannel(self._channel)
+        self.loadFinished.connect(self._load_finished)
 
     def clear_book(self, generation: int = 0) -> None:
         self._generation = generation
         self._handler.set_root(None)
+        self._interceptor.set_root(None)
+        self._fallback_html = ""
+        self._fallback_path = None
+        self._fallback_attempted = False
+        self._current_segment_id = None
+        self._page_ready = False
         self.setHtml("<html><body></body></html>")
+
+    def _load_finished(self, ok: bool) -> None:
+        if ok:
+            self._page_ready = True
+            self._apply_focus()
+            return
+        self._page_ready = False
+        if self._fallback_attempted or self._fallback_path is None:
+            return
+        self._fallback_attempted = True
+        self.setUrl(QUrl.fromLocalFile(str(self._fallback_path.resolve())))
 
     def set_chapter(
         self, session: ProjectSession, chapter_id: int, segments: list[TextSegment], generation: int,
     ) -> None:
         self._generation = generation
+        self._page_ready = False
         self._handler.set_root(session.root)
+        self._interceptor.set_root(session.root)
         chapter = next((item for item in session.repository.chapters() if item.id == chapter_id), None)
         if chapter is None:
             self.clear_book(generation)
@@ -304,22 +386,70 @@ class OriginalBookView(QWebEngineView):
                 "body{max-width:52rem;margin:2rem auto;padding:0 1.5rem;font:18px/1.9 serif}"
                 "</style></head><body>" + body + "</body></html>"
             )
-        base_url = "aatbook://book/" + quote(base_relative.as_posix().strip("/")) + "/"
+        base_path = (session.root / base_relative).resolve()
+        try:
+            base_path.relative_to(session.root.resolve())
+        except ValueError:
+            base_path = session.root.resolve()
+        # The rendered page is itself a project-local file. Keeping CSS,
+        # fonts and images on the same restricted file origin is reliable on
+        # Qt WebEngine builds that reject file -> custom-scheme subresources.
+        base_url = QUrl.fromLocalFile(base_path.as_posix().rstrip("/") + "/").toString()
         rendered = annotate_html(source_html, segments, base_url)
+        rendered_soup = BeautifulSoup(rendered, "html.parser")
+        rendered_body = rendered_soup.body
+        has_visible_source = bool(
+            rendered_body
+            and (
+                rendered_body.get_text(strip=True)
+                or rendered_body.find(["img", "svg", "image", "video", "canvas"])
+            )
+        )
+        if not has_visible_source:
+            body = "".join(f"<p>{html.escape(segment.text)}</p>" for segment in segments)
+            rendered = annotate_html(
+                "<!doctype html><html><head><meta charset='utf-8'><style>"
+                "body{max-width:52rem;margin:2rem auto;padding:0 1.5rem;font:18px/1.9 serif}"
+                "</style></head><body>" + body + "</body></html>",
+                segments,
+                base_url,
+            )
         output = session.root / "cache" / "book-view" / "rendered" / f"chapter-{chapter_id}.html"
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.with_suffix(".html.tmp")
         temporary.write_text(rendered, encoding="utf-8")
         temporary.replace(output)
-        relative = output.relative_to(session.root).as_posix()
-        self.setUrl(QUrl("aatbook://book/" + quote(relative)))
+        fallback_body = "".join(
+            f"<p>{html.escape(segment.text)}</p>" for segment in segments
+        ) or "<p>本章节没有可显示的正文。</p>"
+        self._fallback_html = (
+            "<!doctype html><html><head><meta charset='utf-8'><style>"
+            "body{max-width:52rem;margin:2rem auto;padding:0 1.5rem;font:18px/1.9 serif}"
+            "</style></head><body>" + fallback_body + "</body></html>"
+        )
+        self._fallback_path = output.with_name(f"chapter-{chapter_id}-fallback.html")
+        self._fallback_path.write_text(self._fallback_html, encoding="utf-8")
+        self._fallback_attempted = False
+        # Some Qt WebEngine builds leave a custom-scheme top-level navigation
+        # at about:blank.  Load the generated page as a project-local file;
+        # the interceptor restricts file access to this project, while EPUB
+        # CSS/images still resolve through the restricted aatbook scheme.
+        self.setUrl(QUrl.fromLocalFile(str(output.resolve())))
 
     def focus_segment(self, segment_id: int | None, *, ensure_visible: bool = True) -> None:
-        if segment_id is None or segment_id == self._current_segment_id:
+        if segment_id is None:
             return
         self._current_segment_id = segment_id
+        self._current_ensure_visible = bool(ensure_visible)
+        if self._page_ready:
+            self._apply_focus()
+
+    def _apply_focus(self) -> None:
+        if self._current_segment_id is None:
+            return
         self.page().runJavaScript(
-            f"window.aatSetActive && window.aatSetActive({segment_id!r},{str(bool(ensure_visible)).lower()});"
+            "window.aatSetActive && window.aatSetActive("
+            f"{self._current_segment_id!r},{str(self._current_ensure_visible).lower()});"
         )
 
     def resume_follow(self) -> None:

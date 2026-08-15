@@ -15,7 +15,7 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import QRect, Qt
+    from PySide6.QtCore import QPoint, QRect, Qt
     from PySide6.QtGui import QColor, QImage, QPainter
     from PySide6.QtWidgets import QApplication, QMessageBox
     from audioalign.core.models import ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentOverlapPolicy, SegmentStatus, TaskLane, TextAudioAnchor, TextSegment
@@ -137,6 +137,39 @@ class GuiSmokeTests(unittest.TestCase):
             )
             window.close()
 
+    def test_segment_switch_updates_only_the_visible_content_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("visible-view", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "first", 1_000, 2_000),
+                TextSegment(None, chapter_id, 1, "second", 2_000, 3_000),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            window.content_tabs.setCurrentWidget(window.segment_table)
+            with (
+                patch.object(window.article_view, "focus_segment") as article_focus,
+                patch.object(window.original_book_view, "focus_segment") as book_focus,
+                patch.object(window.asr_comparison, "focus_segment") as asr_focus,
+            ):
+                window._select_segment_row(1)
+                article_focus.assert_not_called()
+                book_focus.assert_not_called()
+                asr_focus.assert_not_called()
+
+                window.content_tabs.setCurrentWidget(window.article_view)
+                article_focus.assert_called_once_with(1, ensure_visible=True)
+                book_focus.assert_not_called()
+                asr_focus.assert_not_called()
+
+                article_focus.reset_mock()
+                window.content_tabs.setCurrentWidget(window.asr_comparison)
+                asr_focus.assert_called_once_with(1, ensure_visible=True)
+                article_focus.assert_not_called()
+                book_focus.assert_not_called()
+            window.close()
+
     def test_sentence_double_click_locates_only_when_start_is_offscreen(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("double-click-locate", Path(temporary) / "project")
@@ -239,7 +272,27 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotIn("日本 語", transcript_text)
         self.assertGreaterEqual(transcript_text.count("\n"), 1)
 
-    def test_asr_word_click_seeks_and_centres_audio_view(self) -> None:
+    def test_asr_comparison_uses_word_anchors_for_paired_rows(self) -> None:
+        view = ASRComparisonView()
+        segments = [
+            TextSegment(10, 1, 0, "first source", 0, 2_000),
+            TextSegment(11, 1, 1, "second source", 0, 2_000),
+        ]
+        tokens = [
+            ASRToken(None, 1, 0, "alpha", 100, 200, 0.9),
+            ASRToken(None, 1, 1, "beta", 300, 400, 0.9),
+        ]
+        anchors = [
+            TextAudioAnchor(None, 1, 10, 0, 5, 100, 200, 1.0, "asr-word"),
+            TextAudioAnchor(None, 1, 11, 6, 10, 300, 400, 1.0, "asr-word"),
+        ]
+        view.set_content(segments, tokens, anchors)
+        rendered = view.comparison.toPlainText()
+        self.assertLess(rendered.index("first source"), rendered.index("alpha"))
+        self.assertLess(rendered.index("alpha"), rendered.index("second source"))
+        self.assertLess(rendered.index("second source"), rendered.index("beta"))
+
+    def test_asr_word_click_only_seeks_and_double_click_centres(self) -> None:
         window = MainWindow()
         window.spectrogram.view_start = 10_000
         window.spectrogram.view_end = 30_000
@@ -248,7 +301,29 @@ class GuiSmokeTests(unittest.TestCase):
         ) as focus:
             window._asr_word_seek(42_500)
             seek.assert_called_once_with(42_500)
+            focus.assert_not_called()
+            window._asr_word_jump(42_500)
+            self.assertEqual(2, seek.call_count)
             focus.assert_called_once_with(42_500, 20_000)
+        window.close()
+
+    def test_original_book_click_locates_and_double_click_centres(self) -> None:
+        window = MainWindow()
+        window._session_generation = 4
+        window.segment_model.set_segments([
+            TextSegment(77, 1, 0, "source", 12_000, 14_000),
+        ])
+        window.spectrogram.view_start = 0
+        window.spectrogram.view_end = 10_000
+        with patch.object(window, "_audio_time_activated") as locate, patch.object(
+            window.spectrogram, "focus_time"
+        ) as focus:
+            window._original_book_segment_activated(77, 4, False)
+            locate.assert_called_once_with(12_000, 0)
+            focus.assert_not_called()
+            window._original_book_segment_activated(77, 4, True)
+            self.assertEqual(2, locate.call_count)
+            focus.assert_called_once_with(12_000, 10_000)
         window.close()
 
     def test_punctuation_split_uses_asr_character_anchors(self) -> None:
@@ -363,7 +438,112 @@ class GuiSmokeTests(unittest.TestCase):
                 window.segment_model.segments[0].end_ms,
                 window.segment_model.segments[1].start_ms,
             ))
+
+            # An unmatched text row is not a timing boundary. The current cue
+            # must still be clamped by the next cue that actually has timing.
+            window.segment_model.set_segments([
+                TextSegment(None, 1, 0, "a", 0, 1000),
+                TextSegment(None, 1, 1, "unmatched", 0, 0, status=SegmentStatus.UNMATCHED),
+                TextSegment(None, 1, 2, "c", 2000, 3000),
+            ])
+            window.spectrogram.set_segments(window.segment_model.segments)
+            window.overlap_policy_combo.setCurrentIndex(
+                window.overlap_policy_combo.findData(SegmentOverlapPolicy.CLAMP_CURRENT)
+            )
+            window._boundary_moved(0, "end", 2500, False)
+            self.assertEqual(2000, window.segment_model.segments[0].end_ms)
+            self.assertEqual(0, window.segment_model.segments[1].end_ms)
+            self.assertEqual(2000, window.segment_model.segments[2].start_ms)
         finally:
+            window.close()
+
+    def test_multi_selection_context_and_selection_edge_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("multi-context", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "first", 0, 1000),
+                TextSegment(None, chapter_id, 1, "second", 1500, 2500),
+                TextSegment(None, chapter_id, 2, "third", 3000, 4000),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            window.resize(1000, 700)
+            window.show()
+            self.app.processEvents()
+            window._select_segment_rows([1, 2], current_row=1)
+            window.spectrogram.set_selection(1200, 4500)
+
+            point = window.segment_table.visualRect(window.segment_model.index(2, 0)).center()
+            menu = window._segment_table_context_menu(point, execute=False)
+            captured = [action.text() for action in menu.actions()]
+
+            self.assertEqual([1, 2], window._selected_rows())
+            self.assertEqual({1, 2}, window.spectrogram.selected_segments)
+            self.assertIn("Qwen 强制对齐所选 2 句 ↔ 音频选区", captured)
+            self.assertIn("将首句开始设为选区开始", captured)
+            self.assertNotIn("编辑文本", captured)
+
+            window.set_boundary_from_selection("start")
+            window.set_boundary_from_selection("end")
+            self.assertEqual(1200, window.segment_model.segments[1].start_ms)
+            self.assertEqual(4500, window.segment_model.segments[2].end_ms)
+            stored = session.repository.segments(chapter_id)
+            self.assertEqual((1200, 4500), (stored[1].start_ms, stored[2].end_ms))
+            window.close()
+
+    def test_qwen_range_alignment_persists_anchor_method(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = ProjectSession.create("qwen-range", root / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "hello", 0, 900),
+                TextSegment(None, chapter_id, 1, "world", 900, 1800),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            asset = AudioAsset(1, str(root / "audio.wav"), duration_ms=3_000)
+            link = ChapterAudioLink(None, chapter_id, 1, 0, 0, 3_000, 1.0)
+            window.current_parts = [(link, asset, root / "audio.wav", 0, 3_000)]
+            window._select_segment_rows([0, 1], current_row=0)
+            window.spectrogram.set_selection(100, 2_100)
+
+            class FakeAligner:
+                def __init__(self):
+                    self.last_device_info = InferenceDeviceInfo(
+                        "qwen", "forced", actual_device="cpu", compute_type="float32"
+                    )
+
+                def align(self, _path, _text, _language, chapter, _options, progress):
+                    progress(1.0, "done")
+                    return [
+                        ASRToken(None, chapter, 0, "hello", 0, 800, 0.95),
+                        ASRToken(None, chapter, 1, "world", 900, 1_800, 0.95),
+                    ]
+
+            ready = SimpleNamespace(
+                runtime_available=True,
+                cuda_available=True,
+                message="ready",
+            )
+
+            def run_now(_name, function, finished, **_kwargs):
+                finished(function(lambda *_args: None))
+
+            with (
+                patch("audioalign.gui.main_window.runtime_status", return_value=ready),
+                patch("audioalign.gui.main_window.Qwen3ForcedAligner", FakeAligner),
+                patch.object(window, "_selected_language_code", return_value="en"),
+                patch.object(window.tasks, "submit", side_effect=run_now),
+            ):
+                window.qwen_align_selected_range()
+
+            anchors = session.repository.anchors(chapter_id)
+            self.assertTrue(anchors)
+            self.assertTrue(all(
+                anchor.method == "qwen-forced-aligner-range" for anchor in anchors
+            ))
             window.close()
 
     @classmethod
@@ -400,6 +580,33 @@ class GuiSmokeTests(unittest.TestCase):
         editor.follow_playhead(20_001)
         centre = (editor.view_start + editor.view_end) / 2
         self.assertAlmostEqual(centre / 1000, editor.wave_pane.play_line.value())
+
+        editor.set_selection(1_000, 4_000)
+        editor.set_selection_edge("start", 2_000)
+        editor.set_selection_edge("end", 5_000)
+        self.assertEqual(
+            (2_000, 5_000),
+            (editor.selection.start_ms, editor.selection.end_ms),
+        )
+        jumps: list[int] = []
+        editor.seekRequested.connect(jumps.append)
+        editor.jump_to_selection_edge("start")
+        editor.jump_to_selection_edge("end")
+        self.assertEqual([2_000, 5_000], jumps)
+        menu = editor._context_menu(editor.wave_pane.plot, QPoint(10, 10), execute=False)
+        menu_labels = [action.text() for action in menu.actions()]
+        self.assertIn("将此处设为音频选区开始", menu_labels)
+        self.assertIn("跳到音频选区结束", menu_labels)
+
+        editor.wave_pane.plot.setYRange(-4, 4, padding=0)
+        editor.spectrum_pane.plot.setYRange(500, 2_000, padding=0)
+        editor.reset_vertical_scale()
+        wave_range = editor.wave_pane.plot.viewRange()[1]
+        spectrum_range = editor.spectrum_pane.plot.viewRange()[1]
+        self.assertAlmostEqual(-1.05, wave_range[0], places=2)
+        self.assertAlmostEqual(1.05, wave_range[1], places=2)
+        self.assertAlmostEqual(50, spectrum_range[0], places=1)
+        self.assertAlmostEqual(8_000, spectrum_range[1], places=1)
 
     def test_shared_boundary_uses_pointer_side_and_press_ignores_stale_hover(self) -> None:
         editor = AudioVisualizerEditor()
@@ -500,6 +707,7 @@ class GuiSmokeTests(unittest.TestCase):
             window._set_session(session)
             self.app.processEvents()
             self.assertIsNotNone(window.current_cache)
+            window.content_tabs.setCurrentWidget(window.article_view)
             self.assertGreater(window.article_view.line_model.rowCount(), 0)
             window.spectrogram.set_selection(250, 750)
             self.assertEqual((250, 750), (window.spectrogram.selection.start_ms, window.spectrogram.selection.end_ms))
@@ -724,6 +932,7 @@ class GuiSmokeTests(unittest.TestCase):
             window._set_list_visualization_mode(AudioVisualizationMode.SPECTROGRAM)
             self.assertEqual(AudioVisualizationMode.SPECTROGRAM, window.mini_delegate.mode)
 
+            window.content_tabs.setCurrentWidget(window.article_view)
             window._set_article_visualization_mode(AudioVisualizationMode.NONE)
             self.assertFalse(window.article_view.canvas.audio_visible)
             self.assertTrue(window.article_view.none_button.isChecked())
@@ -780,12 +989,17 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(original_text, stored.text)
             self.assertEqual(SegmentStatus.UNMATCHED, stored.status)
 
+            window.content_tabs.setCurrentWidget(window.asr_comparison)
             source_scroll = window.asr_comparison.source.verticalScrollBar()
             transcript_scroll = window.asr_comparison.transcript.verticalScrollBar()
+            self.assertIs(source_scroll, transcript_scroll)
             source_scroll.setRange(0, 100)
-            transcript_scroll.setRange(0, 200)
             source_scroll.setValue(50)
-            self.assertEqual(100, transcript_scroll.value())
+            self.assertEqual(50, transcript_scroll.value())
+
+            window.asr_comparison.focus_segment(0)
+            highlighted = window.asr_comparison._table.cellAt(1, 0).format().background().color()
+            self.assertEqual(QColor("#fff0aa"), highlighted)
             window.close()
 
     def test_undo_never_crosses_project_or_chapter_context(self) -> None:

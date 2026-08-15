@@ -4,15 +4,16 @@ import html
 import unicodedata
 
 from PySide6.QtCore import QUrl, Signal
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QTextBrowser, QVBoxLayout, QWidget
+from PySide6.QtGui import QBrush, QColor, QTextTable
+from PySide6.QtWidgets import QLabel, QTextBrowser, QVBoxLayout, QWidget
 
-from audioalign.core.models import ASRToken, SegmentStatus, TextSegment
+from audioalign.core.models import ASRToken, SegmentStatus, TextAudioAnchor, TextSegment
 from audioalign.core.text import normalize_for_match
 
 
 _STRONG_ENDINGS = frozenset("。！？.!?…")
-_CLOSING_PUNCTUATION = frozenset("，。！？；：、,.!?;:%)]}〉》」』】〕〗〙〛’”")
-_OPENING_PUNCTUATION = frozenset("([{〈《「『【〔〖〘〚‘“")
+_CLOSING_PUNCTUATION = frozenset("，。！？；：、,.!?;:%)]}〉》」』】〗〕’”»…")
+_OPENING_PUNCTUATION = frozenset("([{〈《「『【〖〔‘“«¿¡")
 
 
 def _is_han_or_kana(character: str) -> bool:
@@ -41,7 +42,7 @@ def _needs_word_space(previous: str, current: str) -> bool:
 
 
 def _token_blocks(tokens: list[ASRToken], maximum_tokens: int = 36) -> list[list[ASRToken]]:
-    """Create readable ASR paragraphs from pauses, punctuation and a length cap."""
+    """Create readable groups for recognition tokens not assigned to a cue."""
     blocks: list[list[ASRToken]] = []
     current: list[ASRToken] = []
     for token in tokens:
@@ -58,105 +59,192 @@ def _token_blocks(tokens: list[ASRToken], maximum_tokens: int = 36) -> list[list
     return blocks
 
 
+class _ComparisonBrowser(QTextBrowser):
+    wordClicked = Signal(int)
+    wordDoubleClicked = Signal(int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setOpenLinks(False)
+        self.anchorClicked.connect(self._anchor_clicked)
+
+    def _anchor_clicked(self, url: QUrl) -> None:
+        if url.scheme() != "ms":
+            return
+        try:
+            self.wordClicked.emit(int(url.path()))
+        except ValueError:
+            pass
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        anchor = self.anchorAt(event.position().toPoint())
+        if anchor:
+            url = QUrl(anchor)
+            if url.scheme() == "ms":
+                try:
+                    self.wordDoubleClicked.emit(int(url.path()))
+                except ValueError:
+                    pass
+        super().mouseDoubleClickEvent(event)
+
+
 class ASRComparisonView(QWidget):
-    """Selectable source/recognition comparison with audio-position links."""
+    """Source and ASR in paired rows sharing one real scroll position."""
 
     seekRequested = Signal(int)
+    jumpRequested = Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         self.summary = QLabel("尚无识别结果")
         layout.addWidget(self.summary)
-        columns = QHBoxLayout()
-        source_column = QVBoxLayout()
-        source_column.addWidget(QLabel("原文句段"))
-        self.source = QTextBrowser()
-        self.source.setOpenLinks(False)
-        self.source.setPlaceholderText("原文")
-        transcript_column = QVBoxLayout()
-        transcript_column.addWidget(QLabel("ASR 识别稿"))
-        self.transcript = QTextBrowser()
-        self.transcript.setOpenLinks(False)
-        self.transcript.setPlaceholderText("ASR 识别稿")
-        self.transcript.anchorClicked.connect(self._anchor_clicked)
-        source_column.addWidget(self.source, 1)
-        transcript_column.addWidget(self.transcript, 1)
-        columns.addLayout(source_column, 1)
-        columns.addLayout(transcript_column, 1)
-        layout.addLayout(columns)
-        self._syncing_scroll = False
-        self.source.verticalScrollBar().valueChanged.connect(
-            lambda value: self._sync_scroll(self.source.verticalScrollBar(), self.transcript.verticalScrollBar(), value)
-        )
-        self.transcript.verticalScrollBar().valueChanged.connect(
-            lambda value: self._sync_scroll(self.transcript.verticalScrollBar(), self.source.verticalScrollBar(), value)
-        )
+        self.comparison = _ComparisonBrowser()
+        self.comparison.setPlaceholderText("原文与 ASR 识别稿")
+        self.comparison.wordClicked.connect(self.seekRequested)
+        self.comparison.wordDoubleClicked.connect(self.jumpRequested)
+        # Compatibility names for callers that previously addressed the two
+        # panes. Both now intentionally share one document and scrollbar.
+        self.source = self.comparison
+        self.transcript = self.comparison
+        layout.addWidget(self.comparison, 1)
+        self._table: QTextTable | None = None
+        self._current_row = -1
+        self._row_count = 0
 
-    def _sync_scroll(self, source, target, value: int) -> None:
-        if self._syncing_scroll:
+    def _set_row_background(self, row: int, colour: QColor | None) -> None:
+        if self._table is None or not (0 <= row < self._row_count):
             return
-        self._syncing_scroll = True
-        try:
-            target.setValue(round(value / max(1, source.maximum()) * target.maximum()))
-        finally:
-            self._syncing_scroll = False
+        for column in range(2):
+            cell = self._table.cellAt(row + 1, column)  # row 0 is the header
+            cell_format = cell.format()
+            cell_format.setBackground(QBrush(colour) if colour is not None else QBrush())
+            cell.setFormat(cell_format)
 
-    def set_content(self, segments: list[TextSegment], tokens: list[ASRToken]) -> None:
-        source_html = []
-        for index, segment in enumerate(segments):
+    def focus_segment(self, row: int, *, ensure_visible: bool = False) -> None:
+        """Highlight one paired source/ASR row without rebuilding the document."""
+        if row == self._current_row and not ensure_visible:
+            return
+        self._set_row_background(self._current_row, None)
+        self._current_row = row if 0 <= row < self._row_count else -1
+        self._set_row_background(self._current_row, QColor("#fff0aa"))
+        if ensure_visible and self._table is not None and self._current_row >= 0:
+            cursor = self._table.cellAt(self._current_row + 1, 0).firstCursorPosition()
+            self.comparison.setTextCursor(cursor)
+            self.comparison.ensureCursorVisible()
+
+    @staticmethod
+    def _render_tokens(tokens: list[ASRToken], source_text: str) -> tuple[str, int]:
+        normalized_source = normalize_for_match(source_text)
+        rendered: list[str] = []
+        previous_text = ""
+        matched = 0
+        for token in tokens:
+            token_text = token.text.strip()
+            normalized = normalize_for_match(token_text)
+            is_match = bool(normalized and normalized in normalized_source)
+            matched += int(is_match)
+            colour = "#3aa675" if is_match else "#dc6072"
+            separator = " " if _needs_word_space(previous_text, token_text) else ""
+            rendered.append(
+                html.escape(separator)
+                + f'<a href="ms:{token.start_ms}" style="color:{colour}">'
+                + html.escape(token_text) + "</a>"
+            )
+            if token_text:
+                previous_text = token_text
+        return "".join(rendered), matched
+
+    def set_content(
+        self,
+        segments: list[TextSegment],
+        tokens: list[ASRToken],
+        anchors: list[TextAudioAnchor] | None = None,
+    ) -> None:
+        token_rows: list[list[ASRToken]] = [[] for _segment in segments]
+        unmatched_tokens: list[ASRToken] = []
+        row_by_segment_id = {
+            segment.id: index for index, segment in enumerate(segments)
+            if segment.id is not None
+        }
+        anchor_rows: dict[tuple[int, int], int] = {}
+        for anchor in anchors or []:
+            row = row_by_segment_id.get(anchor.segment_id)
+            if row is not None:
+                anchor_rows[(anchor.start_ms, anchor.end_ms)] = row
+        timed = [
+            (index, segment) for index, segment in enumerate(segments)
+            if segment.end_ms > segment.start_ms
+        ]
+        for token in tokens:
+            anchored_row = anchor_rows.get((token.start_ms, token.end_ms))
+            if anchored_row is not None:
+                token_rows[anchored_row].append(token)
+                continue
+            midpoint = (token.start_ms + token.end_ms) / 2
+            candidates = [
+                (index, segment) for index, segment in timed
+                if segment.start_ms <= midpoint <= segment.end_ms
+            ]
+            if not candidates:
+                unmatched_tokens.append(token)
+                continue
+            index, _segment = min(
+                candidates,
+                key=lambda item: abs(
+                    midpoint - (item[1].start_ms + item[1].end_ms) / 2
+                ),
+            )
+            token_rows[index].append(token)
+
+        rows_html: list[str] = []
+        matched = 0
+        for index, (segment, row_tokens) in enumerate(zip(segments, token_rows)):
             colour = {
                 SegmentStatus.UNMATCHED: "#d9576b",
                 SegmentStatus.LOW_CONFIDENCE: "#d69a36",
             }.get(segment.status, "inherit")
-            source_html.append(
-                '<div style="white-space:pre-wrap;margin:0 0 8px 0;padding:5px 7px;'
-                'border-bottom:1px solid #d7dbe0">'
-                f'<span style="color:#7b838c;font-size:9pt">{index + 1}.&nbsp;</span>'
-                f'<span style="color:{colour}">{html.escape(segment.text)}</span></div>'
+            rendered, row_matched = self._render_tokens(row_tokens, segment.text)
+            matched += row_matched
+            rows_html.append(
+                '<tr><td class="source">'
+                f'<span class="number">{index + 1}.</span> '
+                f'<span style="color:{colour}">{html.escape(segment.text)}</span>'
+                '</td><td class="asr">'
+                + (rendered or '<span class="empty">— 无对应识别词 —</span>')
+                + '</td></tr>'
             )
-        self.source.setHtml("<div>" + "".join(source_html) + "</div>")
-        normalized_source = normalize_for_match("".join(segment.text for segment in segments))
-        transcript_html: list[str] = []
-        matched = 0
-        for block_index, block in enumerate(_token_blocks(tokens)):
-            rendered: list[str] = []
-            previous_text = ""
-            for token in block:
-                token_text = token.text.strip()
-                normalized = normalize_for_match(token_text)
-                is_match = bool(normalized and normalized in normalized_source)
-                matched += int(is_match)
-                colour = "#3aa675" if is_match else "#dc6072"
-                separator = " " if _needs_word_space(previous_text, token_text) else ""
-                rendered.append(
-                    html.escape(separator)
-                    + f'<a href="ms:{token.start_ms}" style="color:{colour};text-decoration:none">'
-                    + f'{html.escape(token_text)}</a>'
-                )
-                if token_text:
-                    previous_text = token_text
-            transcript_html.append(
-                '<div style="white-space:pre-wrap;margin:0 0 8px 0;padding:5px 7px;'
-                'border-bottom:1px solid #d7dbe0">'
-                f'<span style="color:#7b838c;font-size:9pt">{block_index + 1}.&nbsp;</span>'
-                + "".join(rendered)
-                + "</div>"
-            )
-        self.transcript.setHtml("<div>" + "".join(transcript_html) + "</div>")
-        if tokens:
-            self.summary.setText(
-                f"识别单元 {len(tokens)} · 可在原文中直接找到 {matched}/{len(tokens)} · 点击识别词跳转音频"
-            )
-        else:
-            self.summary.setText("尚无识别结果")
 
-        self.source.verticalScrollBar().setValue(0)
-        self.transcript.verticalScrollBar().setValue(0)
+        for block in _token_blocks(unmatched_tokens):
+            rendered, _row_matched = self._render_tokens(block, "")
+            rows_html.append(
+                '<tr><td class="source empty">— 未匹配原文 —</td>'
+                f'<td class="asr">{rendered}</td></tr>'
+            )
 
-    def _anchor_clicked(self, url: QUrl) -> None:
-        if url.scheme() == "ms":
-            try:
-                self.seekRequested.emit(int(url.path()))
-            except ValueError:
-                pass
+        document = (
+            '<style>table{width:100%;table-layout:fixed;border-collapse:collapse}'
+            'th{background:#eef1f4;padding:7px;text-align:left}'
+            'td{width:50%;vertical-align:top;padding:7px;white-space:pre-wrap;'
+            'border-bottom:1px solid #d7dbe0}td+td,th+th{border-left:1px solid #c8cdd3}'
+            '.number{color:#7b838c;font-size:9pt}.empty{color:#9299a1}'
+            'a{text-decoration:none}</style>'
+            '<table><thead><tr><th>原文句段</th><th>ASR 识别稿（双击词定位）</th>'
+            '</tr></thead><tbody>' + "".join(rows_html) + '</tbody></table>'
+        )
+        self.comparison.setHtml(document)
+        self._row_count = len(segments)
+        root = self.comparison.document().rootFrame()
+        self._table = next(
+            (frame for frame in root.childFrames() if isinstance(frame, QTextTable)),
+            None,
+        )
+        current_row = self._current_row
+        self._current_row = -1
+        if 0 <= current_row < self._row_count:
+            self.focus_segment(current_row)
+        self.summary.setText(
+            f"识别单元 {len(tokens)} · 当前句内匹配 {matched}/{len(tokens)} · 双击识别词定位音频"
+            if tokens else "尚无识别结果"
+        )
+        self.comparison.verticalScrollBar().setValue(0)

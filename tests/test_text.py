@@ -8,6 +8,7 @@ from pathlib import Path
 from audioalign.core.text import (
     cursor_split_offset,
     import_epub,
+    join_segment_text,
     normalize_for_match,
     preferred_split_offset,
     split_sentences,
@@ -15,6 +16,15 @@ from audioalign.core.text import (
 
 
 class TextTests(unittest.TestCase):
+    def test_long_spanish_sentence_is_not_split_at_an_arbitrary_space(self) -> None:
+        text = " ".join(f"palabra{index}" for index in range(80))
+        self.assertEqual([text], split_sentences(text))
+
+    def test_merge_restores_word_spacing_but_not_cjk_punctuation_spacing(self) -> None:
+        self.assertEqual("dos palabras", join_segment_text("dos", "palabras"))
+        self.assertEqual("你好。", join_segment_text("你好", "。"))
+        self.assertEqual("第一句", join_segment_text("第一", "句"))
+
     def test_english_ellipsis_is_a_sentence_boundary(self) -> None:
         text = (
             "nor that he would spend the next few weeks being prodded and pinched "

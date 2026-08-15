@@ -183,6 +183,10 @@ class AudioVisualizerEditor(QWidget):
     modeChanged = Signal(str)
     followStateChanged = Signal(str)
     bindSelectionRequested = Signal()
+    distributeSelectionRequested = Signal(bool)
+    selectionStartRequested = Signal()
+    selectionEndRequested = Signal()
+    forceAlignSelectionRequested = Signal()
     newSegmentRequested = Signal()
     splitRequested = Signal()
     mergePreviousRequested = Signal()
@@ -431,9 +435,36 @@ class AudioVisualizerEditor(QWidget):
         self.set_time_range(milliseconds - span // 2, milliseconds + span // 2)
 
     def reset_view(self) -> None:
+        self.reset_vertical_scale()
+        self.focus_time(self.playhead, 30_000)
+
+    def reset_vertical_scale(self) -> None:
+        """Restore amplitude/frequency scale without changing the time window."""
         self.wave_pane.plot.setYRange(-1.05, 1.05, padding=0)
         self.spectrum_pane.plot.setYRange(50, 8000, padding=0)
-        self.focus_time(self.playhead, 30_000)
+
+    def set_selection_edge(self, edge: str, milliseconds: int) -> None:
+        """Move one edge of an existing range and keep it an explicit selection."""
+        if self.selection is None or self.selection.end_ms <= self.selection.start_ms:
+            return
+        milliseconds = max(0, min(self.duration_ms, int(milliseconds)))
+        if edge == "start":
+            start = min(milliseconds, self.selection.end_ms - 1)
+            self.set_selection(start, self.selection.end_ms)
+        else:
+            end = max(milliseconds, self.selection.start_ms + 1)
+            self.set_selection(self.selection.start_ms, end)
+
+    def jump_to_selection_edge(self, edge: str) -> None:
+        if self.selection is None or self.selection.end_ms <= self.selection.start_ms:
+            return
+        milliseconds = (
+            self.selection.start_ms if edge == "start" else self.selection.end_ms
+        )
+        self.suspend_follow("selection-jump")
+        self.seekRequested.emit(milliseconds)
+        if not (self.view_start <= milliseconds <= self.view_end):
+            self.focus_time(milliseconds, max(500, self.view_end - self.view_start))
 
     def show_entire_chapter(self) -> None:
         self.wave_pane.plot.setYRange(-1.05, 1.05, padding=0)
@@ -488,6 +519,16 @@ class AudioVisualizerEditor(QWidget):
         # Selection changes happen at every sentence boundary during playback.
         # Recreating every region and text label here made long chapters stall
         # for one or two seconds.  Only recolour the affected existing regions.
+        for changed_index in previous.symmetric_difference(self.selected_segments):
+            self._apply_cue_style(changed_index)
+
+    def set_selected_segments(self, indices) -> None:
+        """Synchronise cue highlighting from the table row selection model."""
+        previous = set(self.selected_segments)
+        self.selected_segments = {
+            int(index) for index in indices
+            if 0 <= int(index) < len(self.segments)
+        }
         for changed_index in previous.symmetric_difference(self.selected_segments):
             self._apply_cue_style(changed_index)
 
@@ -903,43 +944,117 @@ class AudioVisualizerEditor(QWidget):
         self._render_visible()
         self.viewChanged.emit(start, end)
 
-    def _context_menu(self, source: pg.PlotWidget, position: QPoint) -> None:
+    def _context_menu(
+        self, source: pg.PlotWidget, position: QPoint, *, execute: bool = True,
+    ) -> QMenu:
         scene_position = source.mapToScene(position)
         point = source.plotItem.vb.mapSceneToView(scene_position)
         milliseconds = max(0, min(self.duration_ms, round(point.x() * 1000)))
         index = self._segment_at(milliseconds)
-        if index >= 0:
+        if index >= 0 and index not in self.selected_segments:
             self.select_segment(index)
             self.segmentSelected.emit(index, 0)
         menu = QMenu(self)
-        actions = []
-        if index >= 0:
-            actions.extend([
-                ("播放当前句", self.playCurrentRequested),
-                ("编辑文本", self.editTextRequested),
-                ("在当前句前插入", self.insertBeforeRequested),
-                ("在当前句后插入", self.insertAfterRequested),
-            ])
-        if self.selection and self.selection.end_ms > self.selection.start_ms:
-            actions.extend([("将选区绑定到当前句", self.bindSelectionRequested),
-                            ("用选区新建句段", self.newSegmentRequested)])
-        actions.extend([
-            ("在播放头处拆分", self.splitRequested), ("按标点拆成多句", self.splitPunctuationRequested),
-            ("与前一句合并", self.mergePreviousRequested),
-            ("与后一句合并", self.mergeNextRequested), ("清除时间对应", self.clearTimingRequested),
-            ("锁定/解锁", self.lockRequested), ("恢复原始段落", self.restoreSourceRequested),
-            ("寻找下一处静音", self.nextSilenceRequested), ("删除句段", self.deleteRequested),
-        ])
-        for label, signal in actions:
+
+        def add_signal(label: str, signal, enabled: bool = True) -> QAction:
             action = QAction(label, menu)
+            action.setEnabled(enabled)
             action.triggered.connect(signal.emit)
             menu.addAction(action)
+            return action
+
+        selected = sorted(self.selected_segments)
+        count = len(selected)
+        unlocked = bool(selected) and not any(
+            self.segments[row].locked for row in selected
+        )
+        has_time_selection = bool(
+            self.selection and self.selection.end_ms > self.selection.start_ms
+            and not self.selection_tracks_segment
+        )
+        if count > 1:
+            heading = menu.addAction(f"已选择 {count} 个句段")
+            heading.setEnabled(False)
+            if has_time_selection:
+                menu.addSeparator()
+                action = menu.addAction("将音频选区平均分配给所选句")
+                action.setEnabled(unlocked)
+                action.triggered.connect(lambda: self.distributeSelectionRequested.emit(False))
+                action = menu.addAction("按原时长比例分配音频选区")
+                action.setEnabled(unlocked)
+                action.triggered.connect(lambda: self.distributeSelectionRequested.emit(True))
+                add_signal(
+                    "将首句开始设为选区开始", self.selectionStartRequested,
+                    not self.segments[selected[0]].locked,
+                )
+                add_signal(
+                    "将末句结束设为选区结束", self.selectionEndRequested,
+                    not self.segments[selected[-1]].locked,
+                )
+                consecutive = selected == list(range(selected[0], selected[-1] + 1))
+                add_signal(
+                    f"Qwen 强制对齐所选 {count} 句 ↔ 音频选区",
+                    self.forceAlignSelectionRequested,
+                    consecutive and unlocked,
+                )
+            menu.addSeparator()
+            add_signal("清除所选句时间对应", self.clearTimingRequested)
+            add_signal("锁定/解锁所选句", self.lockRequested)
+            add_signal("删除所选句时间匹配", self.deleteRequested)
+        else:
+            if count == 1:
+                add_signal("播放当前句", self.playCurrentRequested)
+                add_signal("编辑文本", self.editTextRequested)
+                add_signal("在当前句前插入", self.insertBeforeRequested)
+                add_signal("在当前句后插入", self.insertAfterRequested)
+            if has_time_selection:
+                menu.addSeparator()
+                if count == 1:
+                    add_signal("将选区绑定到当前句", self.bindSelectionRequested, unlocked)
+                    add_signal("将当前句开始设为选区开始", self.selectionStartRequested, unlocked)
+                    add_signal("将当前句结束设为选区结束", self.selectionEndRequested, unlocked)
+                    add_signal("Qwen 强制对齐当前句 ↔ 音频选区", self.forceAlignSelectionRequested, unlocked)
+                add_signal("用选区新建句段", self.newSegmentRequested)
+            if count == 1:
+                menu.addSeparator()
+                add_signal("在播放头处拆分", self.splitRequested)
+                add_signal("按标点拆成多句", self.splitPunctuationRequested)
+                add_signal("与前一句合并", self.mergePreviousRequested)
+                add_signal("与后一句合并", self.mergeNextRequested)
+                add_signal("清除时间对应", self.clearTimingRequested)
+                add_signal("锁定/解锁", self.lockRequested)
+                add_signal("恢复原始段落", self.restoreSourceRequested)
+                add_signal("删除句段", self.deleteRequested)
+        if self.selection and self.selection.end_ms > self.selection.start_ms:
+            menu.addSeparator()
+            action = menu.addAction("将此处设为音频选区开始")
+            action.triggered.connect(
+                lambda: self.set_selection_edge("start", milliseconds)
+            )
+            action = menu.addAction("将此处设为音频选区结束")
+            action.triggered.connect(
+                lambda: self.set_selection_edge("end", milliseconds)
+            )
+            action = menu.addAction("跳到音频选区开始")
+            action.triggered.connect(lambda: self.jump_to_selection_edge("start"))
+            action = menu.addAction("跳到音频选区结束")
+            action.triggered.connect(lambda: self.jump_to_selection_edge("end"))
+            clear_action = menu.addAction("清除音频选区")
+            clear_action.triggered.connect(self.clear_selection)
         menu.addSeparator()
-        for label, callback in (("重置视图", self.reset_view), ("显示整章", self.show_entire_chapter)):
+        add_signal("寻找下一处静音", self.nextSilenceRequested)
+        menu.addSeparator()
+        for label, callback in (
+            ("恢复频率/振幅原始比例", self.reset_vertical_scale),
+            ("恢复时间缩放（30 秒）", self.reset_view),
+            ("显示整章", self.show_entire_chapter),
+        ):
             action = QAction(label, menu)
             action.triggered.connect(callback)
             menu.addAction(action)
-        menu.exec(source.mapToGlobal(position))
+        if execute:
+            menu.exec(source.mapToGlobal(position))
+        return menu
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape:

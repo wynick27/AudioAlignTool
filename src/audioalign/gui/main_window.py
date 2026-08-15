@@ -17,7 +17,18 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QObject, QRunnable, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QEvent,
+    QItemSelectionModel,
+    QObject,
+    QRunnable,
+    QThreadPool,
+    QTimer,
+    Qt,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QFont, QKeySequence
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -126,6 +137,7 @@ from audioalign.core.text import (
     collect_local_markdown_resources,
     cursor_split_offset,
     import_book,
+    join_segment_text,
     normalize_for_match,
     preferred_split_offset,
     split_sentences_with_offsets,
@@ -839,6 +851,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.segment_table.selectionModel().currentRowChanged.connect(self._segment_selected)
+        self.segment_table.selectionModel().selectionChanged.connect(self._table_selection_changed)
         self.segment_table.doubleClicked.connect(lambda index: self._segment_double_activated(index.row()))
         self.article_view = ArticleSpectrogramView()
         self.article_view.segmentActivated.connect(self._select_segment_row)
@@ -856,6 +869,7 @@ class MainWindow(QMainWindow):
         self.content_tabs.addTab(self.original_book_view, "原书")
         self.asr_comparison = ASRComparisonView()
         self.asr_comparison.seekRequested.connect(self._asr_word_seek)
+        self.asr_comparison.jumpRequested.connect(self._asr_word_jump)
         self.content_tabs.addTab(self.asr_comparison, "ASR 对比")
         self.content_tabs.currentChanged.connect(self._content_tab_changed)
         self.segment_table.setColumnHidden(2, not self.list_audio_action.isChecked())
@@ -966,7 +980,7 @@ class MainWindow(QMainWindow):
         split = self._action_button("✂", self.split_action)
         merge = self._action_button("⇥", self.merge_action)
         lock = self._action_button("🔒", self.lock_action)
-        reset_view = self._tool_button("⌂", "重置视图", self.spectrogram.reset_view)
+        reset_view = self._tool_button("⌂", "恢复原始缩放比例", self.spectrogram.reset_view)
         self.waveform_button = self._action_button("∿", self.waveform_action)
         self.spectrum_button = self._action_button("▥", self.spectrum_action)
         self.combined_button = self._action_button("▤", self.combined_action)
@@ -1003,7 +1017,7 @@ class MainWindow(QMainWindow):
         self.spectrogram.selectionChanged.connect(self._selection_changed)
         self.spectrogram.timeActivated.connect(self._audio_time_activated)
         self.spectrogram.segmentDoubleClickedAt.connect(self._segment_double_activated)
-        self.spectrogram.segmentSelected.connect(lambda row, _mods: self._select_segment_row(row))
+        self.spectrogram.segmentSelected.connect(self._audio_segment_selected)
         self.spectrogram.boundaryDragStarted.connect(self._begin_segment_drag)
         self.spectrogram.boundaryMoved.connect(self._boundary_moved)
         self.spectrogram.segmentShiftRequested.connect(self._shift_segment)
@@ -1011,6 +1025,14 @@ class MainWindow(QMainWindow):
         self.spectrogram.viewChanged.connect(self._spectrum_view_changed)
         self.spectrogram.followStateChanged.connect(self._follow_state_changed)
         self.spectrogram.bindSelectionRequested.connect(self.bind_selection)
+        self.spectrogram.distributeSelectionRequested.connect(self.distribute_selection)
+        self.spectrogram.selectionStartRequested.connect(
+            lambda: self.set_boundary_from_selection("start")
+        )
+        self.spectrogram.selectionEndRequested.connect(
+            lambda: self.set_boundary_from_selection("end")
+        )
+        self.spectrogram.forceAlignSelectionRequested.connect(self.qwen_align_selected_range)
         self.spectrogram.newSegmentRequested.connect(self.new_segment_from_selection)
         self.spectrogram.splitRequested.connect(self.split_segment)
         self.spectrogram.mergePreviousRequested.connect(lambda: self.merge_segment(-1))
@@ -1114,35 +1136,101 @@ class MainWindow(QMainWindow):
             if not self.segment_model.segments[row].locked:
                 self.editor_text.setFocus()
 
-    def _segment_table_context_menu(self, position) -> None:
+    def _segment_table_context_menu(self, position, *, execute: bool = True) -> QMenu:
         index = self.segment_table.indexAt(position)
         if index.isValid():
-            self._select_segment_row(index.row())
+            selected_before = self._selected_rows()
+            if index.row() not in selected_before:
+                self._select_only_segment_row(index.row())
+            else:
+                # Keep the multi-selection while making the clicked row the
+                # current row used by single-row commands.
+                self.segment_table.selectionModel().setCurrentIndex(
+                    self.segment_model.index(index.row(), 0),
+                    QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
         rows = self._selected_rows()
-        has_row = bool(rows)
+        count = len(rows)
+        has_row = count > 0
+        multi = count > 1
+        selection = self.spectrogram.selection
+        has_time_selection = bool(
+            selection and selection.end_ms > selection.start_ms
+            and not self.spectrogram.selection_tracks_segment
+        )
+        consecutive = bool(rows) and rows == list(range(rows[0], rows[-1] + 1))
+        unlocked = bool(rows) and not any(
+            self.segment_model.segments[row].locked for row in rows
+        )
         menu = QMenu(self.segment_table)
-        actions = [
-            ("播放当前句", self.play_current_segment, has_row),
-            ("编辑文本", self.focus_segment_editor, has_row),
-            ("在当前句前插入", lambda: self.insert_segment(-1), has_row),
-            ("在当前句后插入", lambda: self.insert_segment(1), has_row),
-            ("按播放头拆分", self.split_segment, has_row),
-            ("按标点拆成多句", self.split_segment_by_punctuation, has_row),
-            ("与前一句合并", lambda: self.merge_segment(-1), has_row),
-            ("与后一句合并", lambda: self.merge_segment(1), has_row),
-            ("清除时间对应", self.clear_timing, has_row),
-            ("锁定/解锁", self.toggle_lock, has_row),
-            ("恢复原始段落", self.restore_source_fragment, has_row),
-            ("恢复整章原文", self.restore_source_chapter, bool(self.current_chapter_id)),
-            ("删除句段", self.delete_segments, has_row),
-        ]
-        for order, (label, callback, enabled) in enumerate(actions):
-            if order in {2, 4, 8, 11}:
-                menu.addSeparator()
+
+        def add_action(label: str, callback, enabled: bool = True) -> QAction:
             action = menu.addAction(label)
             action.setEnabled(enabled)
             action.triggered.connect(callback)
-        menu.exec(self.segment_table.viewport().mapToGlobal(position))
+            return action
+
+        if multi:
+            heading = menu.addAction(f"已选择 {count} 个句段")
+            heading.setEnabled(False)
+            if has_time_selection:
+                menu.addSeparator()
+                add_action(
+                    "将音频选区平均分配给所选句",
+                    lambda: self.distribute_selection(False),
+                    consecutive and unlocked,
+                )
+                add_action(
+                    "按原时长比例分配音频选区",
+                    lambda: self.distribute_selection(True),
+                    consecutive and unlocked,
+                )
+                add_action(
+                    "将首句开始设为选区开始",
+                    lambda: self.set_boundary_from_selection("start"),
+                    not self.segment_model.segments[rows[0]].locked,
+                )
+                add_action(
+                    "将末句结束设为选区结束",
+                    lambda: self.set_boundary_from_selection("end"),
+                    not self.segment_model.segments[rows[-1]].locked,
+                )
+                add_action(
+                    f"Qwen 强制对齐所选 {count} 句 ↔ 音频选区",
+                    self.qwen_align_selected_range,
+                    consecutive and unlocked,
+                )
+            menu.addSeparator()
+            add_action("清除所选句时间对应", self.clear_timing)
+            add_action("锁定/解锁所选句", self.toggle_lock)
+            add_action("删除所选句时间匹配", self.delete_segments)
+        else:
+            add_action("播放当前句", self.play_current_segment, has_row)
+            add_action("编辑文本", self.focus_segment_editor, has_row)
+            menu.addSeparator()
+            add_action("在当前句前插入", lambda: self.insert_segment(-1), has_row)
+            add_action("在当前句后插入", lambda: self.insert_segment(1), has_row)
+            if has_time_selection:
+                menu.addSeparator()
+                add_action("将选区绑定到当前句", self.bind_selection, has_row)
+                add_action("将当前句开始设为选区开始", lambda: self.set_boundary_from_selection("start"), has_row)
+                add_action("将当前句结束设为选区结束", lambda: self.set_boundary_from_selection("end"), has_row)
+                add_action("Qwen 强制对齐当前句 ↔ 音频选区", self.qwen_align_selected_range, unlocked)
+            menu.addSeparator()
+            add_action("按播放头拆分", self.split_segment, has_row)
+            add_action("按标点拆成多句", self.split_segment_by_punctuation, has_row)
+            add_action("与前一句合并", lambda: self.merge_segment(-1), has_row)
+            add_action("与后一句合并", lambda: self.merge_segment(1), has_row)
+            menu.addSeparator()
+            add_action("清除时间对应", self.clear_timing, has_row)
+            add_action("锁定/解锁", self.toggle_lock, has_row)
+            add_action("恢复原始段落", self.restore_source_fragment, has_row)
+            add_action("删除句段", self.delete_segments, has_row)
+        menu.addSeparator()
+        add_action("恢复整章原文", self.restore_source_chapter, bool(self.current_chapter_id))
+        if execute:
+            menu.exec(self.segment_table.viewport().mapToGlobal(position))
+        return menu
 
     def insert_segment(self, relative: int = 1) -> None:
         if not self.session or self.current_chapter_id is None:
@@ -1319,13 +1407,23 @@ class MainWindow(QMainWindow):
         self.status_chapters.setText(f"章节 {row + 1}/{len(chapters)}")
         segments = self.session.repository.segments(chapter.id or 0)
         self.segment_model.set_segments(segments)
-        self.original_book_view.set_chapter(
-            self.session, chapter.id or 0, segments, self._session_generation,
-        )
-        self.asr_comparison.set_content(segments, self.session.repository.asr_tokens(chapter.id or 0))
-        self._article_content_dirty = False
-        self._asr_content_dirty = False
-        self._original_book_content_dirty = False
+        current_view = self.content_tabs.currentWidget()
+        anchors = self.session.repository.anchors(chapter.id or 0)
+        self._article_content_dirty = current_view is not self.article_view
+        self._asr_content_dirty = current_view is not self.asr_comparison
+        self._original_book_content_dirty = current_view is not self.original_book_view
+        if current_view is self.article_view:
+            self.article_view.set_content(segments, anchors, None)
+        elif current_view is self.asr_comparison:
+            self.asr_comparison.set_content(
+                segments,
+                self.session.repository.asr_tokens(chapter.id or 0),
+                anchors,
+            )
+        elif current_view is self.original_book_view:
+            self.original_book_view.set_chapter(
+                self.session, chapter.id or 0, segments, self._session_generation,
+            )
         self._editing_row = -1
         if not segments:
             self._load_segment_editor(-1)
@@ -1343,7 +1441,6 @@ class MainWindow(QMainWindow):
             self.player.setSource(QUrl())
             self.spectrogram.set_cache(None)
             self.overview.set_cache(None)
-            self.article_view.set_content(segments, self.session.repository.anchors(chapter.id or 0), None)
             if segments:
                 self._select_segment_row(0)
             self._update_undo_actions()
@@ -1433,8 +1530,12 @@ class MainWindow(QMainWindow):
         self.overview.set_segments(self.segment_model.segments)
         self.overview.set_cache(self.current_cache, duration)
         self.overview.set_mode(self.spectrogram.mode)
-        anchors = self.session.repository.anchors(self.current_chapter_id or 0) if self.session else []
-        self.article_view.set_content(self.segment_model.segments, anchors, self.current_cache)
+        if self.content_tabs.currentWidget() is self.article_view:
+            anchors = self.session.repository.anchors(self.current_chapter_id or 0) if self.session else []
+            self.article_view.set_content(self.segment_model.segments, anchors, self.current_cache)
+            self._article_content_dirty = False
+        else:
+            self._article_content_dirty = True
 
     def _load_spectrogram(self, cache_dir: Path, duration: int) -> None:
         """Compatibility entry point used by older tests and integrations."""
@@ -2454,7 +2555,10 @@ class MainWindow(QMainWindow):
         self.article_view.set_content(
             self.segment_model.segments, self.session.repository.anchors(chapter_id), self.current_cache,
         )
-        self.asr_comparison.set_content(self.segment_model.segments, tokens)
+        self.asr_comparison.set_content(
+            self.segment_model.segments, tokens,
+            self.session.repository.anchors(chapter_id),
+        )
         self._mark_dirty()
         self._update_model_status()
         if run:
@@ -2662,7 +2766,7 @@ class MainWindow(QMainWindow):
             for anchor in anchors:
                 anchor.source_start_char += source_base
                 anchor.source_end_char += source_base
-                anchor.source = "qwen-forced-aligner-range"
+                anchor.method = "qwen-forced-aligner-range"
             self._push_history()
             self.session.repository.replace_segments_and_anchors(
                 chapter_id, updated, [*existing_anchors, *anchors],
@@ -2678,12 +2782,13 @@ class MainWindow(QMainWindow):
             self.asr_comparison.set_content(
                 self.segment_model.segments,
                 self.session.repository.asr_tokens(chapter_id),
+                self.session.repository.anchors(chapter_id),
             )
             self.model_status_label.setText(device.display_text)
             self.status_stage.setText(
                 f"Qwen 范围强制对齐完成 · {len(rows)} 句 · {_time(start_ms)}–{_time(end_ms)} · {device.display_text}"
             )
-            self._select_segment_row(rows[0])
+            self._select_segment_rows(rows, current_row=rows[0])
             self._mark_dirty()
 
         self.tasks.submit(
@@ -2861,6 +2966,7 @@ class MainWindow(QMainWindow):
             self.asr_comparison.set_content(
                 self.segment_model.segments,
                 self.session.repository.asr_tokens(chapter_id),
+                self.session.repository.anchors(chapter_id),
             )
             self.model_status_label.setText(device.display_text)
             self.status_stage.setText(
@@ -3154,11 +3260,21 @@ class MainWindow(QMainWindow):
     def _has_timing(segment: TextSegment | None) -> bool:
         return bool(segment and segment.end_ms > segment.start_ms)
 
+    def _nearest_timed_neighbor(self, row: int, direction: int) -> tuple[int, TextSegment | None]:
+        """Find the nearest timed cue, skipping unmatched text-only rows."""
+        index = row + direction
+        while 0 <= index < len(self.segment_model.segments):
+            candidate = self.segment_model.segments[index]
+            if self._has_timing(candidate):
+                return index, candidate
+            index += direction
+        return -1, None
+
     def _apply_adjacent_policy(self, row: int, kind: str) -> None:
         segments = self.segment_model.segments
         current = segments[row]
-        previous = segments[row - 1] if row > 0 else None
-        following = segments[row + 1] if row + 1 < len(segments) else None
+        previous_row, previous = self._nearest_timed_neighbor(row, -1)
+        following_row, following = self._nearest_timed_neighbor(row, 1)
         policy = self._overlap_policy()
         minimum = 100
         if policy == SegmentOverlapPolicy.ALLOW_OVERLAP:
@@ -3169,7 +3285,7 @@ class MainWindow(QMainWindow):
                 if trimmed <= current.start_ms:
                     previous.end_ms = trimmed
                     previous.status = SegmentStatus.MANUAL
-                    self._drag_changed_rows.add(row - 1)
+                    self._drag_changed_rows.add(previous_row)
                 else:
                     current.start_ms = previous.end_ms
             else:
@@ -3180,7 +3296,7 @@ class MainWindow(QMainWindow):
                 if trimmed >= current.end_ms:
                     following.start_ms = trimmed
                     following.status = SegmentStatus.MANUAL
-                    self._drag_changed_rows.add(row + 1)
+                    self._drag_changed_rows.add(following_row)
                 else:
                     current.end_ms = following.start_ms
             else:
@@ -3222,8 +3338,8 @@ class MainWindow(QMainWindow):
         chapter_end = self.current_parts[-1][4] if self.current_parts else max(segment.end_ms, 0)
         start = max(0, min(max(0, chapter_end - duration), segment.start_ms + delta_ms))
         if self._overlap_policy() == SegmentOverlapPolicy.CLAMP_CURRENT:
-            previous = self.segment_model.segments[row - 1] if row > 0 else None
-            following = self.segment_model.segments[row + 1] if row + 1 < len(self.segment_model.segments) else None
+            _previous_row, previous = self._nearest_timed_neighbor(row, -1)
+            _following_row, following = self._nearest_timed_neighbor(row, 1)
             lower = previous.end_ms if self._has_timing(previous) else 0
             upper = following.start_ms - duration if self._has_timing(following) else chapter_end - duration
             start = max(lower, min(max(lower, upper), start))
@@ -3373,6 +3489,42 @@ class MainWindow(QMainWindow):
             changed_rows.extend(self._drag_changed_rows)
         self._persist_current_segments(sorted(set(changed_rows)))
 
+    def set_boundary_from_selection(self, kind: str) -> None:
+        """Apply an explicit audio selection edge to the selected cue range."""
+        rows = self._selected_rows()
+        selection = self.spectrogram.selection
+        if (
+            not rows or selection is None
+            or selection.end_ms <= selection.start_ms
+            or self.spectrogram.selection_tracks_segment
+        ):
+            self.status_stage.setText("请先在音频图中框选一个时间范围")
+            return
+        row = rows[0] if kind == "start" else rows[-1]
+        segment = self.segment_model.segments[row]
+        if segment.locked:
+            self.status_stage.setText("目标句段已锁定，请先解锁")
+            return
+        value = selection.start_ms if kind == "start" else selection.end_ms
+        old_value = segment.start_ms if kind == "start" else segment.end_ms
+        if value == old_value:
+            return
+        self._push_history()
+        self._drag_changed_rows.clear()
+        if kind == "start":
+            segment.start_ms = min(value, segment.end_ms)
+        else:
+            segment.end_ms = max(value, segment.start_ms)
+        self._apply_adjacent_policy(row, kind)
+        segment.status = SegmentStatus.MANUAL
+        changed_rows = {row, *self._drag_changed_rows}
+        self._persist_current_segments(sorted(changed_rows))
+        target = "首句开始" if len(rows) > 1 and kind == "start" else (
+            "末句结束" if len(rows) > 1 else ("当前句开始" if kind == "start" else "当前句结束")
+        )
+        actual = segment.start_ms if kind == "start" else segment.end_ms
+        self.status_stage.setText(f"已将{target}设为 {_time(actual)}")
+
     def _time_for_text_offset(
         self, source: TextSegment, text: str, text_offset: int, fallback_ms: int,
     ) -> int:
@@ -3393,6 +3545,21 @@ class MainWindow(QMainWindow):
                 anchor for anchor in self.session.repository.anchors(self.current_chapter_id)
                 if anchor.source_end_char >= source.source_start_char
                 and anchor.source_start_char <= source.source_end_char
+                and anchor.end_ms > anchor.start_ms
+                and (
+                    "asr" in anchor.method.casefold()
+                    or "align" in anchor.method.casefold()
+                    or "whisper" in anchor.method.casefold()
+                )
+            ]
+            # Inclusive range queries can pick up the first word of the next
+            # cue. Keep anchors whose character centre actually belongs to the
+            # source segment.
+            anchors = [
+                anchor for anchor in anchors
+                if source.source_start_char
+                <= (anchor.source_start_char + anchor.source_end_char) / 2
+                <= source.source_end_char
             ]
             containing = [
                 anchor for anchor in anchors
@@ -3409,16 +3576,36 @@ class MainWindow(QMainWindow):
                 )
                 result = round(anchor.start_ms + ratio * (anchor.end_ms - anchor.start_ms))
             elif anchors:
-                # A punctuation boundary commonly falls in the character gap
-                # between two word anchors.  Use the nearest word edge.
-                edges = [
-                    (abs(mapped_character - anchor.source_start_char), anchor.start_ms)
-                    for anchor in anchors
-                ] + [
-                    (abs(mapped_character - anchor.source_end_char), anchor.end_ms)
-                    for anchor in anchors
+                before = [
+                    anchor for anchor in anchors
+                    if anchor.source_end_char <= mapped_character
                 ]
-                result = min(edges, key=lambda item: item[0])[1]
+                after = [
+                    anchor for anchor in anchors
+                    if anchor.source_start_char >= mapped_character
+                ]
+                previous = max(before, key=lambda item: item.source_end_char) if before else None
+                following = min(after, key=lambda item: item.source_start_char) if after else None
+                if previous and following:
+                    # A sentence beginning is anchored by the first ASR word
+                    # on its right. Keep the intervening pause with the prior
+                    # cue and start the new cue at that actual word boundary.
+                    result = following.start_ms
+                elif previous:
+                    result = previous.end_ms
+                elif following:
+                    result = following.start_ms
+
+            if anchors and not source.start_ms < result < source.end_ms:
+                # An older coarse segmentation can be shifted relative to the
+                # word anchors. Preserve the ASR speaking-rate information by
+                # projecting its local time span into the cue, rather than
+                # clamping an out-of-range word time to cue_end-1 ms.
+                anchor_start = min(anchor.start_ms for anchor in anchors)
+                anchor_end = max(anchor.end_ms for anchor in anchors)
+                if anchor_end > anchor_start:
+                    ratio = max(0.0, min(1.0, (result - anchor_start) / (anchor_end - anchor_start)))
+                    result = round(source.start_ms + ratio * (source.end_ms - source.start_ms))
         return max(source.start_ms + 1, min(source.end_ms - 1, int(result)))
 
     def split_segment(self) -> None:
@@ -3456,7 +3643,7 @@ class MainWindow(QMainWindow):
         left_end = source_start + len(left_text) if source_start is not None else None
         right_start = source_start + text_offset + right_leading if source_start is not None else None
         self._push_history()
-        replacement = self.segment_model.segments[:row] + [
+        replacement = [
             TextSegment(
                 None, self.current_chapter_id, 0, left_text, source.start_ms, position,
                 source.confidence, SegmentStatus.MANUAL, origin=source.origin,
@@ -3469,8 +3656,8 @@ class MainWindow(QMainWindow):
                 source_fragment_id=source.source_fragment_id,
                 source_start_char=right_start, source_end_char=source.source_end_char,
             ),
-        ] + self.segment_model.segments[row + 1 :]
-        self._replace_segments(replacement)
+        ]
+        self._replace_one_segment(row, replacement)
 
     def split_segment_at_text_cursor(self) -> None:
         """Split the current cue at the explicit cursor in the fixed text editor."""
@@ -3525,7 +3712,7 @@ class MainWindow(QMainWindow):
         if not self._editor_history_pushed:
             self._push_history()
         status = SegmentStatus.MANUAL if has_timing else SegmentStatus.UNMATCHED
-        replacement = self.segment_model.segments[:row] + [
+        replacement = [
             TextSegment(
                 None, self.current_chapter_id, 0, left_text,
                 source.start_ms if has_timing else 0, split_time if has_timing else 0,
@@ -3540,8 +3727,8 @@ class MainWindow(QMainWindow):
                 source_fragment_id=source.source_fragment_id,
                 source_start_char=right_source_start, source_end_char=source_end,
             ),
-        ] + self.segment_model.segments[row + 1:]
-        self._replace_segments(replacement)
+        ]
+        self._replace_one_segment(row, replacement)
         self._select_segment_row(row + 1)
         self.editor_text.setFocus()
         self.status_stage.setText(f"已在文本光标处拆分为第 {row + 1}、{row + 2} 句")
@@ -3559,6 +3746,10 @@ class MainWindow(QMainWindow):
         has_timing = duration >= len(pieces)
         replacement: list[TextSegment] = []
         previous_end = source.start_ms if has_timing else 0
+        minimum_piece_ms = (
+            max(1, min(200, duration // max(1, len(pieces) * 4)))
+            if has_timing else 0
+        )
         for index, (text, start, end) in enumerate(pieces):
             piece_start = previous_end if has_timing else 0
             if not has_timing:
@@ -3572,8 +3763,8 @@ class MainWindow(QMainWindow):
                 piece_end = self._time_for_text_offset(
                     source, source.text, end, fallback_end,
                 )
-                latest = source.end_ms - (len(pieces) - index - 1)
-                piece_end = min(latest, max(piece_start + 1, piece_end))
+                latest = source.end_ms - (len(pieces) - index - 1) * minimum_piece_ms
+                piece_end = min(latest, max(piece_start + minimum_piece_ms, piece_end))
             previous_end = piece_end
             base = source.source_start_char
             replacement.append(TextSegment(
@@ -3586,9 +3777,7 @@ class MainWindow(QMainWindow):
                 source_end_char=None if base is None else base + end,
             ))
         self._push_history()
-        self._replace_segments(
-            self.segment_model.segments[:row] + replacement + self.segment_model.segments[row + 1:]
-        )
+        self._replace_one_segment(row, replacement)
 
     def restore_source_fragment(self) -> None:
         rows = self._selected_rows()
@@ -3695,7 +3884,7 @@ class MainWindow(QMainWindow):
         self._push_history()
         same_source = left.source_fragment_id is not None and left.source_fragment_id == right.source_fragment_id
         merged = TextSegment(
-            None, self.current_chapter_id, 0, left.text + right.text,
+            None, self.current_chapter_id, 0, join_segment_text(left.text, right.text),
             min(left.start_ms, right.start_ms), max(left.end_ms, right.end_ms),
             min(left.confidence, right.confidence), SegmentStatus.MANUAL,
             origin=left.origin if same_source else SegmentOrigin.USER,
@@ -3703,7 +3892,16 @@ class MainWindow(QMainWindow):
             source_start_char=left.source_start_char if same_source else None,
             source_end_char=right.source_end_char if same_source else None,
         )
-        self._replace_segments(self.segment_model.segments[:low] + [merged] + self.segment_model.segments[high + 1 :])
+        if left.id is not None and right.id is not None and self.session:
+            self.session.repository.merge_adjacent_segments(
+                self.current_chapter_id, left.id, right.id, merged,
+            )
+            self._reload_after_structural_edit()
+        else:
+            self._replace_segments(
+                self.segment_model.segments[:low] + [merged]
+                + self.segment_model.segments[high + 1:]
+            )
 
     def delete_segments(self) -> None:
         rows = self._selected_rows()
@@ -3754,17 +3952,7 @@ class MainWindow(QMainWindow):
             if segment.id is not None:
                 ids.append(segment.id)
         self.session.repository.mark_segments_unmatched(ids)
-        self.spectrogram.set_segments(self.segment_model.segments)
-        self.overview.set_segments(self.segment_model.segments)
-        self.article_view.set_content(
-            self.segment_model.segments,
-            self.session.repository.anchors(self.current_chapter_id or 0),
-            self.current_cache,
-        )
-        self.asr_comparison.set_content(
-            self.segment_model.segments,
-            self.session.repository.asr_tokens(self.current_chapter_id or 0),
-        )
+        self._refresh_segment_views(defer_hidden=True, refresh_audio=True)
         first = self.segment_model.index(min(editable), 0)
         last = self.segment_model.index(max(editable), 3)
         self.segment_model.dataChanged.emit(first, last)
@@ -3772,7 +3960,7 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
 
     def _refresh_segment_views(
-        self, *, defer_hidden: bool = False, refresh_audio: bool = True,
+        self, *, defer_hidden: bool = True, refresh_audio: bool = True,
     ) -> None:
         if refresh_audio:
             self.spectrogram.set_segments(self.segment_model.segments)
@@ -3791,7 +3979,13 @@ class MainWindow(QMainWindow):
                 self.session.repository.asr_tokens(self.current_chapter_id or 0)
                 if self.session else []
             )
-            self.asr_comparison.set_content(self.segment_model.segments, tokens)
+            comparison_anchors = (
+                self.session.repository.anchors(self.current_chapter_id or 0)
+                if self.session else []
+            )
+            self.asr_comparison.set_content(
+                self.segment_model.segments, tokens, comparison_anchors,
+            )
             self._asr_content_dirty = False
         else:
             self._asr_content_dirty = True
@@ -3816,20 +4010,31 @@ class MainWindow(QMainWindow):
             self.asr_comparison.set_content(
                 self.segment_model.segments,
                 self.session.repository.asr_tokens(self.current_chapter_id),
+                self.session.repository.anchors(self.current_chapter_id),
             )
             self._asr_content_dirty = False
         elif current is self.original_book_view and self._original_book_content_dirty:
             self._refresh_original_book()
             self._original_book_content_dirty = False
+        row = self.segment_table.currentIndex().row()
+        if 0 <= row < len(self.segment_model.segments):
+            self._focus_segment_in_active_content_view(row)
 
     def _refresh_original_book(self) -> None:
-        if self.session and self.current_chapter_id is not None:
-            self.original_book_view.set_chapter(
-                self.session, self.current_chapter_id,
-                self.segment_model.segments, self._session_generation,
-            )
+        if not self.session or self.current_chapter_id is None:
+            return
+        if self.content_tabs.currentWidget() is not self.original_book_view:
+            self._original_book_content_dirty = True
+            return
+        self.original_book_view.set_chapter(
+            self.session, self.current_chapter_id,
+            self.segment_model.segments, self._session_generation,
+        )
+        self._original_book_content_dirty = False
 
-    def _original_book_segment_activated(self, segment_id: int, generation: int) -> None:
+    def _original_book_segment_activated(
+        self, segment_id: int, generation: int, jump: bool = False,
+    ) -> None:
         if generation != self._session_generation:
             return
         row = next((
@@ -3840,7 +4045,11 @@ class MainWindow(QMainWindow):
             return
         segment = self.segment_model.segments[row]
         if segment.end_ms > segment.start_ms:
-            self._segment_double_activated(row, segment.start_ms)
+            self._audio_time_activated(segment.start_ms, row)
+            if jump:
+                self.spectrogram.suspend_follow("original-book")
+                span = max(500, self.spectrogram.view_end - self.spectrogram.view_start)
+                self.spectrogram.focus_time(segment.start_ms, span)
         else:
             self._select_segment_row(row)
 
@@ -3858,6 +4067,35 @@ class MainWindow(QMainWindow):
         current = self.segment_table.currentIndex().row()
         if current >= 0:
             self._load_segment_editor(current)
+
+    def _reload_after_structural_edit(self) -> None:
+        """Reload one changed cue structure without rewriting chapter data."""
+        if not self.session or self.current_chapter_id is None:
+            return
+        self.segment_model.set_segments(
+            self.session.repository.segments(self.current_chapter_id)
+        )
+        self._refresh_segment_views(defer_hidden=True, refresh_audio=True)
+        self._refresh_segment_play_range()
+        self._mark_dirty()
+
+    def _replace_one_segment(
+        self, row: int, replacements: list[TextSegment],
+    ) -> None:
+        """Use the local database path for interactive split operations."""
+        if not self.session or self.current_chapter_id is None:
+            return
+        original = self.segment_model.segments[row]
+        if original.id is None:
+            self._replace_segments(
+                self.segment_model.segments[:row] + replacements
+                + self.segment_model.segments[row + 1:]
+            )
+            return
+        self.session.repository.replace_one_segment(
+            self.current_chapter_id, original.id, replacements,
+        )
+        self._reload_after_structural_edit()
 
     def _replace_segments(
         self, segments: list[TextSegment], anchors: list[TextAudioAnchor] | None = None,
@@ -3915,23 +4153,18 @@ class MainWindow(QMainWindow):
         self.segment_model.dataChanged.emit(first, last)
         self.spectrogram.update_segments(self.segment_model.segments, rows)
         self.overview.set_segments(self.segment_model.segments)
-        self._refresh_segment_views(defer_hidden=True, refresh_audio=False)
+        # Timing/status edits do not change either side of the ASR comparison
+        # or the original book text. Rebuilding their large HTML documents made
+        # a simple bind take several seconds on audiobook-sized chapters.
+        # The article audio rows do depend on timing, so rebuild them lazily.
+        self._article_content_dirty = True
         self._refresh_segment_play_range()
         self._mark_dirty()
 
     def _segment_edited(self, segment: TextSegment) -> None:
         if self.session:
             self.session.repository.update_segment(segment)
-            self.spectrogram.set_segments(self.segment_model.segments)
-            self.article_view.set_content(
-                self.segment_model.segments,
-                self.session.repository.anchors(self.current_chapter_id or 0),
-                self.current_cache,
-            )
-            self.asr_comparison.set_content(
-                self.segment_model.segments, self.session.repository.asr_tokens(self.current_chapter_id or 0),
-            )
-            self.original_book_refresh_timer.start()
+            self._refresh_segment_views(defer_hidden=True, refresh_audio=True)
             self._refresh_segment_play_range()
             self._mark_dirty()
 
@@ -4012,17 +4245,62 @@ class MainWindow(QMainWindow):
         if not self._playback_row_update:
             self._clear_play_range()
             self._manual_selection_until = time.monotonic() + 0.35
-        self.spectrogram.select_segment(row)
-        self.article_view.focus_segment(
-            row,
-            ensure_visible=(not self._playback_row_update or self.content_tabs.currentWidget() is self.article_view),
-        )
-        segment = self.segment_model.segments[row]
-        self.original_book_view.focus_segment(
-            segment.id,
-            ensure_visible=(self._playback_row_update or self.content_tabs.currentWidget() is self.original_book_view),
-        )
+        self._focus_segment_in_active_content_view(row)
         self._load_segment_editor(row)
+
+    def _focus_segment_in_active_content_view(self, row: int) -> None:
+        """Synchronise only the visible document view; hidden views stay idle."""
+        if not (0 <= row < len(self.segment_model.segments)):
+            return
+        current = self.content_tabs.currentWidget()
+        if current is self.article_view:
+            self.article_view.focus_segment(row, ensure_visible=True)
+        elif current is self.original_book_view:
+            self.original_book_view.focus_segment(
+                self.segment_model.segments[row].id, ensure_visible=True,
+            )
+        elif current is self.asr_comparison:
+            self.asr_comparison.focus_segment(row, ensure_visible=True)
+
+    def _table_selection_changed(self, _selected=None, _deselected=None) -> None:
+        rows = {
+            index.row()
+            for index in self.segment_table.selectionModel().selectedRows()
+        }
+        self.spectrogram.set_selected_segments(rows)
+
+    def _audio_segment_selected(self, row: int, modifiers: int) -> None:
+        """Mirror Ctrl/Shift cue selection into the table without collapsing it."""
+        if not (0 <= row < self.segment_model.rowCount()):
+            return
+        selection_model = self.segment_table.selectionModel()
+        index = self.segment_model.index(row, 0)
+        control = bool(modifiers & int(Qt.KeyboardModifier.ControlModifier.value))
+        shift = bool(modifiers & int(Qt.KeyboardModifier.ShiftModifier.value))
+        if shift:
+            current = self.segment_table.currentIndex()
+            anchor = current.row() if current.isValid() else row
+            selection_model.clearSelection()
+            for selected_row in range(min(anchor, row), max(anchor, row) + 1):
+                selection_model.select(
+                    self.segment_model.index(selected_row, 0),
+                    QItemSelectionModel.SelectionFlag.Select
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            selection_model.setCurrentIndex(
+                index, QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+        elif control:
+            selection_model.select(
+                index,
+                QItemSelectionModel.SelectionFlag.Toggle
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
+            selection_model.setCurrentIndex(
+                index, QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+        else:
+            self._select_only_segment_row(row)
 
     def _load_segment_editor(self, row: int) -> None:
         self.editor_commit_timer.stop()
@@ -4113,17 +4391,7 @@ class MainWindow(QMainWindow):
         self.session.repository.update_segment(segment)
         index = self.segment_model.index(self._editing_row, 0)
         self.segment_model.dataChanged.emit(index, self.segment_model.index(self._editing_row, 3))
-        self.spectrogram.set_segments(self.segment_model.segments)
-        self.overview.set_segments(self.segment_model.segments)
-        self.article_view.set_content(
-            self.segment_model.segments,
-            self.session.repository.anchors(self.current_chapter_id or 0),
-            self.current_cache,
-        )
-        self.asr_comparison.set_content(
-            self.segment_model.segments, self.session.repository.asr_tokens(self.current_chapter_id or 0),
-        )
-        self.original_book_refresh_timer.start()
+        self._refresh_segment_views(defer_hidden=True, refresh_audio=True)
         self._last_editor_values = (start, end, end - start)
         self._editor_loading = True
         self.editor_end.setText(_time(end))
@@ -4133,8 +4401,36 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
 
     def _select_segment_row(self, row: int) -> None:
+        self._select_only_segment_row(row)
+
+    def _select_only_segment_row(self, row: int) -> None:
         if 0 <= row < self.segment_model.rowCount():
-            self.segment_table.setCurrentIndex(self.segment_model.index(row, 0))
+            index = self.segment_model.index(row, 0)
+            self.segment_table.selectionModel().setCurrentIndex(
+                index,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
+
+    def _select_segment_rows(self, rows: list[int], *, current_row: int | None = None) -> None:
+        valid_rows = sorted({
+            row for row in rows if 0 <= row < self.segment_model.rowCount()
+        })
+        if not valid_rows:
+            return
+        selection_model = self.segment_table.selectionModel()
+        selection_model.clearSelection()
+        for row in valid_rows:
+            selection_model.select(
+                self.segment_model.index(row, 0),
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
+        row = current_row if current_row in valid_rows else valid_rows[0]
+        selection_model.setCurrentIndex(
+            self.segment_model.index(row, 0),
+            QItemSelectionModel.SelectionFlag.NoUpdate,
+        )
 
     def _article_range_selected(self, start: int, end: int) -> None:
         self.spectrogram.set_selection(start, end)
@@ -4148,9 +4444,13 @@ class MainWindow(QMainWindow):
         self.spectrogram.focus_time(milliseconds, self.spectrogram.view_end - self.spectrogram.view_start)
 
     def _asr_word_seek(self, milliseconds: int) -> None:
-        """A clicked ASR word is an explicit seek-and-centre command."""
+        """A single click only moves the playback cursor."""
         self._clear_play_range()
         self._seek_local(milliseconds)
+
+    def _asr_word_jump(self, milliseconds: int) -> None:
+        """A double click locates and centres the word in the audio view."""
+        self._asr_word_seek(milliseconds)
         self.spectrogram.suspend_follow("asr-comparison")
         span = max(500, self.spectrogram.view_end - self.spectrogram.view_start)
         self.spectrogram.focus_time(milliseconds, span)
@@ -4220,9 +4520,9 @@ class MainWindow(QMainWindow):
         self._clear_play_range()
         self._manual_selection_until = time.monotonic() + 0.35
         self._seek_local(milliseconds)
-        if row >= 0:
-            self._select_segment_row(row)
-            self.spectrogram.select_segment(row)
+        # Cue selection follows in segmentSelected, after the seek, where
+        # Ctrl/Shift modifiers can be applied without briefly collapsing a
+        # multi-selection to one row.
 
     def _segment_double_activated(self, row: int, milliseconds: int | None = None) -> None:
         """Double-click selects; it only keeps playing when playback was already active."""

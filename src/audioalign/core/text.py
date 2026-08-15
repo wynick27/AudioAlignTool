@@ -581,7 +581,13 @@ def _strong_sentence_pieces(paragraph: str) -> list[tuple[str, int, int]]:
     return pieces
 
 
-def preferred_split_offset(text: str, approximate: int, *, radius: int | None = None) -> int:
+def preferred_split_offset(
+    text: str,
+    approximate: int,
+    *,
+    radius: int | None = None,
+    punctuation_only: bool = False,
+) -> int:
     """Choose a readable boundary near an audio-derived character position."""
     if len(text) < 2:
         return 0
@@ -595,14 +601,14 @@ def preferred_split_offset(text: str, approximate: int, *, radius: int | None = 
             priority = 0
         elif previous in _STRONG_END or previous == "\n":
             priority = 1
-        elif previous.isspace():
+        elif previous.isspace() and not punctuation_only:
             priority = 2
         else:
             continue
         if _has_text(text[:index]) and _has_text(text[index:]):
             candidates.append((priority, index))
     if not candidates:
-        return approximate
+        return 0 if punctuation_only else approximate
     priority = min(value for value, _index in candidates)
     return min(
         (index for value, index in candidates if value == priority),
@@ -632,7 +638,11 @@ def _balanced_piece(text: str, base: int, target: int, cjk: bool) -> list[tuple[
         else:
             matches = list(re.finditer(r"\b[\w'’-]+\b", remaining, re.UNICODE))
             approximate = matches[min(target, len(matches)) - 1].end() if matches else min(len(remaining) - 1, target)
-        split = preferred_split_offset(remaining, approximate)
+        # Do not invent automatic sentence boundaries at arbitrary spaces.
+        # Manual splitting still retains its nearby-whitespace fallback.
+        split = preferred_split_offset(
+            remaining, approximate, punctuation_only=True,
+        )
         if split <= 0 or split >= len(remaining):
             break
         raw_left = remaining[:split]
@@ -675,6 +685,28 @@ def split_sentences_with_offsets(text: str) -> list[tuple[str, int, int]]:
 
 def split_sentences(text: str) -> list[str]:
     return [value for value, _start, _end in split_sentences_with_offsets(text)]
+
+
+def join_segment_text(left: str, right: str) -> str:
+    """Join cue text without gluing Latin words or spacing CJK punctuation."""
+    if not left:
+        return right
+    if not right:
+        return left
+    if left[-1].isspace() or right[0].isspace():
+        return left + right
+
+    left_char, right_char = left[-1], right[0]
+    no_space_before = "，。！？；：、,.!?;:%)]}〉》」』】〗〕’”»…"
+    no_space_after = "([{〈《「『【〖〔‘“«¿¡"
+    if right_char in no_space_before or left_char in no_space_after:
+        return left + right
+
+    left_cjk = "\u3400" <= left_char <= "\u9fff" or "\u3040" <= left_char <= "\u30ff"
+    right_cjk = "\u3400" <= right_char <= "\u9fff" or "\u3040" <= right_char <= "\u30ff"
+    if left_cjk and right_cjk:
+        return left + right
+    return left + " " + right
 
 
 def normalize_for_match(text: str, language: str = "auto") -> str:

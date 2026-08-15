@@ -5,13 +5,15 @@ import os
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from audioalign.core.exporters import export_html, export_json, export_subtitles
 from audioalign.core.models import (
     ASRToken, BoundaryCandidate, Chapter, InferenceDeviceInfo, RecognitionChunk,
-    SegmentOrigin, SegmentStatus, SourceFragment, TextSegment,
+    SegmentOrigin, SegmentStatus, SourceDocument, SourceDocumentKind, SourceFragment,
+    TextSegment,
 )
 from audioalign.core.storage import (
     ProjectRepository, ProjectSession, UnsupportedProjectError, migrate_manifest,
@@ -20,6 +22,72 @@ from audioalign.core.storage import (
 
 
 class StorageExportTests(unittest.TestCase):
+    def test_html_export_copies_epub_css_and_images_with_original_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = ProjectSession.create("epub-reader", root / "project")
+            try:
+                epub = session.root / "source" / "book.epub"
+                epub.parent.mkdir(exist_ok=True)
+                source_html = (
+                    "<html><head><link rel='stylesheet' href='../styles/book.css'></head>"
+                    "<body><p class='novel'>Styled text.</p>"
+                    "<img src='../images/picture.png'></body></html>"
+                )
+                with zipfile.ZipFile(epub, "w") as archive:
+                    archive.writestr("text/chapter.xhtml", source_html)
+                    archive.writestr("styles/book.css", ".novel{font-style:italic}")
+                    archive.writestr("images/picture.png", b"image")
+                document_id = session.repository.add_source_document(SourceDocument(
+                    None, SourceDocumentKind.EPUB, "book.epub", "source/book.epub", "fixture",
+                ))
+                chapter_id = session.repository.add_chapter(
+                    Chapter(None, "Chapter", 0, source_html)
+                )
+                session.repository.set_chapter_source_document(
+                    chapter_id, document_id, entry_path="text/chapter.xhtml",
+                )
+                session.repository.replace_segments(
+                    chapter_id, [TextSegment(None, chapter_id, 0, "Styled text.", 0, 500)],
+                )
+                output = root / "html"
+                export_html(session, output)
+                page = (output / "pages" / "chapter-001.html").read_text("utf-8")
+                self.assertIn(f'../book/source-{document_id}/text/', page)
+                self.assertTrue((output / "book" / f"source-{document_id}" / "styles" / "book.css").is_file())
+                self.assertTrue((output / "book" / f"source-{document_id}" / "images" / "picture.png").is_file())
+            finally:
+                session.close()
+
+    def test_html_export_preserves_source_style_and_reader_state_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = ProjectSession.create("styled-reader", root / "project")
+            try:
+                source_html = (
+                    "<html><head><style>.novel{color:rgb(12,34,56)}</style></head>"
+                    "<body><p class='novel'>Hello <em>styled world</em>.</p></body></html>"
+                )
+                chapter_id = session.repository.add_chapter(
+                    Chapter(None, "Styled chapter", 0, source_html)
+                )
+                session.repository.replace_segments(chapter_id, [
+                    TextSegment(None, chapter_id, 0, "Hello styled world.", 100, 900),
+                ])
+                index = export_html(session, root / "html")
+                page = root / "html" / "pages" / "chapter-001.html"
+                rendered = page.read_text("utf-8")
+                shell = index.read_text("utf-8")
+                self.assertIn(".novel{color:rgb(12,34,56)}", rendered)
+                self.assertIn("<em>", rendered)
+                self.assertIn("data-aat-index", rendered)
+                self.assertIn("单句循环", shell)
+                self.assertIn("playbackRate", shell)
+                self.assertIn("localStorage", shell)
+                self.assertIn('"page_path": "pages/chapter-001.html"', shell)
+            finally:
+                session.close()
+
     def test_non_structural_chapter_restore_preserves_segment_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("stable-undo", Path(temporary) / "project")
