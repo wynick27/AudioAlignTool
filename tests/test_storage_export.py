@@ -66,7 +66,8 @@ class StorageExportTests(unittest.TestCase):
             try:
                 source_html = (
                     "<html><head><style>.novel{color:rgb(12,34,56)}</style></head>"
-                    "<body><p class='novel'>Hello <em>styled world</em>.</p></body></html>"
+                    "<body><p class='novel'><span class='dropcap'>H</span>ello "
+                    "<em>styled world</em>.</p></body></html>"
                 )
                 chapter_id = session.repository.add_chapter(
                     Chapter(None, "Styled chapter", 0, source_html)
@@ -81,8 +82,12 @@ class StorageExportTests(unittest.TestCase):
                 self.assertIn(".novel{color:rgb(12,34,56)}", rendered)
                 self.assertIn("<em>", rendered)
                 self.assertIn("data-aat-index", rendered)
+                self.assertGreaterEqual(rendered.count('data-aat-index="0"'), 3)
+                self.assertIn("targets.forEach(target=>target.classList.add('aat-active'))", rendered)
                 self.assertIn("单句循环", shell)
                 self.assertIn("playbackRate", shell)
+                self.assertIn("player.onplay=syncPlayButton", shell)
+                self.assertIn("playing?'⏸':'▶'", shell)
                 self.assertIn("localStorage", shell)
                 self.assertIn('"page_path": "pages/chapter-001.html"', shell)
             finally:
