@@ -11,13 +11,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-portable-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows-package:
     runs-on: windows-latest
     timeout-minutes: 120
-    concurrency:
-      group: windows-portable-${{ github.ref }}
-      cancel-in-progress: true
     env:
       PYTHONUTF8: "1"
       PYTHONDONTWRITEBYTECODE: "1"
@@ -44,6 +45,7 @@ jobs:
           cache-dependency-path: |
             requirements-lock.txt
             requirements-build.txt
+            requirements-qwen-lock.txt
             pyproject.toml
 
       - name: Install dependencies

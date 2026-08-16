@@ -61,6 +61,42 @@ class TextTests(unittest.TestCase):
             split_sentences("Narration ends.‘New speaker?’"),
         )
 
+    def test_english_titles_and_initials_do_not_split_sentences(self) -> None:
+        text = (
+            "Mr. Justice Wargrave spoke. Dr. Armstrong listened. "
+            "Prof. H. L. Smith answered. Then he left."
+        )
+
+        self.assertEqual(
+            [
+                "Mr. Justice Wargrave spoke.",
+                "Dr. Armstrong listened.",
+                "Prof. H. L. Smith answered.",
+                "Then he left.",
+            ],
+            split_sentences(text),
+        )
+
+    def test_abbreviation_inside_sentence_is_not_detached(self) -> None:
+        self.assertEqual(
+            ["Evidently Mrs. Oliver had good connections."],
+            split_sentences("Evidently Mrs. Oliver had good connections."),
+        )
+        self.assertEqual(
+            ["He met H. Poirot.", "They talked."],
+            split_sentences("He met H. Poirot. They talked."),
+        )
+
+    def test_initial_and_vocative_periods_can_end_sentences(self) -> None:
+        self.assertEqual(
+            ["My wife and I.", "We left."],
+            split_sentences("My wife and I. We left."),
+        )
+        self.assertEqual(
+            ["Good night, Miss.", "Vera frowned."],
+            split_sentences("Good night, Miss. Vera frowned."),
+        )
+
     def test_cursor_split_keeps_following_punctuation_on_the_left(self) -> None:
         text = "First clause, second clause"
         self.assertEqual(len("First clause,"), cursor_split_offset(text, len("First clause")))

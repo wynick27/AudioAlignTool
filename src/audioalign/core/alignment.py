@@ -16,7 +16,7 @@ from .models import (
     TextAudioAnchor,
     TextSegment,
 )
-from .text import normalize_for_match
+from .text import is_cjk_text, normalize_for_match
 
 
 @dataclass(slots=True)
@@ -26,6 +26,39 @@ class SilenceAlignmentResult:
     unused_candidates: list[BoundaryCandidate]
     proposed_count: int = 0
     stopped_early: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class _SelectedSilenceBoundary:
+    center_ms: int
+    start_ms: int
+    end_ms: int
+    reliable: bool
+    score: float
+
+
+def silence_boundary_edges(
+    candidate: BoundaryCandidate,
+    padding_ms: int = 0,
+) -> tuple[int, int]:
+    """Return ``(previous_end, following_start)`` for one silence interval.
+
+    A cue ending before a pause belongs at the pause's leading edge, while a
+    cue beginning after it belongs at the trailing edge.  Padding is kept
+    inside the detected non-speech interval, never on the speech side and
+    never with the two directions reversed.  Legacy point candidates retain
+    the old symmetric-gap behaviour.
+    """
+    center = max(0, int(candidate.time_ms))
+    start = center if candidate.start_ms is None else max(0, int(candidate.start_ms))
+    end = center if candidate.end_ms is None else max(0, int(candidate.end_ms))
+    if end < start:
+        start, end = end, start
+    padding = max(0, int(padding_ms))
+    if end > start:
+        inside = min(padding, (end - start) // 2)
+        return start + inside, end - inside
+    return max(0, center - padding), center + padding
 
 
 @dataclass(slots=True)
@@ -44,15 +77,30 @@ class ProgressiveAlignmentEvaluation:
 @dataclass(slots=True, frozen=True)
 class ForcedAlignmentPlannerOptions:
     minimum_segments: int = 4
-    maximum_segments: int = 12
-    target_duration_ms: int = 30_000
-    maximum_window_ms: int = 75_000
+    # Sentence count is derived from estimated spoken duration.  This is only a
+    # pathological safety ceiling for books split into many one- or two-word
+    # fragments, not the normal block size.
+    # The upstream Qwen long-audio recipe caps one call at twenty sentences.
+    # Duration still chooses the normal end inside this model-capacity guard.
+    maximum_segments: int = 20
+    target_duration_ms: int = 80_000
+    maximum_window_ms: int = 90_000
+    # The next block repeats two source sentences and their proven audio.  The
+    # older block remains their sole writer; the repeat is validation only.
     overlap_segments: int = 2
     stable_score: float = 0.72
     review_score: float = 0.50
     beam_width: int = 3
     maximum_backtracks: int = 2
     recovery_search_ms: int = 90_000
+    recovery_attempts: int = 8
+    leading_text_search_segments: int = 6
+    initial_resync_pairs: int = 18
+    candidate_trial_budget: int = 6
+    # The following overlapping block is the real validator.  Once a local
+    # candidate is already stable, running more alternatives only multiplies
+    # GPU work and native-memory pressure on long audiobook chapters.
+    stable_candidates_required: int = 2
 
 
 @dataclass(slots=True)
@@ -84,6 +132,25 @@ class ForcedAlignmentRunResult:
     completed_count: int
     review_count: int
     stopped_reason: str = ""
+
+
+def forced_alignment_hypothesis_priority(
+    hypothesis: ForcedAlignmentHypothesis,
+    *,
+    stable_score: float = 0.72,
+) -> tuple[bool, float, int, float]:
+    """Prefer complete stable blocks over higher-scoring partial recovery."""
+    content = [segment for segment in hypothesis.segments if segment.text.strip()]
+    coverage = sum(
+        segment.end_ms > segment.start_ms for segment in content
+    ) / max(1, len(content))
+    return (
+        hypothesis.score >= stable_score,
+        coverage,
+        hypothesis.end_index - hypothesis.start_index
+        if hypothesis.score >= stable_score else 0,
+        hypothesis.score,
+    )
 
 
 def forced_alignment_text_group_ends(
@@ -135,6 +202,7 @@ def forced_alignment_window_ends(
     *,
     language: str = "auto",
     observed_ms_per_unit: float | None = None,
+    expected_duration_ms: int | None = None,
     options: ForcedAlignmentPlannerOptions | None = None,
 ) -> list[tuple[int, bool]]:
     """Plan strong-VAD-first audio ends followed by bounded weak fallbacks."""
@@ -143,7 +211,15 @@ def forced_alignment_window_ends(
     limit_ms = max(start_ms, int(limit_ms))
     if limit_ms <= start_ms:
         return []
-    expected = estimate_spoken_duration_ms(text, language, observed_ms_per_unit)
+    # ``estimate_spoken_duration_ms`` is deliberately capped for one unusually
+    # long sentence. A multi-sentence block must pass the sum of its sentence
+    # estimates, otherwise every block longer than 60 seconds is planned with
+    # a prematurely clipped VAD end.
+    expected = (
+        estimate_spoken_duration_ms(text, language, observed_ms_per_unit)
+        if expected_duration_ms is None
+        else max(1, int(expected_duration_ms))
+    )
     expected = min(options.maximum_window_ms, max(4_000, expected))
     target = min(limit_ms, start_ms + expected)
     latest = min(limit_ms, start_ms + options.maximum_window_ms)
@@ -157,13 +233,22 @@ def forced_alignment_window_ends(
         if earliest <= end <= latest:
             strong.append((end, False))
     strong.sort(key=lambda item: (abs(item[0] - target), item[0]))
-    fallback_values = {
-        min(latest, max(earliest, target)),
-        min(latest, max(earliest, start_ms + round(expected * 1.35))),
-        latest,
-    }
+    target_fallback = min(latest, max(earliest, target))
+    expanded_fallback = min(
+        latest, max(earliest, start_ms + round(expected * 1.35)),
+    )
     result: list[tuple[int, bool]] = []
-    for item in [*strong[:3], *((value, True) for value in sorted(fallback_values))]:
+    # The second attempt must expand materially. Trying three nearby VAD
+    # boundaries before expanding exhausted the per-block budget whenever the
+    # default speaking-rate estimate was 15–30% too fast.
+    ordered = [
+        *strong[:1],
+        (expanded_fallback, True),
+        *strong[1:3],
+        (target_fallback, True),
+        (latest, True),
+    ]
+    for item in ordered:
         if item[0] <= start_ms or any(abs(existing[0] - item[0]) < 250 for existing in result):
             continue
         result.append(item)
@@ -198,6 +283,10 @@ def score_forced_alignment_hypothesis(
 
     reasons: list[str] = []
     score = 0.35
+    expected_count = sum(bool(segment.text.strip()) for segment in segments)
+    coverage = len(aligned) / max(1, expected_count)
+    if coverage < 1.0:
+        reasons.append("块内有未朗读或未能映射的文字")
     last_end = max(token.end_ms for token in timed)
     touches_end = last_end >= duration - 250
     if touches_end:
@@ -242,6 +331,14 @@ def score_forced_alignment_hypothesis(
             score += 0.10
         else:
             reasons.append("句段时长与文字量不匹配")
+    # A missing visual heading is tolerable, but a hypothesis that only maps a
+    # small fraction of its text must not outrank a complete neighbouring one.
+    score *= 0.65 + 0.35 * coverage
+    if touches_end:
+        # A forced aligner can assign the final supplied word to the clip edge
+        # even when the actual utterance continues. Such a candidate may be
+        # shown for review, but must not become the cursor for the next block.
+        score = min(score, 0.69)
     return max(0.0, min(1.0, score)), tuple(reasons), measured_rate
 
 
@@ -261,12 +358,80 @@ def forced_alignment_overlap_score(
     for position in shared:
         left = previous_by_position[position]
         right = current_by_position[position]
+        if left.end_ms <= left.start_ms or right.end_ms <= right.start_ms:
+            # An unspoken visual heading or a locally omitted source word is
+            # not evidence of time drift. A neighbouring timed overlap row
+            # must still validate the cursor.
+            continue
         tolerance = max(250, round(max(left.end_ms - left.start_ms, right.end_ms - right.start_ms) * 0.05))
         error = max(abs(left.start_ms - right.start_ms), abs(left.end_ms - right.end_ms))
         if error > tolerance:
             return 0.0
         scores.append(max(0.0, 1.0 - error / max(1, tolerance)))
-    return mean(scores)
+    return mean(scores) if scores else 0.0
+
+
+def forced_alignment_has_usable_coverage(
+    segments: Sequence[TextSegment],
+    *,
+    minimum_ratio: float = 0.70,
+    maximum_unmatched_suffix: int = 2,
+) -> bool:
+    """Distinguish a local source difference from truncated model output."""
+    content = [segment for segment in segments if segment.text.strip()]
+    if not content:
+        return False
+    timed_indexes = [
+        index for index, segment in enumerate(content)
+        if segment.end_ms > segment.start_ms
+    ]
+    if not timed_indexes:
+        return False
+    coverage = len(timed_indexes) / len(content)
+    trailing_unmatched = len(content) - timed_indexes[-1] - 1
+    return (
+        coverage >= max(0.0, min(1.0, minimum_ratio))
+        and trailing_unmatched <= max(0, int(maximum_unmatched_suffix))
+    )
+
+
+def forced_alignment_candidate_can_end_search(
+    segments: Sequence[TextSegment],
+    score: float,
+    *,
+    stable_score: float = 0.72,
+) -> bool:
+    """Only a fully covered stable candidate may stop alternative trials."""
+    return score >= stable_score and all(
+        not segment.text.strip() or segment.end_ms > segment.start_ms
+        for segment in segments
+    )
+
+
+def partition_monotonic_alignment_rows(
+    rows: Sequence[tuple[int, TextSegment]],
+    *,
+    tolerance_ms: int = 250,
+) -> tuple[set[int], set[int]]:
+    """Separate safe rows from time-regressive forced-alignment output.
+
+    A model block may fail locally, but it must never move the chapter cursor
+    back into already confirmed audio. Rejected rows do not advance the cursor,
+    which allows a later independently confirmed block to recover.
+    """
+    accepted: set[int] = set()
+    rejected: set[int] = set()
+    cursor_ms = 0
+    for row_index, segment in sorted(rows, key=lambda item: item[0]):
+        if segment.end_ms <= segment.start_ms:
+            rejected.add(row_index)
+            continue
+        if segment.start_ms < cursor_ms - max(0, int(tolerance_ms)):
+            rejected.add(row_index)
+            continue
+        accepted.add(row_index)
+        cursor_ms = max(cursor_ms, segment.end_ms)
+    return accepted, rejected
 
 
 def locate_contiguous_audio_part(parts: Sequence[tuple], milliseconds: int):
@@ -608,6 +773,125 @@ def _token_character_map(tokens: Sequence[ASRToken], language: str) -> tuple[str
     return "".join(characters), owner
 
 
+def _uses_character_alignment(language: str, sample: str) -> bool:
+    code = (language or "auto").casefold().split("-", 1)[0]
+    if code in {"zh", "yue", "ja", "ko"}:
+        return True
+    if code not in {"", "auto"}:
+        return False
+    return is_cjk_text(sample)
+
+
+def _alignment_units(text: str, language: str, *, character_mode: bool) -> list[str]:
+    """Create matching units without erasing word or segment boundaries.
+
+    ``normalize_for_match`` deliberately removes spaces. Concatenating its
+    output for a whole chapter used to turn adjacent English source segments
+    such as ``II`` + ``I`` into ``III`` and let one omitted heading shift every
+    later sentence. Space languages therefore match whole lexical units; CJK
+    languages retain their useful character-level behaviour.
+    """
+    if character_mode:
+        return list(normalize_for_match(text, language))
+    words = re.findall(r"[^\W_]+(?:[’'\-][^\W_]+)*", text, flags=re.UNICODE)
+    return [unit for word in words if (unit := normalize_for_match(word, language))]
+
+
+def _alignment_units_with_spans(
+    text: str,
+    language: str,
+    *,
+    character_mode: bool,
+) -> list[tuple[str, int, int]]:
+    if character_mode:
+        result: list[tuple[str, int, int]] = []
+        for index, character in enumerate(text):
+            result.extend(
+                (unit, index, index + 1)
+                for unit in normalize_for_match(character, language)
+            )
+        return result
+    result = []
+    for match in re.finditer(r"[^\W_]+(?:[’'\-][^\W_]+)*", text, flags=re.UNICODE):
+        unit = normalize_for_match(match.group(), language)
+        if unit:
+            result.append((unit, match.start(), match.end()))
+    return result
+
+
+def _transcript_units_with_owners(
+    tokens: Sequence[ASRToken],
+    source_unit_groups: Sequence[Sequence[str]],
+    language: str,
+    *,
+    character_mode: bool,
+) -> tuple[list[str], list[int]]:
+    """Normalize model tokens while undoing punctuation-fused Latin words.
+
+    Qwen removes em dashes from its returned token text and can consequently
+    emit ``Owenunfortunately`` for source ``Owen—unfortunately``.  Matching
+    that as one lexical unit drops both source words and moves the sentence
+    start to the next token.  Split only when the fused value exactly equals a
+    short *contiguous* sequence of source units, so this remains monotonic and
+    language-independent rather than becoming an English abbreviation rule.
+    """
+    source_units = [unit for group in source_unit_groups for unit in group]
+    fused_splits: dict[str, tuple[str, ...]] = {}
+    source_vocabulary = set(source_units)
+    if not character_mode:
+        # Never join across a source segment boundary. Otherwise a transcript
+        # heading ``III`` could be falsely decomposed into adjacent source rows
+        # ``II`` + ``I`` and shift the rest of the chapter.
+        for group in source_unit_groups:
+            for start in range(len(group)):
+                combined = group[start]
+                for end in range(start + 1, min(len(group), start + 6)):
+                    combined += group[end]
+                    if combined not in source_vocabulary:
+                        fused_splits.setdefault(combined, tuple(group[start:end + 1]))
+
+    transcript_units: list[str] = []
+    owners: list[int] = []
+    for token_index, token in enumerate(tokens):
+        units = _alignment_units(token.text, language, character_mode=character_mode)
+        if len(units) == 1 and units[0] in fused_splits:
+            units = list(fused_splits[units[0]])
+        transcript_units.extend(units)
+        owners.extend([token_index] * len(units))
+    return transcript_units, owners
+
+
+def _ordered_unit_matches(
+    source_units: Sequence[str], transcript_units: Sequence[str],
+) -> dict[int, int]:
+    """Return conservative monotonic matches that tolerate local insertions.
+
+    Long matching runs are reliable anchors. A one-unit run is accepted only
+    when that unit is unique on both sides (or sufficiently distinctive), so a
+    stray common word cannot connect two unrelated passages. An unmatched
+    source sentence consumes no transcript units, leaving later anchors intact.
+    """
+    matcher = SequenceMatcher(None, source_units, transcript_units, autojunk=False)
+    source_counts: dict[str, int] = {}
+    transcript_counts: dict[str, int] = {}
+    for unit in source_units:
+        source_counts[unit] = source_counts.get(unit, 0) + 1
+    for unit in transcript_units:
+        transcript_counts[unit] = transcript_counts.get(unit, 0) + 1
+    mapping: dict[int, int] = {}
+    for block in matcher.get_matching_blocks():
+        if block.size <= 0:
+            continue
+        if block.size == 1:
+            unit = source_units[block.a]
+            unique = source_counts.get(unit, 0) == transcript_counts.get(unit, 0) == 1
+            if not unique and len(unit) < 5:
+                continue
+        for offset in range(block.size):
+            mapping[block.a + offset] = block.b + offset
+    return mapping
+
+
 def anchors_from_segments_tokens(
     segments: Sequence[TextSegment],
     tokens: Sequence[ASRToken],
@@ -617,28 +901,36 @@ def anchors_from_segments_tokens(
     """Map original source character ranges to matched ASR word times."""
     if not segments or not tokens:
         return []
-    source_characters: list[str] = []
-    source_owner: list[int] = []
+    sample = "".join(segment.text for segment in segments) + "".join(token.text for token in tokens)
+    character_mode = _uses_character_alignment(language, sample)
+    source_units: list[str] = []
+    source_unit_groups: list[list[str]] = []
+    source_spans: list[tuple[int, int]] = []
     segment_ranges: list[tuple[int, int, TextSegment]] = []
     raw_offset = 0
     for segment in segments:
         start = raw_offset
-        for local_index, character in enumerate(segment.text):
-            normalized = normalize_for_match(character, language)
-            source_characters.extend(normalized)
-            source_owner.extend([raw_offset + local_index] * len(normalized))
+        segment_units: list[str] = []
+        for unit, local_start, local_end in _alignment_units_with_spans(
+            segment.text, language, character_mode=character_mode,
+        ):
+            source_units.append(unit)
+            segment_units.append(unit)
+            source_spans.append((raw_offset + local_start, raw_offset + local_end))
+        source_unit_groups.append(segment_units)
         raw_offset += len(segment.text)
         segment_ranges.append((start, raw_offset, segment))
-    transcript, transcript_owner = _token_character_map(tokens, language)
-    matcher = SequenceMatcher(None, "".join(source_characters), transcript, autojunk=False)
+    transcript_units, transcript_owner = _transcript_units_with_owners(
+        tokens, source_unit_groups, language, character_mode=character_mode,
+    )
+    mapping = _ordered_unit_matches(source_units, transcript_units)
     token_source_positions: dict[int, list[int]] = {}
-    for block in matcher.get_matching_blocks():
-        for offset in range(block.size):
-            source_index = block.a + offset
-            transcript_index = block.b + offset
-            if source_index >= len(source_owner) or transcript_index >= len(transcript_owner):
-                continue
-            token_source_positions.setdefault(transcript_owner[transcript_index], []).append(source_owner[source_index])
+    for source_index, transcript_index in mapping.items():
+        if source_index >= len(source_spans) or transcript_index >= len(transcript_owner):
+            continue
+        span_start, span_end = source_spans[source_index]
+        positions = token_source_positions.setdefault(transcript_owner[transcript_index], [])
+        positions.extend((span_start, max(span_start, span_end - 1)))
     anchors: list[TextAudioAnchor] = []
     chapter_id = segments[0].chapter_id
     for token_index, positions in sorted(token_source_positions.items()):
@@ -671,10 +963,12 @@ def align_segments_to_tokens(
     language: str = "auto",
     low_confidence: float = 0.58,
 ) -> list[TextSegment]:
-    """Monotonic fuzzy alignment using character-level matching blocks.
+    """Monotonically align source segments while containing local differences.
 
-    Original text is never changed. Matching blocks map normalized source
-    characters to normalized ASR characters, which then map back to word times.
+    Space languages use lexical units, so an extra word or source-only sentence
+    cannot be concatenated across segment boundaries and shift the remainder of
+    a chapter. CJK languages use normalized characters. Original text is never
+    changed.
     """
     if not tokens:
         return [
@@ -687,17 +981,20 @@ def align_segments_to_tokens(
             )
             for s in segments
         ]
-    source_parts = [normalize_for_match(segment.text, language) for segment in segments]
+    sample = "".join(segment.text for segment in segments) + "".join(token.text for token in tokens)
+    character_mode = _uses_character_alignment(language, sample)
+    source_parts = [
+        _alignment_units(segment.text, language, character_mode=character_mode)
+        for segment in segments
+    ]
     offsets: list[int] = [0]
     for part in source_parts:
         offsets.append(offsets[-1] + len(part))
-    source_text = "".join(source_parts)
-    transcript, transcript_owner = _token_character_map(tokens, language)
-    matcher = SequenceMatcher(None, source_text, transcript, autojunk=False)
-    mapping: dict[int, int] = {}
-    for block in matcher.get_matching_blocks():
-        for offset in range(block.size):
-            mapping[block.a + offset] = block.b + offset
+    source_units = [unit for part in source_parts for unit in part]
+    transcript_units, transcript_owner = _transcript_units_with_owners(
+        tokens, source_parts, language, character_mode=character_mode,
+    )
+    mapping = _ordered_unit_matches(source_units, transcript_units)
 
     result: list[TextSegment] = []
     last_end = 0
@@ -707,9 +1004,9 @@ def align_segments_to_tokens(
             last_end = max(last_end, segment.end_ms)
             continue
         start_offset, end_offset = offsets[index], offsets[index + 1]
-        matched_chars = [mapping[pos] for pos in range(start_offset, end_offset) if pos in mapping]
-        coverage = len(matched_chars) / max(1, end_offset - start_offset)
-        if not matched_chars or coverage < 0.18:
+        matched_units = [mapping[pos] for pos in range(start_offset, end_offset) if pos in mapping]
+        coverage = len(matched_units) / max(1, end_offset - start_offset)
+        if not matched_units or coverage < 0.18:
             result.append(
                 TextSegment(
                     id=segment.id, chapter_id=segment.chapter_id, position=segment.position,
@@ -720,9 +1017,9 @@ def align_segments_to_tokens(
                 )
             )
             continue
-        first_char, last_char = min(matched_chars), max(matched_chars)
-        first_token = transcript_owner[first_char]
-        last_token = transcript_owner[last_char]
+        first_unit, last_unit = min(matched_units), max(matched_units)
+        first_token = transcript_owner[first_unit]
+        last_token = transcript_owner[last_unit]
         start_ms = max(last_end, tokens[first_token].start_ms)
         end_ms = max(start_ms, tokens[last_token].end_ms)
         probabilities = [token.probability for token in tokens[first_token:last_token + 1]]
@@ -749,7 +1046,8 @@ def snap_boundaries(
     window_ms: int = 1000,
     padding_ms: int = 80,
 ) -> list[TextSegment]:
-    times = sorted(candidate.time_ms for candidate in candidates)
+    ordered = sorted(candidates, key=lambda candidate: candidate.time_ms)
+    times = [candidate.time_ms for candidate in ordered]
     output = [
         TextSegment(
             id=s.id, chapter_id=s.chapter_id, position=s.position, text=s.text,
@@ -762,18 +1060,33 @@ def snap_boundaries(
     ]
     for index in range(len(output) - 1):
         left, right = output[index], output[index + 1]
-        if left.locked or right.locked or left.end_ms <= 0:
+        if (
+            left.locked or right.locked
+            or left.end_ms <= left.start_ms or right.end_ms <= right.start_ms
+        ):
             continue
         target = (left.end_ms + right.start_ms) // 2 if right.start_ms else left.end_ms
         insertion = bisect_right(times, target)
-        nearby = times[max(0, insertion - 3): insertion + 3]
+        nearby = ordered[max(0, insertion - 3): insertion + 3]
         if not nearby:
             continue
-        selected = min(nearby, key=lambda value: abs(value - target))
-        if abs(selected - target) > window_ms:
+        def distance(candidate: BoundaryCandidate) -> int:
+            start = candidate.time_ms if candidate.start_ms is None else candidate.start_ms
+            end = candidate.time_ms if candidate.end_ms is None else candidate.end_ms
+            if end < start:
+                start, end = end, start
+            if target < start:
+                return start - target
+            if target > end:
+                return target - end
+            return 0
+
+        selected = min(nearby, key=lambda candidate: (distance(candidate), -candidate.score))
+        if distance(selected) > window_ms:
             continue
-        left.end_ms = max(left.start_ms, selected - padding_ms)
-        right.start_ms = min(max(left.end_ms, selected + padding_ms), max(selected + padding_ms, right.end_ms))
+        previous_end, following_start = silence_boundary_edges(selected, padding_ms)
+        left.end_ms = max(left.start_ms, min(previous_end, right.end_ms))
+        right.start_ms = min(right.end_ms, max(left.end_ms, following_start))
         if left.status == SegmentStatus.AUTO:
             left.status = SegmentStatus.MANUAL
         if right.status == SegmentStatus.AUTO:
@@ -813,7 +1126,7 @@ def _select_silence_boundaries(
     candidates: list[BoundaryCandidate],
     start_ms: int,
     end_ms: int,
-) -> list[tuple[int, bool, float]]:
+) -> list[_SelectedSilenceBoundary]:
     """Choose monotonic silence boundaries nearest cumulative text-duration targets."""
     needed = max(0, len(weights) - 1)
     if not needed:
@@ -824,7 +1137,10 @@ def _select_silence_boundaries(
     for weight in weights[:-1]:
         cumulative += weight
         targets.append(start_ms + round((end_ms - start_ms) * cumulative / total_weight))
-    available = [item for item in candidates if start_ms < item.time_ms < end_ms]
+    available = sorted(
+        (item for item in candidates if start_ms < item.time_ms < end_ms),
+        key=lambda item: item.time_ms,
+    )
     if len(available) >= needed:
         # Dynamic programming selects distinct candidates while allowing extra
         # pauses to be skipped. Candidate confidence mildly favours long pauses.
@@ -856,27 +1172,52 @@ def _select_silence_boundaries(
         chosen.reverse()
         tolerance = max(2_000, round((end_ms - start_ms) / max(1, len(weights)) * 0.8))
         return [
-            (item.time_ms, abs(item.time_ms - target) <= tolerance and item.score >= 0.25, item.score)
+            _SelectedSilenceBoundary(
+                item.time_ms,
+                item.time_ms if item.start_ms is None else item.start_ms,
+                item.time_ms if item.end_ms is None else item.end_ms,
+                abs(item.time_ms - target) <= tolerance and item.score >= 0.25,
+                item.score,
+            )
             for item, target in zip(chosen, targets)
         ]
 
     # With too few pauses, reserve each real candidate for its nearest target
     # and estimate the rest. A monotonic clamp prevents crossed boundaries.
-    output: list[tuple[int, bool, float]] = [(target, False, 0.35) for target in targets]
-    unused_targets = set(range(len(targets)))
-    for candidate in sorted(available, key=lambda item: item.score, reverse=True):
-        if not unused_targets:
-            break
-        target_index = min(unused_targets, key=lambda index: abs(targets[index] - candidate.time_ms))
-        output[target_index] = (candidate.time_ms, True, candidate.score)
-        unused_targets.remove(target_index)
-    cursor = start_ms + 1
-    normalized: list[tuple[int, bool, float]] = []
-    for value, reliable, score in output:
-        value = max(cursor, min(end_ms - (needed - len(normalized)), value))
-        normalized.append((value, reliable, score))
-        cursor = value + 1
-    return normalized
+    output: list[_SelectedSilenceBoundary | None] = [None] * needed
+    # Place real pauses in chronological order.  Restrict each assignment to
+    # the range that still leaves one target slot for every later pause.
+    previous_target = -1
+    for candidate_index, candidate in enumerate(available):
+        first_target = previous_target + 1
+        last_target = needed - (len(available) - candidate_index)
+        target_index = min(
+            range(first_target, last_target + 1),
+            key=lambda index: abs(targets[index] - candidate.time_ms),
+        )
+        output[target_index] = _SelectedSilenceBoundary(
+            candidate.time_ms,
+            candidate.time_ms if candidate.start_ms is None else candidate.start_ms,
+            candidate.time_ms if candidate.end_ms is None else candidate.end_ms,
+            True,
+            candidate.score,
+        )
+        previous_target = target_index
+
+    # Fill only the missing slots.  Estimated points are constrained between
+    # the neighbouring real VAD centres; the real intervals are never moved.
+    anchors = [(-1, start_ms)] + [
+        (index, boundary.center_ms)
+        for index, boundary in enumerate(output) if boundary is not None
+    ] + [(needed, end_ms)]
+    for (left_index, left_time), (right_index, right_time) in zip(anchors, anchors[1:]):
+        cursor = left_time
+        for index in range(left_index + 1, right_index):
+            remaining = right_index - index - 1
+            value = max(cursor + 1, min(right_time - remaining - 1, targets[index]))
+            output[index] = _SelectedSilenceBoundary(value, value, value, False, 0.35)
+            cursor = value
+    return [boundary for boundary in output if boundary is not None]
 
 
 def anchors_from_segment_timings(
@@ -933,13 +1274,33 @@ def align_segments_from_silence(
             punctuation = sum(item.text.count(mark) for mark in "，、；：,.!?。！？")
             weights.append(base + punctuation * 2)
         boundaries = _select_silence_boundaries(weights, list(candidates), cursor_time, run_end_ms)
-        for time_ms, reliable, _score in boundaries:
-            if reliable:
-                used_times.add(time_ms)
+        for boundary in boundaries:
+            if boundary.reliable:
+                used_times.add(boundary.center_ms)
         unreliable_streak = 0
         for local_index, segment in enumerate(run):
-            left = cursor_time if local_index == 0 else boundaries[local_index - 1][0] + options.padding_ms
-            right = run_end_ms if local_index == len(run) - 1 else boundaries[local_index][0] - options.padding_ms
+            if local_index == 0:
+                left = cursor_time
+            else:
+                previous = boundaries[local_index - 1]
+                _previous_end, left = silence_boundary_edges(
+                    BoundaryCandidate(
+                        previous.center_ms, previous.score,
+                        start_ms=previous.start_ms, end_ms=previous.end_ms,
+                    ),
+                    options.padding_ms,
+                )
+            if local_index == len(run) - 1:
+                right = run_end_ms
+            else:
+                following = boundaries[local_index]
+                right, _following_start = silence_boundary_edges(
+                    BoundaryCandidate(
+                        following.center_ms, following.score,
+                        start_ms=following.start_ms, end_ms=following.end_ms,
+                    ),
+                    options.padding_ms,
+                )
             segment.start_ms = max(cursor_time, min(run_end_ms, left))
             segment.end_ms = max(segment.start_ms, min(run_end_ms, right))
             neighbouring = []
@@ -947,7 +1308,7 @@ def align_segments_from_silence(
                 neighbouring.append(boundaries[local_index - 1])
             if local_index < len(boundaries):
                 neighbouring.append(boundaries[local_index])
-            reliable = all(item[1] for item in neighbouring) if neighbouring else True
+            reliable = all(item.reliable for item in neighbouring) if neighbouring else True
             unreliable_streak = 0 if reliable else unreliable_streak + 1
             if unreliable_streak > 3:
                 original = segments[cursor_index + local_index]
@@ -957,7 +1318,7 @@ def align_segments_from_silence(
                 segment.status = original.status
                 stopped_early = True
                 break
-            score = mean(item[2] for item in neighbouring) if neighbouring else 0.7
+            score = mean(item.score for item in neighbouring) if neighbouring else 0.7
             duration_weight = weights[local_index] / max(1, sum(weights))
             expected = max(1, (run_end_ms - cursor_time) * duration_weight)
             ratio = min(expected, max(1, segment.end_ms - segment.start_ms)) / max(expected, max(1, segment.end_ms - segment.start_ms))

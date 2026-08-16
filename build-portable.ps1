@@ -125,7 +125,18 @@ try {
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
         throw "The build finished without producing: $executable"
     }
+    # PyInstaller 6 places collected data under _internal by default.  The
+    # runtime component catalog is intentionally writable and belongs beside
+    # the executable, so copy the source catalog into the portable layout
+    # explicitly instead of depending on PyInstaller's internal data layout.
+    $sourceRuntimeIndex = Join-Path $projectRoot "runtime-packages\runtime-index.json"
+    if (-not (Test-Path -LiteralPath $sourceRuntimeIndex -PathType Leaf)) {
+        throw "The source runtime index is missing: $sourceRuntimeIndex"
+    }
+    $runtimeDirectory = Join-Path $bundleDir "runtime-packages"
+    New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
     $runtimeIndex = Join-Path $bundleDir "runtime-packages\runtime-index.json"
+    Copy-Item -LiteralPath $sourceRuntimeIndex -Destination $runtimeIndex -Force
     if (-not (Test-Path -LiteralPath $runtimeIndex -PathType Leaf)) {
         throw "The build finished without the local runtime index: $runtimeIndex"
     }

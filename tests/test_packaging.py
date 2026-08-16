@@ -30,7 +30,8 @@ class PortablePackagingTests(unittest.TestCase):
         self.assertIn("AudioAlignTool.spec", script_text)
         self.assertIn("Compress-Archive", script_text)
         self.assertIn("COLLECT(", spec_text)
-        self.assertIn('"runtime-packages/runtime-index.json"', spec_text)
+        self.assertIn('"runtime-packages\\runtime-index.json"', script_text)
+        self.assertIn("Copy-Item -LiteralPath $sourceRuntimeIndex", script_text)
         self.assertIn('"pip"', spec_text)
         self.assertRegex(spec_text, re.compile(r"upx\s*=\s*False"))
 
@@ -82,6 +83,8 @@ class PortablePackagingTests(unittest.TestCase):
         self.assertIn("download.pytorch.org/whl/cpu", workflow_text)
         self.assertNotIn("-IncludeQwen", workflow_text)
         self.assertIn("AudioAlignTool-*-Windows-x64-*.zip", workflow_text)
+        self.assertEqual(1, workflow_text.count("concurrency:"))
+        self.assertLess(workflow_text.index("concurrency:"), workflow_text.index("jobs:"))
 
     def test_tag_build_publishes_the_portable_archive(self) -> None:
         workflow_text = (ROOT / ".github" / "workflows" / "windows-portable.yml").read_text(encoding="utf-8")

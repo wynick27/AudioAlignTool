@@ -18,7 +18,7 @@ try:
     from PySide6.QtCore import QItemSelectionModel, QPoint, QRect, Qt
     from PySide6.QtGui import QColor, QImage, QPainter
     from PySide6.QtWidgets import QApplication, QMessageBox
-    from audioalign.core.models import ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, BoundaryCandidate, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentOverlapPolicy, SegmentStatus, SilenceDisplayMode, TaskLane, TextAudioAnchor, TextSegment
+    from audioalign.core.models import ASRBackendId, ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, BoundaryCandidate, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentOverlapPolicy, SegmentStatus, SilenceDisplayMode, TaskLane, TextAudioAnchor, TextSegment
     from audioalign.core.paths import ApplicationPaths
     from audioalign.core.spectrogram import build_spectrogram_cache_from_slices
     from audioalign.core.storage import ProjectSession
@@ -29,6 +29,7 @@ try:
         WORKFLOW_FASTER_WHISPER,
         WORKFLOW_QWEN_ASR,
         WORKFLOW_QWEN_FORCED,
+        _asr_uses_silence_snap,
     )
     from audioalign.gui.mapping_dialog import ChapterAudioMappingDialog
     from audioalign.gui.segment_model import SegmentTableModel
@@ -43,6 +44,45 @@ except ImportError:
 
 @unittest.skipIf(QApplication is None, "PySide6 is not installed")
 class GuiSmokeTests(unittest.TestCase):
+    def test_qwen_asr_keeps_model_timestamps_and_manual_snap_is_directional(self) -> None:
+        self.assertFalse(_asr_uses_silence_snap(ASRBackendId.QWEN3_ASR))
+        self.assertTrue(_asr_uses_silence_snap(ASRBackendId.FASTER_WHISPER))
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("qwen-no-vad-shift", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "first", 300, 900),
+                TextSegment(None, chapter_id, 1, "second", 1_300, 1_900),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            window.silence_candidates = [
+                BoundaryCandidate(1_100, 0.95, start_ms=950, end_ms=1_250),
+            ]
+            tokens = [
+                ASRToken(None, chapter_id, 0, "first", 300, 900, 0.95),
+                ASRToken(None, chapter_id, 1, "second", 1_300, 1_900, 0.95),
+            ]
+
+            window._apply_recognition_tokens(
+                chapter_id, tokens,
+                SimpleNamespace(
+                    backend=ASRBackendId.QWEN3_ASR.value,
+                    model="Qwen3-ASR-0.6B",
+                    actual_device="cpu",
+                    compute_type="float32",
+                    device_name="",
+                    fallback_reason="",
+                ),
+            )
+
+            saved = session.repository.segments(chapter_id)
+            self.assertEqual((300, 900), (saved[0].start_ms, saved[0].end_ms))
+            self.assertEqual((1_300, 1_900), (saved[1].start_ms, saved[1].end_ms))
+            self.assertEqual(950, window._nearest_silence(1_000, "end"))
+            self.assertEqual(1_250, window._nearest_silence(1_200, "start"))
+            window.close()
+
     def test_segment_loop_uses_live_timing_but_manual_selection_is_fixed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("live-loop", Path(temporary) / "project")
@@ -849,6 +889,64 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual((100, 900), (aligned[0].start_ms, aligned[0].end_ms))
             self.assertEqual(SegmentStatus.LOW_CONFIDENCE, aligned[0].status)
             self.assertIn("部分完成", window.status_stage.text())
+            window.close()
+
+    def test_qwen_chapter_start_resynchronizes_without_language_special_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = ProjectSession.create("qwen-chapter-prefix", root / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "Two", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "Two"),
+                TextSegment(None, chapter_id, 1, "I"),
+                TextSegment(None, chapter_id, 2, "Outside Oakbridge station a little group stood waiting."),
+                TextSegment(None, chapter_id, 3, "Behind them stood porters with suitcases."),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            asset = AudioAsset(1, str(root / "audio.m4b"), duration_ms=20_000)
+            link = ChapterAudioLink(None, chapter_id, 1, 0, 0, 20_000, 1.0)
+            window.current_parts = [(link, asset, root / "audio.m4b", 0, 20_000)]
+            window.silence_candidates = [
+                BoundaryCandidate(8_000, 0.95, start_ms=7_500, end_ms=8_400),
+                BoundaryCandidate(14_000, 0.9, start_ms=13_500, end_ms=14_400),
+            ]
+
+            class ResynchronizingAligner:
+                def __init__(self):
+                    self.last_device_info = InferenceDeviceInfo(
+                        "qwen", "forced", actual_device="cpu", compute_type="float32"
+                    )
+
+                def align(self, _path, text, _language, chapter, _options, progress):
+                    progress(1.0, "done")
+                    if not text.startswith("Outside Oakbridge"):
+                        return []
+                    return [
+                        ASRToken(None, chapter, index, line, 300 + index * 2_000,
+                                 1_700 + index * 2_000, 0.9)
+                        for index, line in enumerate(text.splitlines())
+                    ]
+
+            ready = SimpleNamespace(runtime_available=True, cuda_available=True, message="ready")
+
+            def run_now(_name, function, finished, **_kwargs):
+                finished(function(lambda *_args: None))
+
+            with (
+                patch("audioalign.gui.main_window.runtime_status", return_value=ready),
+                patch("audioalign.gui.main_window.Qwen3ForcedAligner", ResynchronizingAligner),
+                patch.object(window, "_selected_language_code", return_value="en"),
+                patch.object(window.tasks, "submit", side_effect=run_now),
+                patch.object(window, "_show_error") as show_error,
+            ):
+                window.qwen_align_chapter()
+
+            aligned = session.repository.segments(chapter_id)
+            self.assertEqual(SegmentStatus.UNMATCHED, aligned[0].status)
+            self.assertEqual(SegmentStatus.UNMATCHED, aligned[1].status)
+            self.assertGreater(aligned[2].end_ms, aligned[2].start_ms)
+            show_error.assert_not_called()
             window.close()
 
     @classmethod

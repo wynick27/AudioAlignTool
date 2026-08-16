@@ -1,8 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import faulthandler
 import json
 import sys
+
+
+_CRASH_LOG = None
+
+
+def _enable_crash_diagnostics() -> None:
+    """Keep a useful traceback when a native model or driver terminates Python."""
+    global _CRASH_LOG
+    try:
+        from audioalign.core.paths import application_root
+
+        log_directory = application_root() / "logs"
+        log_directory.mkdir(parents=True, exist_ok=True)
+        _CRASH_LOG = (log_directory / "native-crash.log").open("a", encoding="utf-8")
+        faulthandler.enable(file=_CRASH_LOG, all_threads=True)
+    except (OSError, RuntimeError):
+        _CRASH_LOG = None
 
 
 def _runtime_probe(arguments: list[str]) -> int:
@@ -24,6 +42,7 @@ def _runtime_pip(arguments: list[str]) -> int:
 
 
 def main() -> int:
+    _enable_crash_diagnostics()
     if len(sys.argv) > 1 and sys.argv[1] == "--runtime-pip":
         return _runtime_pip(sys.argv[2:])
 

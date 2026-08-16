@@ -700,6 +700,30 @@ def _qwen_timestamp_value(value) -> int:
     return round(numeric * 1000)
 
 
+def _bounded_forced_alignment_tokens(
+    items,
+    chapter_id: int,
+    duration_ms: int | None,
+) -> list[ASRToken]:
+    """Clamp quantized model timestamps to the requested clip interval."""
+    tokens: list[ASRToken] = []
+    maximum = None if duration_ms is None else max(0, int(duration_ms))
+    for item in items or ():
+        start_ms = max(0, _qwen_timestamp_value(item.start_time))
+        end_ms = max(0, _qwen_timestamp_value(item.end_time))
+        if maximum is not None:
+            if start_ms >= maximum:
+                continue
+            end_ms = min(end_ms, maximum)
+        if end_ms <= start_ms:
+            continue
+        tokens.append(ASRToken(
+            None, chapter_id, len(tokens), str(item.text),
+            start_ms, end_ms, 0.9,
+        ))
+    return tokens
+
+
 def _qwen_vad_subchunk_ranges(
     samples,
     sample_rate: int,
@@ -915,9 +939,19 @@ class Qwen3ForcedAligner:
             if torch is not None:
                 try:
                     if torch.cuda.is_available() and torch.cuda.is_initialized():
+                        # Surface an asynchronous kernel error at the model
+                        # call boundary instead of during a later Qt event or
+                        # memory query, where it can look like a random exit.
+                        torch.cuda.synchronize()
                         torch.cuda.empty_cache()
                 except Exception:
                     pass
+
+    def close(self) -> None:
+        """Release the chapter-scoped model before another inference task starts."""
+        self._model = None
+        self._model_key = None
+        self.release_temporary_memory(aggressive=True)
 
     def align(
         self,
@@ -952,7 +986,7 @@ class Qwen3ForcedAligner:
             fallback_reason = load_fallback or fallback_reason
             self._model_key = (model_path, device, str(dtype))
         model = self._model
-        samples = results = None
+        samples = results = aligned_items = None
         try:
             samples, sample_rate = decode_audio_mono(
                 path, 16000, start_ms=options.clip_start_ms, end_ms=options.clip_end_ms,
@@ -961,6 +995,8 @@ class Qwen3ForcedAligner:
             try:
                 with torch.inference_mode():
                     results = model.align(audio=(samples, sample_rate), text=text, language=language_name)
+                    if device.startswith("cuda"):
+                        torch.cuda.synchronize()
             except Exception as exc:
                 if not device.startswith("cuda") or not _is_fatal_torch_cuda_error(exc):
                     raise
@@ -984,13 +1020,12 @@ class Qwen3ForcedAligner:
                     results = model.align(
                         audio=(samples, sample_rate), text=text, language=language_name,
                     )
-            tokens: list[ASRToken] = []
-            for item in results[0]:
-                tokens.append(ASRToken(
-                    None, chapter_id, len(tokens), str(item.text),
-                    _qwen_timestamp_value(item.start_time), _qwen_timestamp_value(item.end_time), 0.9,
-                ))
+            aligned_items = results[0] if results and results[0] else ()
+            tokens = _bounded_forced_alignment_tokens(
+                aligned_items, chapter_id, duration,
+            )
         finally:
+            aligned_items = None
             results = None
             samples = None
         device_name = ""

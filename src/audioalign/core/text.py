@@ -635,6 +635,17 @@ _CLOSERS = set("”’」』】》）)]}\"")
 _OPENING_QUOTES = set("‘“「『《〈«‹\"")
 _CURSOR_TRAILING_PUNCTUATION = _STRONG_END | _WEAK_END | _CLOSERS | {"."}
 
+# Titles and name prefixes cannot terminate a sentence while another lexical
+# item follows. Keep this deliberately language-neutral at the call site: the
+# list only handles Latin-script abbreviations whose trailing period would
+# otherwise be mistaken for a strong English sentence boundary.
+_NON_TERMINAL_ABBREVIATIONS = frozenset({
+    "adm", "brig", "capt", "cmdr", "col", "cpl", "det", "dr", "fr", "gen",
+    "gov", "hon", "insp", "lt", "maj", "miss", "mlle", "mme", "mmes", "mr",
+    "mrs", "ms", "mt", "pres", "prof", "pvt", "rep", "rev", "sen", "sgt",
+    "sr", "st", "supt",
+})
+
 
 def _has_text(value: str) -> bool:
     return any(unicodedata.category(char)[0] in {"L", "N"} for char in value)
@@ -646,6 +657,47 @@ def _measure(value: str, cjk: bool) -> int:
     return len(re.findall(r"\b[\w'’-]+\b", value, re.UNICODE))
 
 
+def _period_is_sentence_boundary(paragraph: str, index: int) -> bool:
+    """Return whether a period is prose punctuation rather than an abbreviation."""
+    if index <= 0:
+        return True
+    if (
+        index + 1 < len(paragraph)
+        and paragraph[index - 1].isdigit()
+        and paragraph[index + 1].isdigit()
+    ):
+        return False
+    following = index + 1
+    while following < len(paragraph) and paragraph[following].isspace():
+        following += 1
+    if following >= len(paragraph):
+        return True
+    before = paragraph[:index]
+    word_match = re.search(r"([^\W\d_]+)$", before, re.UNICODE)
+    word = word_match.group(1) if word_match else ""
+    folded = word.casefold()
+    if folded in _NON_TERMINAL_ABBREVIATIONS:
+        if folded == "miss" and re.search(
+            rf",\s*{re.escape(word)}$", before, re.IGNORECASE,
+        ):
+            return True
+        return False
+    # Personal initials (``H. Poirot``, ``J. R. R. Tolkien``) and dotted
+    # initialisms must remain attached to the following name. A standalone
+    # Roman-numeral heading at paragraph end is still handled as a boundary.
+    if (
+        len(word) == 1 and word.isalpha() and word != "I"
+        and paragraph[following].isalpha()
+    ):
+        return False
+    if re.search(r"(?:\b[^\W\d_]\.)+[^\W\d_]$", before, re.UNICODE):
+        return False
+    return (
+        paragraph[index + 1].isspace()
+        or paragraph[index + 1] in _OPENING_QUOTES
+    )
+
+
 def _strong_sentence_pieces(paragraph: str) -> list[tuple[str, int, int]]:
     pieces: list[tuple[str, int, int]] = []
     start = 0
@@ -654,11 +706,7 @@ def _strong_sentence_pieces(paragraph: str) -> list[tuple[str, int, int]]:
         char = paragraph[index]
         boundary = char in _STRONG_END
         if char == ".":
-            boundary = (
-                index + 1 == len(paragraph)
-                or paragraph[index + 1].isspace()
-                or paragraph[index + 1] in _OPENING_QUOTES
-            )
+            boundary = _period_is_sentence_boundary(paragraph, index)
         if boundary:
             end = index + 1
             while end < len(paragraph) and paragraph[end] in _CLOSERS:

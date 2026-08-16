@@ -16,6 +16,7 @@ from audioalign.core.asr import (
     InferenceMemoryPressureError,
     QWEN_MAX_NEW_TOKENS,
     Qwen3ASRTranscriber,
+    _bounded_forced_alignment_tokens,
     _ensure_qwen_model,
     _qwen_device,
     plan_audio_chunks,
@@ -42,7 +43,23 @@ class _Segment:
     text = "hello"
 
 
+class _AlignedItem:
+    def __init__(self, text: str, start: float, end: float) -> None:
+        self.text = text
+        self.start_time = start
+        self.end_time = end
+
+
 class ASRTests(unittest.TestCase):
+    def test_forced_alignment_tail_is_bounded_to_requested_m4b_clip(self) -> None:
+        tokens = _bounded_forced_alignment_tokens([
+            _AlignedItem("last", 29.4, 30.24),
+            _AlignedItem("outside", 30.0, 30.3),
+            _AlignedItem("zero", 11.2, 11.2),
+        ], 7, 29_808)
+        self.assertEqual(1, len(tokens))
+        self.assertEqual((29_400, 29_808), (tokens[0].start_ms, tokens[0].end_ms))
+
     def test_qwen_splits_over_limit_outer_chunk_at_vad_silence(self) -> None:
         calls: list[int] = []
         load_options: list[dict] = []

@@ -74,11 +74,17 @@ from audioalign.core.alignment import (
     ForcedAlignmentPlannerOptions,
     ForcedAlignmentRunResult,
     forced_alignment_overlap_score,
+    forced_alignment_has_usable_coverage,
+    forced_alignment_candidate_can_end_search,
+    forced_alignment_hypothesis_priority,
+    partition_monotonic_alignment_rows,
+    estimate_spoken_duration_ms,
     forced_alignment_text_group_ends,
     forced_alignment_window_ends,
     locate_contiguous_audio_part,
     progressive_vad_next_start,
     segments_from_asr_tokens,
+    silence_boundary_edges,
     snap_boundaries,
     score_forced_alignment_hypothesis,
     spoken_unit_count,
@@ -187,6 +193,13 @@ WORKFLOW_FASTER_WHISPER = "faster-whisper-asr-align"
 WORKFLOW_WHISPERX = "whisperx-asr-align"
 WORKFLOW_QWEN_ASR = "qwen3-asr-align"
 WORKFLOW_QWEN_FORCED = "qwen3-forced-align"
+
+
+def _asr_uses_silence_snap(backend: ASRBackendId | str | None) -> bool:
+    """Qwen3-ASR timestamps are model output and must not be VAD-shifted."""
+    if isinstance(backend, ASRBackendId):
+        backend = backend.value
+    return backend != ASRBackendId.QWEN3_ASR.value
 
 WHISPER_LANGUAGE_CODES = (
     "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs", "ca", "cs", "cy",
@@ -2552,7 +2565,11 @@ class MainWindow(QMainWindow):
 
         database = Path(self.session.repository.database)
         alignment_language = options.language or self.session.manifest.language
-        alignment_algorithm = f"monotonic-dp-v2:{alignment_language or 'auto'}"
+        snap_asr_boundaries = _asr_uses_silence_snap(options.backend)
+        boundary_policy = "vad-directional-v3" if snap_asr_boundaries else "model-timestamps-v1"
+        alignment_algorithm = (
+            f"monotonic-dp-v3:{alignment_language or 'auto'}:{boundary_policy}"
+        )
         total_chapters = len(prepared)
         self._mark_dirty()
 
@@ -2711,11 +2728,16 @@ class MainWindow(QMainWindow):
                     # contain exactly this recognition result. Register it without
                     # repeating the expensive dynamic-programming match.
                     published_tokens = repository.asr_tokens(chapter_id) if used_cache else []
-                    already_published = bool(current) and len(published_tokens) == len(tokens) and all(
-                        left.text == right.text
-                        and left.start_ms == right.start_ms
-                        and left.end_ms == right.end_ms
-                        for left, right in zip(published_tokens, tokens)
+                    already_published = (
+                        snap_asr_boundaries
+                        and bool(current)
+                        and len(published_tokens) == len(tokens)
+                        and all(
+                            left.text == right.text
+                            and left.start_ms == right.start_ms
+                            and left.end_ms == right.end_ms
+                            for left, right in zip(published_tokens, tokens)
+                        )
                     )
                     if already_published:
                         repository.record_alignment_run(
@@ -2740,7 +2762,7 @@ class MainWindow(QMainWindow):
                         if not current or _are_unedited_asr_segments(current)
                         else align_segments_to_tokens(current, tokens, language=alignment_language)
                     )
-                    if candidates:
+                    if candidates and snap_asr_boundaries:
                         aligned = snap_boundaries(
                             aligned, candidates,
                             window_ms=settings.snap_window_ms,
@@ -2821,7 +2843,9 @@ class MainWindow(QMainWindow):
             if not current or _are_unedited_asr_segments(current)
             else align_segments_to_tokens(current, tokens, language=self.session.manifest.language)
         )
-        if self.silence_candidates:
+        if self.silence_candidates and _asr_uses_silence_snap(
+            getattr(run, "backend", None),
+        ):
             settings = self._silence_settings()
             aligned = snap_boundaries(
                 aligned, self.silence_candidates,
@@ -3132,8 +3156,6 @@ class MainWindow(QMainWindow):
         chapter_id = self.current_chapter_id
         parts = list(self.current_parts)
         candidates = list(self.silence_candidates)
-        padding_ms = self.padding_spin.value()
-        min_silence_ms = self.min_silence_spin.value()
         planner = ForcedAlignmentPlannerOptions()
         source_ranges: dict[int, tuple[int, int]] = {}
         source_cursor = 0
@@ -3142,6 +3164,18 @@ class MainWindow(QMainWindow):
             source_cursor += len(segment.text)
 
         def job(progress):
+            progress_sink = progress
+            highest_progress = 0.0
+
+            def monotonic_progress(value: float, message: str) -> None:
+                nonlocal highest_progress
+                if value >= 0:
+                    highest_progress = max(highest_progress, min(1.0, value))
+                progress_sink(highest_progress, message)
+
+            # Candidate fallback and overlap revalidation may revisit earlier
+            # rows, but the user-visible total must never move backwards.
+            progress = monotonic_progress
             aligner = Qwen3ForcedAligner()
             blocks: list[ForcedAlignmentBlockResult] = []
             observed_rate: float | None = None
@@ -3152,6 +3186,7 @@ class MainWindow(QMainWindow):
             pending_alternatives: list[ForcedAlignmentHypothesis] = []
             backtracks = 0
             stopped_reason = ""
+            model_call_count = 0
 
             def locate_part(milliseconds: int):
                 return locate_contiguous_audio_part(parts, milliseconds)
@@ -3161,8 +3196,9 @@ class MainWindow(QMainWindow):
                 audio_start: int,
                 *,
                 trial_label: str = "",
+                trial_budget_override: int | None = None,
             ) -> list[ForcedAlignmentHypothesis]:
-                nonlocal observed_rate
+                nonlocal observed_rate, model_call_count
                 part, audio_start = locate_part(audio_start)
                 if part is None or audio_start >= limit_ms:
                     return []
@@ -3184,18 +3220,55 @@ class MainWindow(QMainWindow):
                 )
                 hypotheses: list[ForcedAlignmentHypothesis] = []
                 trial_count = 0
-                trial_budget = 6
+                trial_budget = trial_budget_override or planner.candidate_trial_budget
+                stable_candidates = 0
+                stop_trials = False
+                planned_groups: list[tuple[
+                    int, list[TextSegment], str, int, list[tuple[int, bool]],
+                ]] = []
                 for group_end in group_ends:
                     group = segments[block_start:group_end]
+                    # Keep explicit sentence boundaries for the aligner. Bad
+                    # historical abbreviation splits are repaired at the text
+                    # layer instead of weakening every model input boundary.
                     combined_text = "\n".join(item.text for item in group if item.text.strip())
                     if not combined_text:
                         continue
+                    # The production forced-alignment path deliberately does
+                    # not consult ASR or an existing/manual timeline.  Its only
+                    # time cursor is the end proven by the previous forced-
+                    # alignment block; VAD may suggest a window end, never a
+                    # replacement start.
+                    trial_audio_start = audio_start
+                    if not local_start <= trial_audio_start < block_limit:
+                        continue
                     window_ends = forced_alignment_window_ends(
-                        audio_start, block_limit, combined_text, candidates,
+                        trial_audio_start, block_limit, combined_text, candidates,
                         language=language, observed_ms_per_unit=observed_rate,
+                        expected_duration_ms=sum(
+                            estimate_spoken_duration_ms(
+                                item.text, language, observed_rate,
+                            )
+                            for item in group if item.text.strip()
+                        ),
                         options=planner,
                     )
-                    for audio_end, weak_boundary in window_ends:
+                    if window_ends:
+                        planned_groups.append(
+                            (group_end, group, combined_text, trial_audio_start, window_ends)
+                        )
+                # Try the best VAD end for every nearby text end before trying
+                # a second audio end for the first text block. Previously one
+                # over-sized block could consume the entire trial budget and
+                # the model-capacity-safe shorter alternatives were never run.
+                maximum_window_count = max(
+                    (len(item[4]) for item in planned_groups), default=0,
+                )
+                for window_rank in range(maximum_window_count):
+                    for group_end, group, combined_text, trial_audio_start, window_ends in planned_groups:
+                        if window_rank >= len(window_ends):
+                            continue
+                        audio_end, weak_boundary = window_ends[window_rank]
                         if trial_count >= trial_budget:
                             break
                         trial_count += 1
@@ -3209,10 +3282,12 @@ class MainWindow(QMainWindow):
                             model="Qwen3-ForcedAligner-0.6B",
                             language=language,
                             model_root=str(self.paths.models),
-                            clip_start_ms=link.source_start_ms + audio_start - local_start,
+                            clip_start_ms=link.source_start_ms + trial_audio_start - local_start,
                             clip_end_ms=link.source_start_ms + audio_end - local_start,
                         )
                         try:
+                            ensure_inference_memory_headroom(aligner)
+                            model_call_count += 1
                             tokens = aligner.align(
                                 path, combined_text, language, chapter_id, options,
                                 lambda _value, message: progress(
@@ -3222,12 +3297,28 @@ class MainWindow(QMainWindow):
                             )
                         except ValueError:
                             continue
+                        finally:
+                            # Qwen's forced-aligner creates sizeable temporary
+                            # tensors for every alternative.  A real chapter
+                            # can contain hundreds of source segments, so do a
+                            # bounded cleanup periodically rather than letting
+                            # candidate trials accumulate until Windows kills
+                            # the process.
+                            release_inference_memory(
+                                aligner, aggressive=bool(model_call_count and model_call_count % 4 == 0),
+                            )
                         if not tokens:
                             continue
                         aligned_local = align_segments_to_tokens(group, tokens, language=language)
+                        if not forced_alignment_has_usable_coverage(aligned_local):
+                            # A long unmatched suffix is model/text-context
+                            # truncation and consumes no source rows. Small
+                            # internal holes are legitimate edition or heading
+                            # differences and do not poison later sentences.
+                            continue
                         score, reasons, _measured_rate = score_forced_alignment_hypothesis(
                             aligned_local, tokens,
-                            audio_start_ms=audio_start,
+                            audio_start_ms=trial_audio_start,
                             audio_end_ms=audio_end,
                             candidates=candidates,
                             language=language,
@@ -3239,8 +3330,16 @@ class MainWindow(QMainWindow):
                         aligned_absolute = copy.deepcopy(aligned_local)
                         absolute_tokens = copy.deepcopy(tokens)
                         for segment in aligned_absolute:
-                            segment.start_ms += audio_start
-                            segment.end_ms += audio_start
+                            # Keep even an unmatched row in chapter-absolute
+                            # coordinates.  Previously its zero-length local
+                            # timestamp could become the next block's cursor and
+                            # reset a chapter back toward its beginning.
+                            segment.start_ms += trial_audio_start
+                            segment.end_ms += trial_audio_start
+                            if segment.end_ms <= segment.start_ms:
+                                segment.confidence = 0.0
+                                segment.status = SegmentStatus.UNMATCHED
+                                continue
                             segment.confidence = score
                             segment.status = (
                                 SegmentStatus.AUTO
@@ -3248,15 +3347,28 @@ class MainWindow(QMainWindow):
                                 else SegmentStatus.LOW_CONFIDENCE
                             )
                         for token in absolute_tokens:
-                            token.start_ms += audio_start
-                            token.end_ms += audio_start
+                            token.start_ms += trial_audio_start
+                            token.end_ms += trial_audio_start
                         hypotheses.append(ForcedAlignmentHypothesis(
-                            block_start, group_end, audio_start, audio_end,
+                            block_start, group_end, trial_audio_start, audio_end,
                             aligned_absolute, absolute_tokens, score, reasons, weak_boundary,
                         ))
-                    if trial_count >= trial_budget:
+                        if forced_alignment_candidate_can_end_search(
+                            aligned_local, score,
+                            stable_score=planner.stable_score,
+                        ):
+                            stable_candidates += 1
+                            if stable_candidates >= planner.stable_candidates_required:
+                                stop_trials = True
+                                break
+                    if trial_count >= trial_budget or stop_trials:
                         break
-                hypotheses.sort(key=lambda item: item.score, reverse=True)
+                hypotheses.sort(
+                    key=lambda item: forced_alignment_hypothesis_priority(
+                        item, stable_score=planner.stable_score,
+                    ),
+                    reverse=True,
+                )
                 return hypotheses[:planner.beam_width]
 
             def append_block(hypothesis: ForcedAlignmentHypothesis, status: str) -> None:
@@ -3282,9 +3394,10 @@ class MainWindow(QMainWindow):
                     if current.end_ms <= current.start_ms or current.end_ms < cursor_ms:
                         stopped_reason = f"第 {segment_index + 1} 句是无可用时间的锁定锚点"
                         break
-                    cursor_ms = progressive_vad_next_start(
-                        current.end_ms, candidates, padding_ms=padding_ms, limit_ms=limit_ms,
-                    )
+                    # A locked segment is already an explicit hard anchor. Its
+                    # confirmed end, rather than a nearby VAD pause, owns the
+                    # next audio cursor.
+                    cursor_ms = current.end_ms
                     segment_index += 1
                     continue
                 if not current.text.strip():
@@ -3293,21 +3406,40 @@ class MainWindow(QMainWindow):
 
                 hypotheses = build_hypotheses(segment_index, cursor_ms)
                 if not hypotheses:
-                    recovery_starts = [
-                        (candidate.end_ms or candidate.time_ms) + padding_ms
-                        for candidate in key_silence_candidates(candidates, min_silence_ms)
-                        if cursor_ms < (candidate.end_ms or candidate.time_ms) + padding_ms
-                        <= min(limit_ms, cursor_ms + planner.recovery_search_ms)
-                    ][:3]
-                    for recovery_start in recovery_starts:
-                        hypotheses = build_hypotheses(
-                            segment_index, recovery_start, trial_label=" · 重新同步",
-                        )
-                        if hypotheses:
-                            for hypothesis in hypotheses:
-                                hypothesis.score = min(hypothesis.score, planner.stable_score - 0.01)
-                                hypothesis.reasons = (*hypothesis.reasons, "从后续强静音重新同步")
+                    # Source-side differences (an unspoken heading, edition
+                    # sentence, etc.) may be skipped locally, but the audio
+                    # cursor is immutable until a real alignment proves its
+                    # next position.  Never search forward through VAD starts:
+                    # that was the cause of repeated 50–90 second jumps.
+                    maximum_skip = min(
+                        planner.leading_text_search_segments,
+                        len(segments) - segment_index - 1,
+                    )
+                    for skipped in range(1, maximum_skip + 1):
+                        candidate_start = segment_index + skipped
+                        if any(item.locked for item in segments[segment_index:candidate_start]):
                             break
+                        hypotheses = build_hypotheses(
+                            candidate_start, cursor_ms,
+                            trial_label=" · 同一音频位置跳过不一致文本",
+                            trial_budget_override=2,
+                        )
+                        if not hypotheses:
+                            continue
+                        blocks.append(ForcedAlignmentBlockResult(
+                            segment_index, candidate_start,
+                            "failed", [], None,
+                            "局部文本与音频不一致；音频游标未前移",
+                        ))
+                        segment_index = candidate_start
+                        for hypothesis in hypotheses:
+                            hypothesis.score = min(
+                                hypothesis.score, planner.stable_score - 0.01,
+                            )
+                            hypothesis.reasons = (
+                                *hypothesis.reasons, "跳过局部源文本后在同一音频位置重新同步",
+                            )
+                        break
                 if not hypotheses:
                     if pending is not None:
                         pending.score = min(pending.score, planner.stable_score - 0.01)
@@ -3360,39 +3492,16 @@ class MainWindow(QMainWindow):
                             None,
                         )
                     if matched is None:
-                        recovered: list[ForcedAlignmentHypothesis] = []
-                        recovery_starts = [
-                            (candidate.end_ms or candidate.time_ms) + padding_ms
-                            for candidate in key_silence_candidates(candidates, min_silence_ms)
-                            if cursor_ms < (candidate.end_ms or candidate.time_ms) + padding_ms
-                            <= min(limit_ms, cursor_ms + planner.recovery_search_ms)
-                        ][:3]
-                        for recovery_start in recovery_starts:
-                            recovered = build_hypotheses(
-                                segment_index, recovery_start,
-                                trial_label=" · 漂移后重新同步",
-                            )
-                            if recovered:
-                                break
-                        if not recovered:
-                            pending.score = min(pending.score, planner.stable_score - 0.01)
-                            pending.reasons = (*pending.reasons, "与后续重叠块时间不一致")
-                            append_block(pending, "review")
-                            blocks.append(ForcedAlignmentBlockResult(
-                                segment_index,
-                                min(len(segments), segment_index + planner.minimum_segments),
-                                "failed", [], None, "重叠句验证失败",
-                            ))
-                            stopped_reason = f"第 {segment_index + 1} 句附近发生持续漂移"
-                            break
                         pending.score = min(pending.score, planner.stable_score - 0.01)
-                        pending.reasons = (*pending.reasons, "与后续块不一致，已重新同步")
+                        pending.reasons = (*pending.reasons, "与后续验证块不一致")
                         append_block(pending, "review")
-                        pending = recovered[0]
-                        pending.score = min(pending.score, planner.stable_score - 0.01)
-                        pending.reasons = (*pending.reasons, "从后续强静音重新同步")
-                        pending_alternatives = recovered[1:]
-                        backtracks = 0
+                        blocks.append(ForcedAlignmentBlockResult(
+                            segment_index,
+                            min(len(segments), segment_index + planner.minimum_segments),
+                            "failed", [], None, "验证失败；禁止向后跳过音频",
+                        ))
+                        stopped_reason = f"第 {segment_index + 1} 句附近无法在当前音频游标继续"
+                        break
                     else:
                         overlap_score = forced_alignment_overlap_score(
                             pending, matched, overlap_segments=planner.overlap_segments,
@@ -3409,9 +3518,17 @@ class MainWindow(QMainWindow):
                         pending = matched
                         pending_alternatives = [item for item in hypotheses if item is not matched]
 
-                units = sum(spoken_unit_count(item.text, language) for item in pending.segments)
+                timed_pending = [
+                    item for item in pending.segments if item.end_ms > item.start_ms
+                ]
+                if not timed_pending:
+                    append_block(pending, "review")
+                    stopped_reason = f"第 {pending.start_index + 1} 句附近没有有效时间"
+                    pending = None
+                    break
+                units = sum(spoken_unit_count(item.text, language) for item in timed_pending)
                 measured_rate = (
-                    pending.segments[-1].end_ms - pending.segments[0].start_ms
+                    timed_pending[-1].end_ms - timed_pending[0].start_ms
                 ) / max(1, units)
                 observed_rate = measured_rate if observed_rate is None else observed_rate * 0.7 + measured_rate * 0.3
                 if pending.end_index >= len(segments):
@@ -3425,10 +3542,10 @@ class MainWindow(QMainWindow):
                 overlap = min(planner.overlap_segments, len(pending.segments) - 1)
                 if overlap <= 0:
                     append_block(pending, "review" if pending.score < planner.stable_score else "stable")
-                    cursor_ms = progressive_vad_next_start(
-                        pending.segments[-1].end_ms, candidates,
-                        padding_ms=padding_ms, limit_ms=limit_ms,
-                    )
+                    # Qwen3-aligner-style strict cursor: only a model-confirmed
+                    # sentence end may advance audio. VAD is allowed to choose
+                    # a trial window end, never the next window start.
+                    cursor_ms = timed_pending[-1].end_ms
                     segment_index = pending.end_index
                     pending = None
                 else:
@@ -3443,7 +3560,8 @@ class MainWindow(QMainWindow):
             aligned_rows = {
                 block.start_index + offset
                 for block in blocks if block.selected is not None
-                for offset in range(len(block.selected.segments))
+                for offset, segment in enumerate(block.selected.segments)
+                if segment.end_ms > segment.start_ms
             }
             review_rows = {
                 block.start_index + offset
@@ -3456,9 +3574,13 @@ class MainWindow(QMainWindow):
                 for index in range(block.start_index, block.end_index)
             )
             progress(1.0, f"Qwen {scope}块级对齐结束 · 完成 {len(aligned_rows)} 句")
+            device = aligner.last_device_info
+            close_aligner = getattr(aligner, "close", None)
+            if callable(close_aligner):
+                close_aligner()
             return ForcedAlignmentRunResult(
                 blocks, len(aligned_rows), len(review_rows), stopped_reason,
-            ), aligner.last_device_info
+            ), device
 
         def done(payload):
             if not self.session or self.current_chapter_id != chapter_id:
@@ -3480,6 +3602,11 @@ class MainWindow(QMainWindow):
                     row_index = block.start_index + offset
                     if not 0 <= row_index < len(updated) or updated[row_index].locked:
                         continue
+                    if aligned_segment.end_ms <= aligned_segment.start_ms:
+                        # Retain the original unmatched source text. A visual
+                        # heading omitted by the narrator must never become a
+                        # zero-duration AUTO segment at the block start.
+                        continue
                     replacement = copy.deepcopy(aligned_segment)
                     if block.status == "review":
                         replacement.status = SegmentStatus.LOW_CONFIDENCE
@@ -3490,8 +3617,29 @@ class MainWindow(QMainWindow):
                         token for token in block.selected.tokens
                         if token.end_ms > replacement.start_ms and token.start_ms < replacement.end_ms
                     ]
-                    final_rows[row_index] = (replacement, overlapping_tokens)
+                    # Overlap validates the next block; it is not a second
+                    # writer. The earlier confirmed block owns the shared rows.
+                    # Letting a later candidate overwrite them made one local
+                    # mismatch repeatedly pull paragraphs toward chapter start.
+                    final_rows.setdefault(row_index, (replacement, overlapping_tokens))
                     affected.add(row_index)
+            _accepted_rows, regressive_rows = partition_monotonic_alignment_rows(
+                [(row_index, replacement) for row_index, (replacement, _tokens) in final_rows.items()]
+            )
+            for row_index in regressive_rows:
+                final_rows.pop(row_index, None)
+                affected.discard(row_index)
+            if regressive_rows:
+                first_regression = min(regressive_rows)
+                result.review_count += len(regressive_rows)
+                regression_message = (
+                    f"第 {first_regression + 1} 句返回时间早于已确认游标；"
+                    f"已拒绝 {len(regressive_rows)} 个倒退结果"
+                )
+                result.stopped_reason = (
+                    f"{result.stopped_reason}；{regression_message}"
+                    if result.stopped_reason else regression_message
+                )
             for row_index, (replacement, _tokens) in final_rows.items():
                 target = updated[row_index]
                 target.start_ms = replacement.start_ms
@@ -3519,7 +3667,11 @@ class MainWindow(QMainWindow):
                     anchor.method = "qwen-forced-aligner-block"
                 new_anchors.extend(generated)
             if not affected:
-                self._show_error(result.stopped_reason or "强制对齐没有生成可应用结果")
+                self.model_status_label.setText(device.display_text)
+                self.status_stage.setText(
+                    f"Qwen {scope}未能建立首个稳定块 · 原数据已保留 · "
+                    f"{result.stopped_reason or '请从正文句和对应音频位置建立锚点后重试'}"
+                )
                 return
             self._push_history()
             self.session.repository.replace_chapter_edit_state(
@@ -3853,10 +4005,15 @@ class MainWindow(QMainWindow):
             self.snap_spin.value(),
         )
 
-    def _nearest_silence(self, milliseconds: int) -> int:
+    def _nearest_silence(self, milliseconds: int, kind: str) -> int:
         window = self.snap_spin.value()
-        candidates = [candidate.time_ms for candidate in self.silence_candidates if abs(candidate.time_ms - milliseconds) <= window]
-        return min(candidates, key=lambda value: abs(value - milliseconds)) if candidates else milliseconds
+        targets = []
+        for candidate in self.silence_candidates:
+            previous_end, following_start = silence_boundary_edges(candidate)
+            target = following_start if kind == "start" else previous_end
+            if abs(target - milliseconds) <= window:
+                targets.append(target)
+        return min(targets, key=lambda value: abs(value - milliseconds)) if targets else milliseconds
 
     def _overlap_policy(self) -> SegmentOverlapPolicy:
         value = self.overlap_policy_combo.currentData() if hasattr(self, "overlap_policy_combo") else None
@@ -3924,7 +4081,7 @@ class MainWindow(QMainWindow):
         if segment.locked:
             return
         selection_follows, manual_play_follows = self._ranges_follow_segment(segment)
-        value = self._nearest_silence(milliseconds) if snap else milliseconds
+        value = self._nearest_silence(milliseconds, kind) if snap else milliseconds
         if kind == "start":
             segment.start_ms = max(0, min(segment.end_ms, value))
         else:
