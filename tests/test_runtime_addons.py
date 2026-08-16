@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 import tempfile
 import unittest
@@ -7,8 +9,12 @@ from pathlib import Path
 import sys
 from unittest.mock import patch
 
+from audioalign.__main__ import _runtime_probe
+from audioalign.core.asr import RuntimeStatus
 from audioalign.core.paths import ApplicationPaths
 from audioalign.core.runtime_addons import (
+    RuntimeComponent,
+    _install_pypi_packages,
     component_manifest,
     install_runtime_component,
     load_active_runtimes,
@@ -20,6 +26,54 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RuntimeAddonTests(unittest.TestCase):
+    def test_runtime_probe_uses_codepage_independent_ascii_json(self) -> None:
+        status = RuntimeStatus(
+            False, False, False, False,
+            "模型 Qwen3-ASR-0.6B 尚未下载",
+            "qwen3-asr",
+        )
+        output = io.StringIO()
+        with patch("audioalign.core.asr.runtime_status", return_value=status):
+            with redirect_stdout(output):
+                result = _runtime_probe(["qwen3-asr", "Qwen3-ASR-0.6B", "models"])
+
+        self.assertEqual(0, result)
+        encoded = output.getvalue().strip()
+        encoded.encode("ascii")
+        self.assertEqual(status.message, json.loads(encoded)["message"])
+
+    def test_pip_installer_passes_environment_with_subprocess_env(self) -> None:
+        component = RuntimeComponent(
+            id="test-win-x64",
+            group="test",
+            variant="cpu",
+            display_name="Test",
+            packages=("example-package==1.0",),
+        )
+        captured: dict[str, object] = {}
+
+        class FakeProcess:
+            stdout = ["installed\n"]
+
+            @staticmethod
+            def wait() -> int:
+                return 0
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            captured.update(kwargs)
+            return FakeProcess()
+
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("audioalign.core.runtime_addons.subprocess.Popen", fake_popen):
+                _install_pypi_packages(component, Path(folder), None)
+
+        self.assertNotIn("environment", captured)
+        environment = captured["env"]
+        self.assertIsInstance(environment, dict)
+        self.assertEqual("1", environment["PYTHONUTF8"])
+        self.assertEqual("1", environment["PIP_NO_INPUT"])
+
     def test_bundled_index_uses_package_sources_and_no_github_assets(self) -> None:
         index_path = ROOT / "runtime-packages" / "runtime-index.json"
         payload = json.loads(index_path.read_text(encoding="utf-8"))

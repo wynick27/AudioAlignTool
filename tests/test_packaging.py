@@ -33,6 +33,7 @@ class PortablePackagingTests(unittest.TestCase):
         self.assertIn('"runtime-packages\\runtime-index.json"', script_text)
         self.assertIn("Copy-Item -LiteralPath $sourceRuntimeIndex", script_text)
         self.assertIn('"pip"', spec_text)
+        self.assertIn('module_collection_mode={"pip": "py"}', spec_text)
         self.assertRegex(spec_text, re.compile(r"upx\s*=\s*False"))
 
     def test_runtime_catalog_is_local_and_not_a_github_release_index(self) -> None:

@@ -30,12 +30,25 @@ def _runtime_probe(arguments: list[str]) -> int:
 
     backend, model, model_root = arguments
     status = runtime_status(model, model_root, backend)
-    print(json.dumps(asdict(status), ensure_ascii=False), flush=True)
+    # Frozen windowed applications can ignore PYTHONIOENCODING and attach
+    # stdout using the active Windows code page.  An ASCII-only JSON envelope
+    # keeps the probe protocol independent of either process' text encoding;
+    # json.loads restores the original Unicode message in the GUI process.
+    print(json.dumps(asdict(status), ensure_ascii=True), flush=True)
     return 0
 
 
 def _runtime_pip(arguments: list[str]) -> int:
     """Private entry point used by the frozen app's runtime installer."""
+    if getattr(sys, "frozen", False):
+        # distlib's registry knows the standard source/zip loaders but not
+        # PyInstaller's frozen loader.  Register its public filesystem finder
+        # before importing pip's CLI, which imports distlib.scripts and scans
+        # the bundled Windows launcher stubs immediately.
+        import pip._vendor.distlib as distlib
+        from pip._vendor.distlib import resources
+
+        resources.register_finder(distlib.__loader__, resources.ResourceFinder)
     from pip._internal.cli.main import main as pip_main
 
     return int(pip_main(arguments))

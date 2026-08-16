@@ -194,7 +194,7 @@ def _install_pypi_packages(
         encoding="utf-8",
         errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        environment=environment,
+        env=environment,
     )
     recent: list[str] = []
     if process.stdout is not None:

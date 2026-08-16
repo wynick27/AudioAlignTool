@@ -80,6 +80,10 @@ a = Analysis(
     hiddenimports=hiddenimports,
     excludes=excludes,
     noarchive=False,
+    # pip's vendored distlib enumerates its Windows launcher resources through
+    # the package loader.  Keeping pip outside PYZ gives it a standard file
+    # loader and leaves the bundled --runtime-pip entry point self-contained.
+    module_collection_mode={"pip": "py"},
 )
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="AudioAlignTool", console=False)
