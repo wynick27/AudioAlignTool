@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -62,6 +63,8 @@ class ChapterAudioMappingDialog(QDialog):
         }
         self._next_temporary_id = -1
         self._next_temporary_chapter_id = -1
+        self._audio_only_offer_shown = False
+        self.created_audio_only_chapters = 0
         self.choices: list[AudioSlice] = []
 
         layout = QVBoxLayout(self)
@@ -70,6 +73,26 @@ class ChapterAudioMappingDialog(QDialog):
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
+        source_options = QHBoxLayout()
+        source_options.addWidget(QLabel("原文解析："))
+        self.anki_furigana_check = QCheckBox("Anki Furigana：漢字[かな] 显示为上方假名")
+        self.anki_furigana_check.setChecked(bool(session.manifest.anki_furigana))
+        self.anki_furigana_check.setToolTip(
+            "影响之后导入的 TXT、Markdown、HTML 或 EPUB；原始文件不会被修改，匹配时忽略方括号中的读音。"
+        )
+        source_options.addWidget(self.anki_furigana_check)
+        source_options.addStretch(1)
+        layout.addLayout(source_options)
+        self.audio_only_hint = QLabel(
+            "当前项目没有文本章节。添加媒体后可按每个文件或 M4B 内嵌章节建立空白章节，"
+            "应用后运行“识别并对齐”即可直接从音频生成文本。"
+        )
+        self.audio_only_hint.setWordWrap(True)
+        self.audio_only_hint.setStyleSheet(
+            "QLabel { background:#fff4ce; border:1px solid #d6b656; padding:7px; }"
+        )
+        self.audio_only_hint.setVisible(not self.chapters)
+        layout.addWidget(self.audio_only_hint)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         media_panel = QWidget()
@@ -82,7 +105,7 @@ class ChapterAudioMappingDialog(QDialog):
             ("上移", lambda: self.move_asset(-1)),
             ("下移", lambda: self.move_asset(1)),
             ("检查重复项", self.check_duplicates),
-            ("按未配对媒体创建章节", self.create_chapters_for_unpaired),
+            ("纯音频：按媒体/M4B章节创建空白章节", self.create_chapters_for_unpaired),
         ):
             button = QPushButton(label)
             button.clicked.connect(callback)
@@ -268,6 +291,7 @@ class ChapterAudioMappingDialog(QDialog):
             ]
         self._rebuild_mapping_table(links)
         self._refresh_media_table()
+        self._offer_audio_only_chapters()
 
     def _selected_asset_row(self) -> int:
         return self.media_table.currentRow()
@@ -411,6 +435,27 @@ class ChapterAudioMappingDialog(QDialog):
             return
         self._rebuild_mapping_table(links)
         self._refresh_media_table()
+        self.created_audio_only_chapters += created
+        self.audio_only_hint.setText(
+            f"已暂存 {self.created_audio_only_chapters} 个纯音频章节。点击“应用”写入项目，"
+            "然后可对当前章节或全书运行识别来生成文本。"
+        )
+
+    def _offer_audio_only_chapters(self) -> None:
+        """Offer an explicit, staged audio-only workflow without guessing silently."""
+        if self._audio_only_offer_shown or self.chapters or not self.choices:
+            return
+        self._audio_only_offer_shown = True
+        answer = QMessageBox.question(
+            self,
+            "创建纯音频项目章节",
+            f"检测到 {len(self.choices)} 个未配对的媒体文件或 M4B 内嵌章节，且项目没有文本。\n\n"
+            "是否按这些媒体切片建立空白章节？应用后可直接运行 ASR 生成文本。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.create_chapters_for_unpaired()
 
     def _choice_index(self, link: ChapterAudioLink | None) -> int:
         if not link:
@@ -588,5 +633,6 @@ class ChapterAudioMappingDialog(QDialog):
             self.assets, self.markers, self._mapping_links(),
             [chapter for chapter in self.chapters if chapter.id is not None and chapter.id < 0],
         )
+        self.session.manifest.anki_furigana = self.anki_furigana_check.isChecked()
         self.session.mark_dirty()
         self.accept()

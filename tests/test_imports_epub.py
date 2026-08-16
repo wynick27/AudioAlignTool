@@ -12,13 +12,16 @@ from bs4 import BeautifulSoup
 
 from audioalign.core.epub_media_overlay import (
     EpubMediaOverlayOptions,
+    EpubTextPolicy,
     _annotate_for_overlay,
+    _apply_text_edits_to_xhtml,
+    _original_segment_targets,
     _export_segment_ranges,
     export_epub_media_overlay,
 )
 from audioalign.core.models import (
     AudioAsset, Chapter, ChapterAudioLink, SourceDocument, SourceDocumentKind,
-    TextAudioAnchor, TextSegment,
+    SourceFragment, TextAudioAnchor, TextSegment,
 )
 from audioalign.core.storage import ProjectSession
 from audioalign.core.subtitles import parse_srt_text
@@ -28,6 +31,97 @@ from audioalign.gui.original_book_view import annotate_html
 
 
 class ImportAndEpubTests(unittest.TestCase):
+    def test_epub_text_policy_can_preserve_or_safely_apply_user_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("edited-text", Path(temporary) / "project")
+            try:
+                original = "She learned a new word."
+                edited = "She learned two new words."
+                source = f"<html><body><p>{original}</p></body></html>"
+                chapter_id = session.repository.add_chapter(Chapter(None, "One", 0, source))
+                session.repository.replace_source_fragments(chapter_id, [
+                    SourceFragment(None, chapter_id, 0, "p", original, 0, len(original)),
+                ])
+                stored_fragment = session.repository.source_fragments(chapter_id)[0]
+                session.repository.replace_segments(chapter_id, [
+                    TextSegment(
+                        None, chapter_id, 0, edited, 100, 900,
+                        source_fragment_id=stored_fragment.id,
+                        source_start_char=0, source_end_char=len(original),
+                    ),
+                ])
+                audio_id = session.repository.add_audio(AudioAsset(
+                    None, str(Path(temporary) / "audio.opus"), duration_ms=1_000,
+                ))
+                session.repository.set_chapter_links(chapter_id, [
+                    ChapterAudioLink(None, chapter_id, audio_id, 0, 0, 1_000, 1.0),
+                ])
+                chapter = session.repository.chapters()[0]
+                targets = _original_segment_targets(session, chapter_id)
+                self.assertEqual(original, targets[0])
+
+                preserved, units, errors = _annotate_for_overlay(
+                    source, session, chapter, target_texts=targets,
+                )
+                self.assertEqual([], errors)
+                self.assertTrue(units)
+                self.assertIn(original, BeautifulSoup(preserved, "html.parser").get_text())
+                self.assertNotIn(edited, BeautifulSoup(preserved, "html.parser").get_text())
+
+                applied: set[int] = set()
+                changed, modified, unsafe = _apply_text_edits_to_xhtml(
+                    source, session.repository.segments(chapter_id), targets, applied,
+                )
+                self.assertEqual({0}, modified)
+                self.assertEqual(set(), unsafe)
+                self.assertEqual({0}, applied)
+                self.assertIn(edited, BeautifulSoup(changed, "html.parser").get_text())
+            finally:
+                session.close()
+
+    def test_epub_text_edit_crossing_markup_is_preserved_and_reported_unsafe(self) -> None:
+        source = "<html><body><p><b>Old</b> styled text.</p></body></html>"
+        segment = TextSegment(None, 1, 0, "New plain text.", 100, 500)
+        applied: set[int] = set()
+        rendered, modified, unsafe = _apply_text_edits_to_xhtml(
+            source, [segment], {0: "Old styled text."}, applied,
+        )
+        self.assertEqual({0}, modified)
+        self.assertEqual({0}, unsafe)
+        self.assertEqual(set(), applied)
+        self.assertIn("<b>Old</b>", rendered)
+
+    def test_japanese_ruby_is_preserved_but_not_counted_in_source_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("ruby", Path(temporary) / "project")
+            try:
+                source = (
+                    "<html><body><p><ruby>夫<rt>ふ</rt></ruby>"
+                    "<ruby>妻<rt>さい</rt></ruby>はまともな人間だった。</p></body></html>"
+                )
+                chapter_id = session.repository.add_chapter(Chapter(None, "第一章", 0, source))
+                session.repository.replace_segments(chapter_id, [
+                    TextSegment(None, chapter_id, 0, "夫妻はまともな人間だった。", 100, 900),
+                ])
+                audio_id = session.repository.add_audio(AudioAsset(
+                    None, str(Path(temporary) / "audio.opus"), duration_ms=1_000,
+                ))
+                session.repository.set_chapter_links(chapter_id, [
+                    ChapterAudioLink(None, chapter_id, audio_id, 0, 0, 1_000, 1.0),
+                ])
+                chapter = session.repository.chapters()[0]
+                rendered, units, errors = _annotate_for_overlay(source, session, chapter)
+                self.assertEqual([], errors)
+                self.assertTrue(units)
+                self.assertIn("<rt>ふ</rt>", rendered)
+                self.assertIn("<rt>さい</rt>", rendered)
+
+                book_view = annotate_html(source, session.repository.segments(chapter_id), "aatbook://book/")
+                self.assertIn("<rt>ふ</rt>", book_view)
+                self.assertIn("data-aat-segment", book_view)
+            finally:
+                session.close()
+
     def test_epub_mapping_tolerates_a_small_wording_difference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("fuzzy", Path(temporary) / "project")
@@ -140,6 +234,16 @@ class ImportAndEpubTests(unittest.TestCase):
             self.assertEqual([root / "style.css"], resources)
             self.assertEqual([], warnings)
 
+    def test_txt_anki_furigana_option_preserves_source_and_uses_base_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "book.txt"
+            source.write_text("第一章\n\n魔法[まほう]学校[がっこう]へ行く。", encoding="utf-8")
+            chapter = import_book(source, anki_furigana=True)[0]
+            self.assertIn("魔法学校へ行く。", chapter.text)
+            self.assertNotIn("まほう", chapter.text)
+            self.assertIn("<rt>まほう</rt>", chapter.source_html)
+            self.assertIn("audioalign-anki-furigana", chapter.source_html)
+
     def test_multiple_document_mode_keeps_each_markdown_or_html_as_one_chapter(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -216,9 +320,11 @@ class ImportAndEpubTests(unittest.TestCase):
                 session.repository.replace_segments(chapter_id, [
                     TextSegment(None, chapter_id, 0, "uno dos", 100, 500),
                     TextSegment(None, chapter_id, 1, "tres", 500, 800),
+                    TextSegment(None, chapter_id, 2, "cuatro", 800, 1_100),
+                    TextSegment(None, chapter_id, 3, "cinco", 1_100, 1_400),
                 ])
                 original = session.repository.segments(chapter_id)
-                untouched_id = original[1].id
+                untouched_ids = [segment.id for segment in original[1:]]
                 session.repository.replace_anchors(chapter_id, [
                     TextAudioAnchor(None, chapter_id, original[0].id, 0, 3, 100, 250, 1.0, "asr-word"),
                     TextAudioAnchor(None, chapter_id, original[0].id, 4, 7, 300, 500, 1.0, "asr-word"),
@@ -229,7 +335,8 @@ class ImportAndEpubTests(unittest.TestCase):
                 ])
                 split = session.repository.segments(chapter_id)
                 anchors = session.repository.anchors(chapter_id)
-                self.assertEqual(untouched_id, split[2].id)
+                self.assertEqual(untouched_ids, [segment.id for segment in split[2:]])
+                self.assertEqual(list(range(5)), [segment.position for segment in split])
                 self.assertEqual(split[0].id, anchors[0].segment_id)
                 self.assertEqual(split[1].id, anchors[1].segment_id)
 
@@ -241,12 +348,20 @@ class ImportAndEpubTests(unittest.TestCase):
                     chapter_id, split[0].id or 0, split[1].id or 0, merged,
                 )
                 final = session.repository.segments(chapter_id)
-                self.assertEqual(["uno dos", "tres"], [item.text for item in final])
-                self.assertEqual(untouched_id, final[1].id)
+                self.assertEqual(
+                    ["uno dos", "tres", "cuatro", "cinco"],
+                    [item.text for item in final],
+                )
+                self.assertEqual(untouched_ids, [segment.id for segment in final[1:]])
+                self.assertEqual(list(range(4)), [segment.position for segment in final])
                 self.assertEqual(
                     {final[0].id},
                     {item.segment_id for item in session.repository.anchors(chapter_id)},
                 )
+                session.repository.delete_segments(chapter_id, [final[1].id or 0])
+                after_delete = session.repository.segments(chapter_id)
+                self.assertEqual(["uno dos", "cuatro", "cinco"], [item.text for item in after_delete])
+                self.assertEqual(list(range(3)), [item.position for item in after_delete])
             finally:
                 session.close()
 
@@ -264,6 +379,18 @@ class ImportAndEpubTests(unittest.TestCase):
         self.assertIn("<em>", rendered)
         self.assertGreaterEqual(rendered.count('data-aat-segment="42"'), 3)
         self.assertIn("targets.forEach(target=>target.classList.add('aat-active'))", rendered)
+
+    def test_epub_html_declared_latin1_decodes_before_utf8_rendering(self) -> None:
+        from audioalign.core.text import decode_html_bytes
+
+        raw = (
+            b"<html><head><meta http-equiv='content-type' "
+            b"content='text/html; charset=iso-8859-1'></head>"
+            b"<body>don\x92t\x97quoted</body></html>"
+        )
+        decoded = decode_html_bytes(raw)
+        self.assertIn("don\u2019t\u2014quoted", decoded)
+        self.assertNotIn("\ufffd", decoded)
 
     def test_original_book_annotation_allows_small_text_difference_and_two_click_modes(self) -> None:
         rendered = annotate_html(

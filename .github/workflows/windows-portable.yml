@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  windows-portable:
+  windows-package:
     runs-on: windows-latest
     timeout-minutes: 120
     concurrency:
@@ -22,15 +22,23 @@ jobs:
       PYTHONUTF8: "1"
       PYTHONDONTWRITEBYTECODE: "1"
       QT_QPA_PLATFORM: offscreen
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: portable
+            build_args: ""
+          - flavor: standard
+            build_args: "-Standard"
 
     steps:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Set up Python 3.14
+      - name: Set up Python 3.13
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.13"
           architecture: x64
           cache: pip
           cache-dependency-path: |
@@ -47,7 +55,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed to install locked build dependencies." }
           python -m pip install --no-deps -e .
           if ($LASTEXITCODE -ne 0) { throw "Failed to install AudioAlignTool." }
-          python -c "import numpy, PySide6, av, faster_whisper, qwen_asr, markdown_it; from PySide6 import QtWebChannel, QtWebEngineCore, QtWebEngineWidgets; print('Runtime import check passed')"
+          python -c "import numpy, PySide6, av, faster_whisper, markdown_it; from PySide6 import QtWebChannel, QtWebEngineCore, QtWebEngineWidgets; print('Base runtime import check passed')"
           if ($LASTEXITCODE -ne 0) { throw "Runtime dependency import check failed." }
 
       - name: Select package version
@@ -66,35 +74,45 @@ jobs:
           }
           "value=$version" >> $env:GITHUB_OUTPUT
 
-      - name: Build portable package
+      - name: Build Windows package
         shell: pwsh
         run: |
           $python = (Get-Command python).Source
-          .\build-portable.ps1 -Python $python -Version "${{ steps.version.outputs.value }}" -SkipInstall -SkipTests -Clean
+          if ("${{ matrix.flavor }}" -eq "standard") {
+            python -m pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cpu
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install CPU-only PyTorch." }
+            python -c "import torch; assert torch.version.cuda is None, torch.version.cuda"
+            if ($LASTEXITCODE -ne 0) { throw "Standard package unexpectedly contains CUDA PyTorch." }
+            python -m pip install -r requirements-qwen-lock.txt
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install Qwen dependencies." }
+            .\build-portable.ps1 -Python $python -Version "${{ steps.version.outputs.value }}" -SkipInstall -SkipTests -Clean -Standard
+          } else {
+            .\build-portable.ps1 -Python $python -Version "${{ steps.version.outputs.value }}" -SkipInstall -SkipTests -Clean
+          }
 
-      - name: Upload portable package
+      - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: AudioAlignTool-${{ steps.version.outputs.value }}-Windows-x64-portable
+          name: AudioAlignTool-${{ steps.version.outputs.value }}-Windows-x64-${{ matrix.flavor }}
           path: |
-            artifacts/AudioAlignTool-*-Windows-x64-portable.zip
+            artifacts/AudioAlignTool-*-Windows-x64-${{ matrix.flavor }}.zip
             artifacts/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
 
   release:
     name: Publish GitHub Release
-    needs: windows-portable
+    needs: windows-package
     if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Download portable artifact
+      - name: Download Windows artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: AudioAlignTool-*-Windows-x64-portable
+          pattern: AudioAlignTool-*-Windows-x64-*
           path: release-assets
           merge-multiple: true
 
@@ -105,7 +123,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           tag="$GITHUB_REF_NAME"
-          assets=(release-assets/AudioAlignTool-*-Windows-x64-portable.zip release-assets/SHA256SUMS.txt)
+          sha256sum release-assets/AudioAlignTool-*-Windows-x64-*.zip > release-assets/SHA256SUMS.txt
+          assets=(release-assets/AudioAlignTool-*-Windows-x64-*.zip release-assets/SHA256SUMS.txt)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${assets[@]}" --clobber
           else

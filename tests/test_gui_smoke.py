@@ -15,10 +15,10 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import QPoint, QRect, Qt
+    from PySide6.QtCore import QItemSelectionModel, QPoint, QRect, Qt
     from PySide6.QtGui import QColor, QImage, QPainter
     from PySide6.QtWidgets import QApplication, QMessageBox
-    from audioalign.core.models import ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentOverlapPolicy, SegmentStatus, TaskLane, TextAudioAnchor, TextSegment
+    from audioalign.core.models import ASRToken, AlignmentMode, AudioAsset, AudioVisualizationMode, BoundaryCandidate, Chapter, ChapterAudioLink, InferenceDeviceInfo, PlaybackFollowState, SegmentOverlapPolicy, SegmentStatus, SilenceDisplayMode, TaskLane, TextAudioAnchor, TextSegment
     from audioalign.core.paths import ApplicationPaths
     from audioalign.core.spectrogram import build_spectrogram_cache_from_slices
     from audioalign.core.storage import ProjectSession
@@ -218,6 +218,111 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual((1_000, 4_000), window._active_play_bounds())
             window.close()
 
+    def test_m4b_slice_seek_waits_for_load_and_reuses_same_asset_source(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        class FakePlayer:
+            def __init__(self) -> None:
+                self.url = QUrl()
+                self.status = QMediaPlayer.MediaStatus.LoadingMedia
+                self.positions: list[int] = []
+                self.sources: list[str] = []
+                self.current_position = 0
+                self.state = QMediaPlayer.PlaybackState.PausedState
+                self.events: list[tuple[str, int | None]] = []
+
+            def source(self):
+                return self.url
+
+            def setSource(self, url):
+                self.url = url
+                self.sources.append(url.toLocalFile())
+
+            def mediaStatus(self):
+                return self.status
+
+            def setPosition(self, value):
+                self.current_position = value
+                self.positions.append(value)
+                self.events.append(("position", value))
+
+            def position(self):
+                return self.current_position
+
+            def playbackState(self):
+                return self.state
+
+            def play(self):
+                self.state = QMediaPlayer.PlaybackState.PlayingState
+                self.events.append(("play", None))
+
+            def pause(self):
+                self.state = QMediaPlayer.PlaybackState.PausedState
+                self.events.append(("pause", None))
+
+        window = MainWindow()
+        real_player = window.player
+        fake = FakePlayer()
+        window.player = fake
+        asset = AudioAsset(7, "book.m4b", duration_ms=10_000)
+        first = ChapterAudioLink(None, 1, 7, 0, 1_000, 2_000, 1.0)
+        second = ChapterAudioLink(None, 1, 7, 1, 5_000, 6_000, 1.0)
+        path = Path("book.m4b")
+        window.current_parts = [
+            (first, asset, path, 0, 1_000),
+            (second, asset, path, 1_000, 2_000),
+        ]
+        window.current_link = first
+        window.current_asset = asset
+
+        window._request_media_position(asset, path, 1_000, autoplay=False)
+        self.assertEqual([], fake.positions)
+        fake.status = QMediaPlayer.MediaStatus.LoadedMedia
+        window._media_status_changed(fake.status)
+        self.assertEqual([1_000], fake.positions)
+
+        window._pending_media_position = None
+        fake.sources.clear()
+        fake.state = QMediaPlayer.PlaybackState.PlayingState
+        fake.events.clear()
+        window._seek_local(1_500)
+        self.assertIs(second, window.current_link)
+        self.assertEqual(5_500, fake.positions[-1])
+        self.assertEqual([], fake.sources)
+        self.assertEqual(
+            [("pause", None), ("position", 5_500), ("play", None)],
+            fake.events,
+        )
+        window._on_position(0)
+        self.assertEqual(5_500, window._pending_media_position)
+        window._on_position(5_500)
+        self.assertIsNone(window._pending_media_position)
+
+        # A silent/failed deep seek may make Qt report resource position zero.
+        # The editor must retain the explicit chapter-local cursor for a
+        # subsequent alignment command instead of reporting "no start".
+        fake.current_position = 0
+        self.assertEqual(1_500, window._local_position())
+
+        fake.state = QMediaPlayer.PlaybackState.PlayingState
+        window._audio_watch_started_at = time.monotonic() - 4.0
+        window._last_audio_buffer_at = 0.0
+        with patch.object(window, "_ensure_m4b_proxy", return_value=True) as ensure_proxy:
+            window._check_m4b_audio_output()
+            ensure_proxy.assert_called_once()
+
+        # A proxy/load task that finishes after the user cancelled playback
+        # must not be allowed to start audio tens of seconds later.
+        window._playback_requested = False
+        fake.state = QMediaPlayer.PlaybackState.PlayingState
+        window._play_state_changed(QMediaPlayer.PlaybackState.PlayingState)
+        self.app.processEvents()
+        self.assertEqual(QMediaPlayer.PlaybackState.PausedState, fake.state)
+
+        window.player = real_player
+        window.close()
+
     def test_fixed_text_editor_splits_at_cursor_as_one_undo_step(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("cursor-split", Path(temporary) / "project")
@@ -245,6 +350,50 @@ class GuiSmokeTests(unittest.TestCase):
             window.undo()
             self.assertEqual(1, window.segment_model.rowCount())
             self.assertEqual(original, window.segment_model.segments[0].text)
+            window.close()
+
+    def test_cursor_split_uses_chapter_anchor_coordinates_not_fragment_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("cursor-anchor", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "Alpha.", 0, 1_000, source_start_char=0, source_end_char=6),
+                TextSegment(None, chapter_id, 1, "Second half.", 5_000, 8_000, source_start_char=0, source_end_char=12),
+            ])
+            stored = session.repository.segments(chapter_id)
+            session.repository.replace_anchors(chapter_id, [
+                TextAudioAnchor(None, chapter_id, stored[0].id, 0, 5, 0, 900, 0.9, "asr-word"),
+                TextAudioAnchor(None, chapter_id, stored[1].id, 6, 12, 5_000, 6_000, 0.9, "asr-word"),
+                TextAudioAnchor(None, chapter_id, stored[1].id, 13, 17, 6_500, 7_500, 0.9, "asr-word"),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            window._select_segment_row(1)
+            cursor = window.editor_text.textCursor()
+            cursor.setPosition(len("Second"))
+            window.editor_text.setTextCursor(cursor)
+            window.split_segment_at_text_cursor()
+            self.assertEqual(3, window.segment_model.rowCount())
+            self.assertEqual(6_000, window.segment_model.segments[1].end_ms)
+            self.assertEqual(6_000, window.segment_model.segments[2].start_ms)
+            window.close()
+
+    def test_find_window_supports_regular_expressions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("find-regex", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "Nothing here."),
+                TextSegment(None, chapter_id, 1, "Order AB-2048 is ready."),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            window.show_find_dialog()
+            window._perform_find(r"AB-\d+", True, True, False, "chapter", False)
+            self.assertEqual(1, window.segment_table.currentIndex().row())
+            self.assertEqual("AB-2048", window.editor_text.textCursor().selectedText())
+            window._perform_find("[", True, False, False, "chapter", False)
+            self.assertIn("正则表达式错误", window._find_dialog.status_label.text())
             window.close()
 
     def test_asr_comparison_separates_blocks_and_restores_word_spaces(self) -> None:
@@ -349,6 +498,53 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(2, window.segment_model.rowCount())
             self.assertEqual(900, window.segment_model.segments[0].end_ms)
             self.assertEqual(900, window.segment_model.segments[1].start_ms)
+            window.close()
+
+    def test_punctuation_split_uses_unsaved_fixed_editor_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("live-punctuation-split", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "Old text without a boundary", 0, 2_000)
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            window._select_segment_row(0)
+            window.editor_text.setPlainText("First sentence. Second sentence.")
+            window.split_segment_by_punctuation()
+            self.assertEqual(2, window.segment_model.rowCount())
+            self.assertEqual("First sentence.", window.segment_model.segments[0].text)
+            self.assertEqual("Second sentence.", window.segment_model.segments[1].text)
+            window.close()
+
+    def test_contiguous_multi_selection_merges_in_one_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("multi-merge", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "First", 100, 500, 0.9, SegmentStatus.AUTO),
+                TextSegment(None, chapter_id, 1, "second", 500, 900, 0.8, SegmentStatus.AUTO),
+                TextSegment(None, chapter_id, 2, "third.", 900, 1_300, 0.7, SegmentStatus.AUTO),
+                TextSegment(None, chapter_id, 3, "Keep me", 1_400, 1_800, 0.9, SegmentStatus.AUTO),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            selection = window.segment_table.selectionModel()
+            selection.clearSelection()
+            for row in range(3):
+                selection.select(
+                    window.segment_model.index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            window.merge_selected_segments()
+            stored = session.repository.segments(chapter_id)
+            self.assertEqual(2, len(stored))
+            self.assertEqual("First second third.", stored[0].text)
+            self.assertEqual((100, 1_300), (stored[0].start_ms, stored[0].end_ms))
+            self.assertEqual("Keep me", stored[1].text)
+            window.undo()
+            self.assertEqual(4, window.segment_model.rowCount())
             window.close()
 
     def test_binding_updates_existing_row_without_rebuilding_chapter(self) -> None:
@@ -546,6 +742,115 @@ class GuiSmokeTests(unittest.TestCase):
             ))
             window.close()
 
+    def test_qwen_anchor_alignment_uses_shared_multi_sentence_block_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = ProjectSession.create("qwen-vad-progressive", root / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "first sentence", 0, 0),
+                TextSegment(None, chapter_id, 1, "second sentence", 0, 0),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            asset = AudioAsset(1, str(root / "audio.wav"), duration_ms=8_000)
+            link = ChapterAudioLink(None, chapter_id, 1, 0, 0, 8_000, 1.0)
+            window.current_parts = [(link, asset, root / "audio.wav", 0, 8_000)]
+            window.silence_candidates = [
+                BoundaryCandidate(1_500, 0.95, start_ms=1_350, end_ms=1_650),
+                BoundaryCandidate(3_200, 0.9, start_ms=3_050, end_ms=3_350),
+                BoundaryCandidate(5_000, 0.8, start_ms=4_850, end_ms=5_150),
+            ]
+            window._select_segment_row(0)
+
+            class FakeAligner:
+                def __init__(self):
+                    self.last_device_info = InferenceDeviceInfo(
+                        "qwen", "forced", actual_device="cpu", compute_type="float32"
+                    )
+
+                def align(self, _path, text, _language, chapter, _options, progress):
+                    progress(1.0, "done")
+                    return [
+                        ASRToken(None, chapter, index, line, 100 + index * 1_200,
+                                 1_100 + index * 1_200, 0.95)
+                        for index, line in enumerate(text.splitlines())
+                    ]
+
+            ready = SimpleNamespace(runtime_available=True, cuda_available=True, message="ready")
+
+            def run_now(_name, function, finished, **_kwargs):
+                finished(function(lambda *_args: None))
+
+            with (
+                patch("audioalign.gui.main_window.runtime_status", return_value=ready),
+                patch("audioalign.gui.main_window.Qwen3ForcedAligner", FakeAligner),
+                patch.object(window, "_selected_language_code", return_value="en"),
+                patch.object(window, "_local_position", return_value=100),
+                patch.object(window.tasks, "submit", side_effect=run_now),
+            ):
+                window.qwen_align_from_current_anchor()
+
+            aligned = session.repository.segments(chapter_id)
+            self.assertEqual((200, 1_200), (aligned[0].start_ms, aligned[0].end_ms))
+            self.assertEqual((1_400, 2_400), (aligned[1].start_ms, aligned[1].end_ms))
+            anchors = session.repository.anchors(chapter_id)
+            self.assertTrue(anchors)
+            self.assertTrue(all(
+                anchor.method == "qwen-forced-aligner-block" for anchor in anchors
+            ))
+            window.close()
+
+    def test_qwen_block_failure_preserves_timing_and_marks_review_without_asr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = ProjectSession.create("qwen-block-failure", root / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "first sentence", 100, 900, 0.9, SegmentStatus.AUTO),
+                TextSegment(None, chapter_id, 1, "second sentence", 1_000, 1_800, 0.9, SegmentStatus.AUTO),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            asset = AudioAsset(1, str(root / "audio.wav"), duration_ms=8_000)
+            link = ChapterAudioLink(None, chapter_id, 1, 0, 0, 8_000, 1.0)
+            window.current_parts = [(link, asset, root / "audio.wav", 0, 8_000)]
+            window.silence_candidates = [
+                BoundaryCandidate(3_200, 0.9, start_ms=3_000, end_ms=3_400),
+            ]
+            window._select_segment_row(0)
+
+            class EmptyAligner:
+                def __init__(self):
+                    self.last_device_info = InferenceDeviceInfo(
+                        "qwen", "forced", actual_device="cpu", compute_type="float32"
+                    )
+
+                def align(self, *_args, **_kwargs):
+                    return []
+
+            ready = SimpleNamespace(runtime_available=True, cuda_available=True, message="ready")
+
+            def run_now(_name, function, finished, **_kwargs):
+                finished(function(lambda *_args: None))
+
+            with (
+                patch("audioalign.gui.main_window.runtime_status", return_value=ready),
+                patch("audioalign.gui.main_window.Qwen3ForcedAligner", EmptyAligner),
+                patch("audioalign.gui.main_window.transcriber_for_options") as asr_factory,
+                patch.object(window, "_selected_language_code", return_value="en"),
+                patch.object(window, "_local_position", return_value=0),
+                patch.object(window.tasks, "submit", side_effect=run_now),
+            ):
+                window.qwen_align_from_current_anchor()
+                asr_factory.assert_not_called()
+
+            aligned = session.repository.segments(chapter_id)
+            self.assertEqual((100, 900), (aligned[0].start_ms, aligned[0].end_ms))
+            self.assertEqual(SegmentStatus.LOW_CONFIDENCE, aligned[0].status)
+            self.assertIn("部分完成", window.status_stage.text())
+            window.close()
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
@@ -711,6 +1016,24 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertGreater(window.article_view.line_model.rowCount(), 0)
             window.spectrogram.set_selection(250, 750)
             self.assertEqual((250, 750), (window.spectrogram.selection.start_ms, window.spectrogram.selection.end_ms))
+            window.silence_candidates = [
+                BoundaryCandidate(400, 0.5, start_ms=300, end_ms=500),
+                BoundaryCandidate(1200, 0.9, start_ms=900, end_ms=1500),
+            ]
+            window._set_silence_display_mode(SilenceDisplayMode.KEY)
+            self.assertEqual(1, len(window.spectrogram.wave_pane.silences))
+            self.assertEqual(1, len(window.spectrogram.spectrum_pane.silences))
+            self.assertEqual(1, len(window.overview._silences))
+
+            # Whole-chapter and anchored automatic alignment must share the
+            # same block engine; the old proportional paths are unreachable.
+            window._select_segment_row(0)
+            with patch.object(window, "_start_qwen_block_alignment") as shared:
+                window._qwen_align_chapter(0, 0, anchored=False)
+                shared.assert_called_once()
+            with patch.object(window, "_start_qwen_block_alignment") as shared:
+                window.qwen_align_from_current_anchor()
+                shared.assert_called_once()
             window.close()
 
     def test_mapping_apply_button_commits_and_cancel_is_chinese(self) -> None:
@@ -729,6 +1052,30 @@ class GuiSmokeTests(unittest.TestCase):
             links = session.repository.chapter_links(chapter_id)
             self.assertEqual(1, len(links))
             self.assertEqual(audio_id, links[0].audio_id)
+            session.close()
+
+    def test_audio_only_mapping_creates_one_empty_chapter_per_media_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = ProjectSession.create("纯音频配对", root / "project")
+            first_id = session.repository.add_audio(
+                AudioAsset(None, str(root / "01.opus"), duration_ms=60_000, title="第一章")
+            )
+            second_id = session.repository.add_audio(
+                AudioAsset(None, str(root / "02.opus"), duration_ms=70_000, title="第二章")
+            )
+            dialog = ChapterAudioMappingDialog(session)
+            self.assertTrue(dialog.audio_only_hint.isVisibleTo(dialog))
+            dialog.create_chapters_for_unpaired()
+            self.assertEqual(2, dialog.created_audio_only_chapters)
+            dialog.apply_button.click()
+            chapters = session.repository.chapters()
+            self.assertEqual(["第一章", "第二章"], [chapter.title for chapter in chapters])
+            self.assertEqual(
+                [first_id, second_id],
+                [session.repository.chapter_links(chapter.id or 0)[0].audio_id for chapter in chapters],
+            )
+            self.assertTrue(all(not session.repository.segments(chapter.id or 0) for chapter in chapters))
             session.close()
 
     def test_modes_follow_speed_and_current_segment_editor(self) -> None:
@@ -771,7 +1118,7 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertIn("Qwen", window.recognize_button.text())
             qwen_actions = [action.text() for action in window.qwen_align_menu.actions() if not action.isSeparator()]
             self.assertEqual(
-                ["对齐当前句", "对齐所选句子 ↔ 音频选区", "从当前句/时间向后对齐"],
+                ["对齐当前句", "对齐所选句子 ↔ 音频选区", "块级对齐（从当前句/时间向后）"],
                 qwen_actions,
             )
             self.assertTrue(window.refresh_recognition_button.isHidden())
@@ -941,9 +1288,11 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(AudioVisualizationMode.WAVEFORM, window.article_view.canvas.mode)
             window._set_article_visualization_mode(AudioVisualizationMode.SPECTROGRAM)
             self.assertEqual(AudioVisualizationMode.SPECTROGRAM, window.article_view.canvas.mode)
-            window.silence_markers_action.trigger()
+            window._set_silence_display_mode(SilenceDisplayMode.HIDDEN)
             self.assertFalse(window.spectrogram.silences_visible)
             self.assertFalse(window.overview.silences_visible)
+            window._set_silence_display_mode(SilenceDisplayMode.KEY)
+            self.assertTrue(window.silence_key_action.isChecked())
             canvas = window.article_view.canvas
             canvas._selection_anchor = 0
             canvas._selection_cursor = 10

@@ -33,6 +33,12 @@ class AudioVisualizationMode(StrEnum):
     COMBINED = "combined"
 
 
+class SilenceDisplayMode(StrEnum):
+    HIDDEN = "hidden"
+    KEY = "key"
+    ALL = "all"
+
+
 class AudioConversionPolicy(StrEnum):
     AUTO_COMPATIBLE = "auto_compatible"
     FORCE_AAC = "force_aac"
@@ -378,6 +384,7 @@ class ProjectManifest:
     created_at: str = ""
     updated_at: str = ""
     source_name: str = ""
+    anki_furigana: bool = False
     media_references: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import wave
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 
@@ -108,6 +109,13 @@ def audio_metadata(path: str | Path) -> tuple[int, int, int]:
     return probe.duration_ms, probe.sample_rate, probe.channels
 
 
+def _chapter_value(chapter, name: str, default=None):
+    """Read a PyAV chapter from both mapping (PyAV 18+) and object APIs."""
+    if isinstance(chapter, Mapping):
+        return chapter.get(name, default)
+    return getattr(chapter, name, default)
+
+
 def probe_audio(path: str | Path) -> AudioProbe:
     source = Path(path)
     try:
@@ -127,9 +135,18 @@ def probe_audio(path: str | Path) -> AudioProbe:
             chapter_data: list[tuple[str, int, int]] = []
             raw_chapters = container.chapters() if callable(container.chapters) else container.chapters
             for index, chapter in enumerate(raw_chapters):
-                time_base = float(chapter.time_base)
-                title = chapter.metadata.get("title") or f"章节 {index + 1}"
-                chapter_data.append((title, int(chapter.start * time_base * 1000), int(chapter.end * time_base * 1000)))
+                time_base = _chapter_value(chapter, "time_base")
+                start = _chapter_value(chapter, "start")
+                end = _chapter_value(chapter, "end")
+                if time_base is None or start is None or end is None:
+                    continue
+                metadata = _chapter_value(chapter, "metadata", {}) or {}
+                title = metadata.get("title") if isinstance(metadata, Mapping) else None
+                title = str(title or f"章节 {index + 1}")
+                scale = float(time_base) * 1000
+                start_ms = max(0, round(float(start) * scale))
+                end_ms = max(start_ms, round(float(end) * scale))
+                chapter_data.append((title, start_ms, end_ms))
             title = container.metadata.get("title", "")
             format_name = source.suffix.lower().lstrip(".") or container.format.name
             return AudioProbe(
@@ -267,6 +284,43 @@ def detect_silence_candidates(
                 )
             start = None
     return result
+
+
+def key_silence_candidates(
+    candidates: list[BoundaryCandidate],
+    min_silence_ms: int,
+    *,
+    minimum_spacing_ms: int = 800,
+) -> list[BoundaryCandidate]:
+    """Return the small, stable subset suitable for drawing and block planning.
+
+    Detection results remain untouched.  This deliberately separates the
+    algorithm's complete VAD cache from the quieter default presentation.
+    """
+    minimum_duration = max(500, round(max(1, min_silence_ms) * 1.5))
+    eligible = []
+    for candidate in candidates:
+        if candidate.start_ms is None or candidate.end_ms is None:
+            continue
+        duration = max(0, candidate.end_ms - candidate.start_ms)
+        if duration >= minimum_duration or (
+            duration >= min_silence_ms and candidate.score >= 0.78
+        ):
+            eligible.append(candidate)
+    eligible.sort(key=lambda item: item.time_ms)
+    selected: list[BoundaryCandidate] = []
+    for candidate in eligible:
+        if not selected or candidate.time_ms - selected[-1].time_ms >= minimum_spacing_ms:
+            selected.append(candidate)
+            continue
+        previous = selected[-1]
+        previous_duration = max(0, (previous.end_ms or 0) - (previous.start_ms or 0))
+        duration = max(0, (candidate.end_ms or 0) - (candidate.start_ms or 0))
+        previous_rank = previous.score * max(1, previous_duration)
+        candidate_rank = candidate.score * max(1, duration)
+        if candidate_rank > previous_rank:
+            selected[-1] = candidate
+    return selected
 
 
 def analyze_silence_file(

@@ -51,6 +51,31 @@ class M4BTests(unittest.TestCase):
             result.chapters,
         )
 
+    def test_probe_supports_pyav_18_mapping_chapters(self) -> None:
+        container = _Container()
+        container.chapters = lambda: [
+            {
+                "id": 0,
+                "start": 0,
+                "end": 42_214,
+                "time_base": Fraction(1, 1000),
+                "metadata": {"title": "Chapter 001"},
+            },
+            {
+                "id": 1,
+                "start": 42_214,
+                "end": 120_000,
+                "time_base": Fraction(1, 1000),
+                "metadata": {},
+            },
+        ]
+        with patch("av.open", return_value=container):
+            result = probe_audio("book.m4b")
+        self.assertEqual(
+            [("Chapter 001", 0, 42_214), ("章节 2", 42_214, 120_000)],
+            result.chapters,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

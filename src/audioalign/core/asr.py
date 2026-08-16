@@ -17,6 +17,7 @@ from .models import (
 )
 from .audio import decode_audio_mono, detect_silence_candidates
 from .runtime import bootstrap_native_runtime
+from .runtime_addons import active_runtime_manifest
 
 
 ProgressCallback = Callable[[float, str], None]
@@ -324,7 +325,10 @@ def runtime_status(
     backend = ASRBackendId(backend)
     runtime_module = "qwen_asr" if backend == ASRBackendId.QWEN3_ASR else "faster_whisper"
     runtime = importlib.util.find_spec(runtime_module) is not None
-    precise = importlib.util.find_spec("whisperx") is not None
+    precise = (
+        importlib.util.find_spec("whisperx") is not None
+        or active_runtime_manifest("whisperx") is not None
+    )
     cuda = False
     compute_types: tuple[str, ...] = ()
     paths = bootstrap_native_runtime()
@@ -764,7 +768,7 @@ class Qwen3ASRTranscriber:
         try:
             from qwen_asr import Qwen3ASRModel  # type: ignore
         except ImportError as exc:
-            raise BackendUnavailableError("Qwen3-ASR 运行库缺失；请在项目 Python 3.14 环境安装 qwen-asr") from exc
+            raise BackendUnavailableError("Qwen3-ASR 运行库缺失；请安装 qwen-asr 或使用运行时组件管理器") from exc
         torch, device, dtype = _qwen_device(options)
         model_path = _ensure_qwen_model(options.model_root, options.model, progress)
         aligner_path = _ensure_qwen_model(options.model_root, "Qwen3-ForcedAligner-0.6B", progress)
@@ -1036,7 +1040,9 @@ class WhisperXTranscriber:
         try:
             import whisperx  # type: ignore
         except ImportError as exc:
-            raise BackendUnavailableError("WhisperX 识别并精确对齐工作流需要安装 WhisperX 组件") from exc
+            raise BackendUnavailableError(
+                "WhisperX 运行库缺失或未能加载；请在“选项 → 运行时组件”中安装后重启"
+            ) from exc
         device = options.device
         if device == "auto":
             try:
@@ -1092,7 +1098,6 @@ class WhisperXTranscriber:
             0 if device == "cuda" else None, "", compute_type,
         )
         return tokens
-
 
 def transcriber_for_mode(mode: AlignmentMode) -> Transcriber:
     return WhisperXTranscriber() if mode == AlignmentMode.PRECISE else FasterWhisperTranscriber()

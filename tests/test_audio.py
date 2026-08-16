@@ -10,8 +10,10 @@ import numpy as np
 
 from unittest.mock import patch
 
-from audioalign.core.audio import audio_metadata, decode_audio_mono, detect_silence_candidates
-from audioalign.core.models import SilenceSettings
+from audioalign.core.audio import (
+    audio_metadata, decode_audio_mono, detect_silence_candidates, key_silence_candidates,
+)
+from audioalign.core.models import BoundaryCandidate, SilenceSettings
 from audioalign.core.spectrogram import AudioVisualizationCache, SpectrogramCache, build_spectrogram_cache
 
 
@@ -43,6 +45,17 @@ class AudioTests(unittest.TestCase):
             samples, rate, SilenceSettings(min_silence_ms=350, energy_percentile=20)
         )
         self.assertTrue(any(900 <= item.time_ms <= 2100 for item in candidates))
+
+    def test_key_silences_filter_short_dense_candidates_without_mutating_cache(self) -> None:
+        candidates = [
+            BoundaryCandidate(1_000, 0.6, start_ms=800, end_ms=1_100),
+            BoundaryCandidate(2_000, 0.9, start_ms=1_600, end_ms=2_200),
+            BoundaryCandidate(2_500, 0.95, start_ms=2_100, end_ms=2_800),
+            BoundaryCandidate(5_000, 0.85, start_ms=4_600, end_ms=5_300),
+        ]
+        result = key_silence_candidates(candidates, 350)
+        self.assertEqual(4, len(candidates))
+        self.assertEqual([2_500, 5_000], [item.time_ms for item in result])
 
     def test_spectrogram_cache_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

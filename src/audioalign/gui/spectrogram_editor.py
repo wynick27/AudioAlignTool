@@ -5,9 +5,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QAction, QCursor
-from PySide6.QtWidgets import QMenu, QVBoxLayout, QWidget
+from PySide6.QtCore import QPoint, QRectF, Qt, Signal
+from PySide6.QtGui import QAction, QCursor, QPainterPath
+from PySide6.QtWidgets import QGraphicsPathItem, QMenu, QVBoxLayout, QWidget
 
 from audioalign.core.models import (
     AudioVisualizationMode,
@@ -718,23 +718,25 @@ class AudioVisualizerEditor(QWidget):
     def _render_silences(self) -> None:
         for pane in self._panes:
             self._clear_items(pane.plot, pane.silences)
+            path = QPainterPath()
+            bottom, height = ((-1.0, 2.0) if pane.kind == "waveform" else (50.0, 7_950.0))
             for silence in self.silences:
                 if silence.start_ms is None or silence.end_ms is None:
                     continue
-                item = pg.LinearRegionItem(
-                    values=(silence.start_ms / 1000, silence.end_ms / 1000), movable=False,
-                    brush=pg.mkBrush(135, 170, 205, 68), pen=pg.mkPen(130, 180, 220, 110),
-                )
+                path.addRect(QRectF(
+                    silence.start_ms / 1000,
+                    bottom,
+                    max(0.001, (silence.end_ms - silence.start_ms) / 1000),
+                    height,
+                ))
+            if not path.isEmpty():
+                item = QGraphicsPathItem(path)
+                item.setBrush(pg.mkBrush(135, 170, 205, 68))
+                item.setPen(pg.mkPen(130, 180, 220, 110))
                 item.setZValue(2)
                 pane.plot.addItem(item)
                 item.setVisible(self.silences_visible)
                 pane.silences.append(item)
-                line = pg.InfiniteLine(pos=silence.time_ms / 1000, angle=90, movable=False,
-                                       pen=pg.mkPen(185, 215, 240, 160, width=1))
-                line.setZValue(3)
-                pane.plot.addItem(line)
-                line.setVisible(self.silences_visible)
-                pane.silences.append(line)
 
     def _nearest_target(self, milliseconds: int) -> _DragTarget:
         tolerance = max(60, int((self.view_end - self.view_start) / max(1, self.width()) * 8))
@@ -795,7 +797,7 @@ class AudioVisualizerEditor(QWidget):
             region = pane.cue_regions.get(target.segment_index)
             if region is not None:
                 region.lines[line_index].setPen(
-                    pg.mkPen("#ffe36e" if active else normal, width=4 if active else 2)
+                    pg.mkPen("#e8f8ff" if active else normal, width=4 if active else 2)
                 )
 
     def _drag_start(self, seconds: float, _modifiers: int) -> None:
@@ -1078,6 +1080,7 @@ class AudioVisualizerOverview(pg.PlotWidget):
     seekRequested = Signal(int)
     windowRequested = Signal(int, int)
     interactionStarted = Signal()
+    issueRequested = Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent=parent)
@@ -1126,6 +1129,7 @@ class AudioVisualizerOverview(pg.PlotWidget):
         self.window.sigRegionChangeFinished.connect(self._window_moved)
         self.scene().sigMouseClicked.connect(self._scene_clicked)
         self._markers: list = []
+        self._review_ranges: list[tuple[int, int, int]] = []
         self._silences: list = []
         self.silences_visible = True
         self.set_cache(None)
@@ -1179,7 +1183,8 @@ class AudioVisualizerOverview(pg.PlotWidget):
         for marker in self._markers:
             self.removeItem(marker)
         self._markers.clear()
-        for segment in segments:
+        self._review_ranges.clear()
+        for index, segment in enumerate(segments):
             if segment.status not in {SegmentStatus.LOW_CONFIDENCE, SegmentStatus.UNMATCHED}:
                 continue
             marker = pg.LinearRegionItem(
@@ -1187,17 +1192,33 @@ class AudioVisualizerOverview(pg.PlotWidget):
                 brush=pg.mkBrush(245, 90 if segment.status == SegmentStatus.UNMATCHED else 175, 60, 120),
             )
             marker.setZValue(6); self.addItem(marker); self._markers.append(marker)
+            if segment.status == SegmentStatus.LOW_CONFIDENCE:
+                self._review_ranges.append(
+                    (segment.start_ms, max(segment.start_ms + 40, segment.end_ms), index)
+                )
 
     def set_silences(self, silences: list[BoundaryCandidate]) -> None:
         for item in self._silences:
             self.removeItem(item)
         self._silences.clear()
+        path = QPainterPath()
         for silence in silences:
             if silence.start_ms is None or silence.end_ms is None:
                 continue
-            item = pg.LinearRegionItem((silence.start_ms / 1000, silence.end_ms / 1000), movable=False,
-                                       brush=pg.mkBrush(160, 195, 220, 65))
-            item.setZValue(4); self.addItem(item); item.setVisible(self.silences_visible); self._silences.append(item)
+            path.addRect(QRectF(
+                silence.start_ms / 1000,
+                -1.05,
+                max(0.001, (silence.end_ms - silence.start_ms) / 1000),
+                2.10,
+            ))
+        if not path.isEmpty():
+            item = QGraphicsPathItem(path)
+            item.setBrush(pg.mkBrush(160, 195, 220, 65))
+            item.setPen(pg.mkPen(150, 190, 220, 90))
+            item.setZValue(4)
+            self.addItem(item)
+            item.setVisible(self.silences_visible)
+            self._silences.append(item)
 
     def set_silences_visible(self, visible: bool) -> None:
         self.silences_visible = bool(visible)
@@ -1225,7 +1246,15 @@ class AudioVisualizerOverview(pg.PlotWidget):
         ):
             return
         point = self.plotItem.vb.mapSceneToView(event.scenePos())
-        self.seekRequested.emit(max(0, min(self.duration_ms, round(point.x() * 1000))))
+        milliseconds = max(0, min(self.duration_ms, round(point.x() * 1000)))
+        review = next(
+            (row for start, end, row in self._review_ranges if start <= milliseconds <= end),
+            None,
+        )
+        if review is not None:
+            self.issueRequested.emit(review)
+            return
+        self.seekRequested.emit(milliseconds)
 
 
 # Old import names remain valid for callers while the implementation is now

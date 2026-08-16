@@ -93,6 +93,47 @@ class StorageExportTests(unittest.TestCase):
             finally:
                 session.close()
 
+    def test_html_export_can_write_independent_chapter_pages_without_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = ProjectSession.create("standalone-reader", root / "project")
+            try:
+                first_id = session.repository.add_chapter(Chapter(
+                    None, "First chapter", 0,
+                    "<html><body><p><span class='dropcap'>F</span>irst unique text.</p></body></html>",
+                ))
+                second_id = session.repository.add_chapter(Chapter(
+                    None, "Second chapter", 1,
+                    "<html><body><p>Second unique text.</p></body></html>",
+                ))
+                session.repository.replace_segments(first_id, [
+                    TextSegment(None, first_id, 0, "First unique text.", 100, 900),
+                ])
+                session.repository.replace_segments(second_id, [
+                    TextSegment(None, second_id, 0, "Second unique text.", 100, 900),
+                ])
+
+                output = root / "standalone"
+                result = export_html(session, output, standalone_chapters=True)
+                self.assertEqual(output, result)
+                self.assertFalse((output / "index.html").exists())
+                self.assertFalse((output / "pages").exists())
+                pages = sorted(output.glob("*.html"))
+                self.assertEqual(2, len(pages))
+                first = pages[0].read_text("utf-8")
+                second = pages[1].read_text("utf-8")
+                self.assertIn("First unique text.", first)
+                self.assertNotIn("Second unique text.", first)
+                self.assertIn("Second unique text.", second)
+                self.assertNotIn("First unique text.", second)
+                self.assertNotIn('id="chapters"', first)
+                self.assertNotIn("<iframe", first)
+                self.assertIn('id="aat-player"', first)
+                self.assertIn("window.aatActivateSegment", first)
+                self.assertGreaterEqual(first.count('data-aat-index="0"'), 2)
+            finally:
+                session.close()
+
     def test_non_structural_chapter_restore_preserves_segment_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("stable-undo", Path(temporary) / "project")

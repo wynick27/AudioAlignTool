@@ -9,7 +9,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from xml.etree import ElementTree
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from .models import SourceDocumentKind
 
@@ -42,6 +42,74 @@ class ImportedSourceFragment:
     source_end_char: int
 
 
+_ANKI_FURIGANA = re.compile(
+    r"(?P<base>[\u3400-\u9fff々〆ヶ]+)\[(?P<reading>[\u3040-\u30ffー・]+)\]"
+)
+
+
+def contains_anki_furigana(value: str) -> bool:
+    return _ANKI_FURIGANA.search(value) is not None
+
+
+def anki_furigana_to_html(source_html: str) -> str:
+    """Convert Anki ``漢字[かんじ]`` notation without touching code or existing ruby."""
+    soup = BeautifulSoup(source_html, "html.parser")
+    for node in list(soup.find_all(string=True)):
+        parent = node.parent
+        if parent is None or parent.name in {"script", "style", "code", "pre", "ruby", "rt", "rp"}:
+            continue
+        value = str(node)
+        if not contains_anki_furigana(value):
+            continue
+        replacements: list[object] = []
+        cursor = 0
+        for match in _ANKI_FURIGANA.finditer(value):
+            if match.start() > cursor:
+                replacements.append(NavigableString(value[cursor:match.start()]))
+            ruby = soup.new_tag("ruby")
+            ruby["data-aat-anki"] = "1"
+            ruby.append(NavigableString(match.group("base")))
+            rt = soup.new_tag("rt")
+            rt.string = match.group("reading")
+            ruby.append(rt)
+            replacements.append(ruby)
+            cursor = match.end()
+        if cursor < len(value):
+            replacements.append(NavigableString(value[cursor:]))
+        for replacement in reversed(replacements):
+            node.insert_after(replacement)
+        node.extract()
+    head = soup.head
+    if head is not None and not head.find("meta", attrs={"name": "audioalign-anki-furigana"}):
+        marker = soup.new_tag("meta")
+        marker["name"] = "audioalign-anki-furigana"
+        marker["content"] = "1"
+        head.append(marker)
+    return str(soup)
+
+
+def _plain_text_html(value: str) -> str:
+    paragraphs = [part for part in re.split(r"\n\s*\n+", value) if part.strip()]
+    body = "".join(f"<p>{html.escape(part).replace(chr(10), '<br/>')}</p>" for part in paragraphs)
+    return f"<!doctype html><html><head><meta charset='utf-8'></head><body>{body}</body></html>"
+
+
+def apply_anki_furigana(chapters: list[ImportedChapter]) -> list[ImportedChapter]:
+    """Render Anki readings while keeping only base characters in alignment text."""
+    for chapter in chapters:
+        document = chapter.source_html or _plain_text_html(chapter.text)
+        document = anki_furigana_to_html(document)
+        chapter.source_html = document
+        chapter.text = html_to_text(document)
+        chapter.fragments = source_fragments(document, chapter.text)
+        chapter.source_parts = [
+            ImportedSourcePart(part.entry_path, part.selector, anki_furigana_to_html(part.source_html))
+            for part in chapter.source_parts
+        ]
+        chapter.title = _ANKI_FURIGANA.sub(lambda match: match.group("base"), chapter.title)
+    return chapters
+
+
 class _HTMLTextExtractor(HTMLParser):
     block_tags = {"p", "div", "h1", "h2", "h3", "h4", "li", "br", "blockquote"}
 
@@ -51,13 +119,16 @@ class _HTMLTextExtractor(HTMLParser):
         self._ignored = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"head", "script", "style", "svg"}:
+        # Ruby pronunciation annotations are presentation metadata, not a
+        # second copy of the spoken text.  Keeping <rt> produced strings such
+        # as ``夫ふ妻さい`` and made Japanese ASR comparison nearly impossible.
+        if tag in {"head", "script", "style", "svg", "rt", "rp"}:
             self._ignored += 1
         elif not self._ignored and tag in self.block_tags:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"head", "script", "style", "svg"} and self._ignored:
+        if tag in {"head", "script", "style", "svg", "rt", "rp"} and self._ignored:
             self._ignored -= 1
         elif not self._ignored and tag in self.block_tags:
             self.parts.append("\n")
@@ -93,7 +164,7 @@ class _HTMLFragmentExtractor(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
-        if tag in {"script", "style", "svg"}:
+        if tag in {"script", "style", "svg", "rt", "rp"}:
             self._ignored += 1
         elif not self._ignored and tag in self.block_tags and not self._tag:
             self._tag = tag
@@ -103,7 +174,7 @@ class _HTMLFragmentExtractor(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
-        if tag in {"script", "style", "svg"} and self._ignored:
+        if tag in {"script", "style", "svg", "rt", "rp"} and self._ignored:
             self._ignored -= 1
         elif tag == self._tag:
             text = html.unescape("".join(self._parts))
@@ -149,6 +220,31 @@ def decode_text(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+_HTML_DECLARED_CHARSET = re.compile(
+    br"(?:charset\s*=\s*['\"]?\s*|encoding\s*=\s*['\"])([a-zA-Z0-9._-]+)",
+    re.IGNORECASE,
+)
+
+
+def decode_html_bytes(raw: bytes) -> str:
+    """Decode HTML/XHTML while honouring its byte-level charset declaration.
+
+    EPUB 2 files frequently declare ISO-8859-1 but contain Windows-1252 smart
+    punctuation.  Browsers apply the HTML-compatible Windows-1252 mapping, so
+    the editor must do the same before rewriting the rendered copy as UTF-8.
+    """
+    declaration = _HTML_DECLARED_CHARSET.search(raw[:4096])
+    if declaration:
+        encoding = declaration.group(1).decode("ascii", errors="ignore").casefold()
+        if encoding in {"iso-8859-1", "iso8859-1", "latin-1", "latin1"}:
+            encoding = "cp1252"
+        try:
+            return raw.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            pass
+    return decode_text(raw)
+
+
 _GENERIC_CHAPTER_TITLE = re.compile(r"^章节\s*\d+$")
 
 
@@ -159,14 +255,17 @@ def infer_epub_chapter_title(source_html: str, text: str, fallback: str) -> str:
         value = html_to_text(heading.group(1)).strip()
         if value:
             return value
+    # Many fixed-layout and Japanese EPUBs put the authored chapter name only
+    # in <head><title>; their body starts immediately with a short narrative
+    # sentence.  Prefer that metadata over guessing from the first body line.
+    document_title = re.search(r"<title[^>]*>(.*?)</title>", source_html, re.I | re.S)
+    if document_title:
+        value = html.unescape(re.sub(r"<[^>]+>", "", document_title.group(1))).strip()
+        if value:
+            return value
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
     if first_line and len(first_line) <= 160:
         return first_line
-    document_title = re.search(r"<title[^>]*>(.*?)</title>", source_html, re.I | re.S)
-    if document_title:
-        value = html_to_text(document_title.group(1)).strip()
-        if value:
-            return value
     return fallback
 
 
@@ -423,7 +522,7 @@ def import_epub(path: str | Path) -> list[ImportedChapter]:
                 raw = archive.read(member)
             except KeyError:
                 continue
-            source_html = decode_text(raw)
+            source_html = decode_html_bytes(raw)
             text = html_to_text(source_html)
             if not text:
                 continue
@@ -507,17 +606,26 @@ def _combine_html_documents(left: str, right: str) -> str:
     return str(output)
 
 
-def import_book(path: str | Path, *, one_chapter: bool = False) -> list[ImportedChapter]:
+def import_book(
+    path: str | Path,
+    *,
+    one_chapter: bool = False,
+    anki_furigana: bool = False,
+) -> list[ImportedChapter]:
     source = Path(path)
     suffix = source.suffix.lower()
     if suffix == ".txt":
-        return import_txt(source)
+        chapters = import_txt(source)
+        return apply_anki_furigana(chapters) if anki_furigana else chapters
     if suffix in {".md", ".markdown"}:
-        return [import_markdown_as_chapter(source)] if one_chapter else import_markdown(source)
+        chapters = [import_markdown_as_chapter(source)] if one_chapter else import_markdown(source)
+        return apply_anki_furigana(chapters) if anki_furigana else chapters
     if suffix in {".html", ".htm"}:
-        return [import_html_as_chapter(source)] if one_chapter else import_html(source)
+        chapters = [import_html_as_chapter(source)] if one_chapter else import_html(source)
+        return apply_anki_furigana(chapters) if anki_furigana else chapters
     if suffix == ".epub":
-        return import_epub(source)
+        chapters = import_epub(source)
+        return apply_anki_furigana(chapters) if anki_furigana else chapters
     raise ValueError(f"不支持的文本格式：{suffix}")
 
 

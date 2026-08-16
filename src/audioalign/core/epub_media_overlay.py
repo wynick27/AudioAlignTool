@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable
 from threading import Lock
 import unicodedata
+from enum import StrEnum
 from urllib.parse import unquote
 from xml.etree import ElementTree
 
@@ -31,6 +32,11 @@ from .text import html_to_text, normalize_for_match
 Progress = Callable[[float, str], None]
 
 
+class EpubTextPolicy(StrEnum):
+    PRESERVE_SOURCE = "preserve_source"
+    APPLY_EDITS = "apply_edits"
+
+
 @dataclass(slots=True)
 class EpubMediaOverlayOptions:
     audio_policy: AudioConversionPolicy = AudioConversionPolicy.AUTO_COMPATIBLE
@@ -38,6 +44,7 @@ class EpubMediaOverlayOptions:
     stereo_bitrate: int = 128_000
     extend_segment_ends: bool = False
     max_end_extension_ms: int = 2_000
+    text_policy: EpubTextPolicy = EpubTextPolicy.PRESERVE_SOURCE
     warnings: list[str] = field(default_factory=list, repr=False)
 
 
@@ -154,7 +161,7 @@ def _q(namespace: str, name: str) -> str:
 def _normalized_nodes(soup: BeautifulSoup):
     nodes = [
         node for node in soup.find_all(string=True)
-        if node.parent and node.parent.name not in {"style", "script", "title", "svg"}
+        if node.parent and node.parent.name not in {"style", "script", "title", "svg", "rt", "rp"}
     ]
     characters: list[str] = []
     mapping: list[tuple[int, int] | None] = []
@@ -229,6 +236,127 @@ def _fuzzy_projection_match(
     return best[1], best[2]
 
 
+def _original_segment_targets(
+    session: ProjectSession, chapter_id: int,
+) -> dict[int, str]:
+    """Recover immutable source text ranges for edited segment rows."""
+    fragments = session.repository.source_fragments(chapter_id)
+    targets: dict[int, str] = {}
+    for segment in session.repository.segments(chapter_id):
+        if segment.source_start_char is None or segment.source_end_char is None:
+            continue
+        parts: list[str] = []
+        for fragment in fragments:
+            overlap_start = max(segment.source_start_char, fragment.source_start_char)
+            overlap_end = min(segment.source_end_char, fragment.source_end_char)
+            if overlap_end <= overlap_start:
+                continue
+            local_start = overlap_start - fragment.source_start_char
+            local_end = overlap_end - fragment.source_start_char
+            parts.append(fragment.text[local_start:local_end])
+        target = "".join(parts)
+        if target:
+            targets[segment.position] = target
+    return targets
+
+
+def _editable_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).replace("\u00ad", "")
+    return " ".join(value.split())
+
+
+def _locate_source_target(
+    document: str,
+    target: str,
+    cursor: int,
+) -> tuple[int, int] | None:
+    target = " ".join(target.split())
+    start = document.find(target, cursor) if target else -1
+    if start >= 0:
+        return start, start + len(target)
+    projected_document, projected_offsets = _match_projection(document)
+    projected_target, _unused = _match_projection(target)
+    projected_cursor = bisect_left(projected_offsets, cursor)
+    projected_start = (
+        projected_document.find(projected_target, projected_cursor)
+        if projected_target else -1
+    )
+    if projected_start < 0:
+        fuzzy = _fuzzy_projection_match(
+            projected_document, projected_target, projected_cursor,
+        ) if projected_target else None
+        if fuzzy is None:
+            return None
+        projected_start, projected_end = fuzzy
+    else:
+        projected_end = projected_start + len(projected_target)
+    if projected_start >= len(projected_offsets) or projected_end <= projected_start:
+        return None
+    return projected_offsets[projected_start], projected_offsets[projected_end - 1] + 1
+
+
+def _apply_text_edits_to_xhtml(
+    source_html: str,
+    segments: list[TextSegment],
+    original_targets: dict[int, str],
+    applied_positions: set[int],
+) -> tuple[str, set[int], set[int]]:
+    """Apply only edits confined to one ordinary text node.
+
+    Cross-node replacements could destroy emphasis, drop caps, ruby or links;
+    those edits deliberately remain in the project but not in the EPUB copy.
+    """
+    soup = BeautifulSoup(source_html, "html.parser")
+    nodes, document, mapping = _normalized_nodes(soup)
+    cursor = 0
+    edits: dict[int, list[tuple[int, int, str, int]]] = {}
+    modified: set[int] = set()
+    unsafe: set[int] = set()
+    for segment in segments:
+        if segment.position in applied_positions:
+            continue
+        original = original_targets.get(segment.position, "")
+        if not original or _editable_text(original) == _editable_text(segment.text):
+            continue
+        modified.add(segment.position)
+        located = _locate_source_target(document, original, cursor)
+        if located is None:
+            continue
+        start, end = located
+        cursor = end
+        per_node: dict[int, list[int]] = {}
+        for item in mapping[start:end]:
+            if item is not None:
+                per_node.setdefault(item[0], []).append(item[1])
+        if len(per_node) != 1 or not segment.text:
+            unsafe.add(segment.position)
+            continue
+        node_index, offsets = next(iter(per_node.items()))
+        local_start, local_end = min(offsets), max(offsets) + 1
+        node_value = str(nodes[node_index])
+        covered = set(offsets)
+        if any(
+            offset not in covered and not node_value[offset].isspace()
+            for offset in range(local_start, local_end)
+        ):
+            unsafe.add(segment.position)
+            continue
+        node = nodes[node_index]
+        if node.parent and node.parent.name in {"ruby", "rt", "rp", "a"}:
+            unsafe.add(segment.position)
+            continue
+        edits.setdefault(node_index, []).append(
+            (local_start, local_end, segment.text, segment.position)
+        )
+    for node_index, node_edits in edits.items():
+        value = str(nodes[node_index])
+        for start, end, replacement, position in sorted(node_edits, reverse=True):
+            value = value[:start] + replacement + value[end:]
+            applied_positions.add(position)
+        nodes[node_index].replace_with(NavigableString(value))
+    return str(soup), modified, unsafe
+
+
 def _audio_chunks(session: ProjectSession, chapter_id: int, start_ms: int, end_ms: int):
     cursor = 0
     result = []
@@ -280,6 +408,7 @@ def _annotate_for_overlay(
     missing_is_error: bool = True,
     matched_positions: set[int] | None = None,
     segment_ranges: dict[int, tuple[int, int]] | None = None,
+    target_texts: dict[int, str] | None = None,
 ) -> tuple[str, list[_OverlayUnit], list[str]]:
     soup = BeautifulSoup(source_html, "html.parser")
     for tag in soup.find_all(["script", "noscript"]):
@@ -302,7 +431,9 @@ def _annotate_for_overlay(
             if segment_ranges is not None
             else (segment.start_ms, segment.end_ms)
         )
-        target = " ".join(segment.text.split())
+        target = " ".join(
+            (target_texts.get(segment.position, segment.text) if target_texts else segment.text).split()
+        )
         start = document.find(target, cursor) if target else -1
         if start < 0 and target:
             projected_target, _unused = _match_projection(target)
@@ -702,9 +833,16 @@ def export_epub_media_overlay(
         for index, chapter in enumerate(chapters):
             items_for_chapter = chapter_items[index]
             matched_positions: set[int] = set()
-            segment_ranges = _export_segment_ranges(
-                session.repository.segments(chapter.id or 0), options,
-            )
+            chapter_segments = session.repository.segments(chapter.id or 0)
+            segment_ranges = _export_segment_ranges(chapter_segments, options)
+            original_targets = _original_segment_targets(session, chapter.id or 0)
+            modified_positions = {
+                segment.position for segment in chapter_segments
+                if original_targets.get(segment.position)
+                and _editable_text(original_targets[segment.position])
+                != _editable_text(segment.text)
+            }
+            applied_edit_positions: set[int] = set()
             page_titles: set[str] = set()
             for part_index, item in enumerate(items_for_chapter):
                 xhtml_path = opf_path.parent / unquote(item.attrib["href"])
@@ -712,11 +850,25 @@ def export_epub_media_overlay(
                 source_soup = BeautifulSoup(source_html, "html.parser")
                 if source_soup.title:
                     page_titles.add(" ".join(source_soup.title.get_text().split()))
+                if options.text_policy == EpubTextPolicy.APPLY_EDITS:
+                    source_html, _modified_here, _unsafe_here = _apply_text_edits_to_xhtml(
+                        source_html, chapter_segments, original_targets,
+                        applied_edit_positions,
+                    )
+                target_texts = {
+                    segment.position: (
+                        segment.text
+                        if segment.position in applied_edit_positions
+                        else original_targets.get(segment.position, segment.text)
+                    )
+                    for segment in chapter_segments
+                }
                 rendered, units, errors = _annotate_for_overlay(
                     source_html, session, chapter,
                     missing_is_error=len(items_for_chapter) == 1,
                     matched_positions=matched_positions,
                     segment_ranges=segment_ranges,
+                    target_texts=target_texts,
                 )
                 all_errors.extend(errors)
                 if not units:
@@ -747,8 +899,10 @@ def export_epub_media_overlay(
                 })
                 item.set("media-overlay", smil_id)
             if len(items_for_chapter) > 1:
-                for segment in session.repository.segments(chapter.id or 0):
-                    target = " ".join(segment.text.split())
+                for segment in chapter_segments:
+                    target = " ".join(
+                        original_targets.get(segment.position, segment.text).split()
+                    )
                     if (
                         segment.end_ms > segment.start_ms
                         and segment.position not in matched_positions
@@ -757,6 +911,12 @@ def export_epub_media_overlay(
                         all_errors.append(
                             f"{chapter.title} · 句段 {segment.position + 1} 无法映射回任何原 XHTML 页面"
                         )
+            if options.text_policy == EpubTextPolicy.APPLY_EDITS:
+                for position in sorted(modified_positions - applied_edit_positions):
+                    all_errors.append(
+                        f"{chapter.title} · 句段 {position + 1} 的文字修改跨越样式、链接、ruby，"
+                        "或无法可靠定位；导出副本已保持原文"
+                    )
             progress(0.5 + 0.4 * (index + 1) / max(1, len(chapters)), f"生成 Media Overlay：{chapter.title}")
         options.warnings[:] = all_errors
         if all_errors:

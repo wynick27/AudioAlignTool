@@ -47,6 +47,16 @@ class MappingPathTests(unittest.TestCase):
         self.assertEqual([(1, 9)], [(link.chapter_id, link.audio_id) for link in links])
         self.assertGreater(links[0].confidence, 0.7)
 
+    def test_japanese_numbered_chapters_do_not_skip_later_audio(self) -> None:
+        chapters = [Chapter(index, f"第{index}章　題名{index}", index - 1) for index in range(1, 18)]
+        choices = [
+            AudioSlice(index, f"{index:02d}. 題名{index}", f"{index:02d}.opus", 0, 60_000, index - 1)
+            for index in range(1, 18)
+        ]
+        links = automatic_links(chapters, choices, {index: 10_000 for index in range(1, 18)})
+        self.assertEqual(list(range(1, 18)), [link.chapter_id for link in links])
+        self.assertEqual(list(range(1, 18)), [link.audio_id for link in links])
+
     def test_short_front_matter_does_not_consume_first_audiobook_chapter(self) -> None:
         chapters = [
             Chapter(1, "章节 1", 0),
@@ -60,6 +70,48 @@ class MappingPathTests(unittest.TestCase):
         ]
         links = automatic_links(chapters, choices, {1: 5, 2: 100, 3: 30_000, 4: 25_000})
         self.assertEqual([(3, 10), (4, 11)], [(link.chapter_id, link.audio_id) for link in links])
+
+    def test_generic_m4b_markers_use_global_duration_shape_not_marker_number(self) -> None:
+        names = (
+            "One Two Three Four Five Six Seven Eight Nine Ten Eleven Twelve "
+            "Thirteen Fourteen Fifteen Sixteen"
+        ).split()
+        lengths = [
+            17914, 22763, 18871, 11865, 14653, 15043, 12473, 16040,
+            27757, 12381, 15172, 12898, 14157, 17332, 15443, 7408,
+        ]
+        body_durations = [
+            1199191, 1599674, 1435625, 924186, 1058678, 1078192,
+            962260, 1182903, 2129176, 963984, 1097796, 1065104,
+            1053010, 1225914, 1104770, 636853,
+        ]
+        chapters = [Chapter(1, "And Then There Were None", 0)]
+        chapters.extend(Chapter(index + 2, name, index + 1) for index, name in enumerate(names))
+        chapters.extend([
+            Chapter(18, "Epilogue", 17),
+            Chapter(19, "A Manuscript Document Sent To Scotland Yard", 18),
+            Chapter(20, "And Then There Were None", 19),
+        ])
+        durations = [42_214, 77_676, *body_durations, 1_013_539, 1_864_451]
+        cursor = 0
+        choices = []
+        for index, duration in enumerate(durations):
+            choices.append(AudioSlice(1, f"Chapter {index + 1:03d}", "book.m4b", cursor, cursor + duration, index))
+            cursor += duration
+        text_lengths = {
+            1: 937, **{index + 2: length for index, length in enumerate(lengths)},
+            18: 15370, 19: 20292, 20: 881,
+        }
+
+        links = automatic_links(chapters, choices, text_lengths)
+
+        by_chapter = {link.chapter_id: link for link in links}
+        self.assertEqual(42_214, by_chapter[1].source_start_ms)
+        for offset, chapter_id in enumerate(range(2, 18), start=2):
+            self.assertEqual(choices[offset].start_ms, by_chapter[chapter_id].source_start_ms)
+        self.assertEqual(choices[18].start_ms, by_chapter[18].source_start_ms)
+        self.assertEqual(choices[19].start_ms, by_chapter[19].source_start_ms)
+        self.assertNotIn(20, by_chapter)
 
     def test_one_chapter_can_have_multiple_ordered_slices(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

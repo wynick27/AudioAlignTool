@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "components": [
+    {
+      "id": "faster-whisper-cuda-win-x64",
+      "group": "cuda",
+      "variant": "cuda12",
+      "display_name": "NVIDIA GPU 支持（faster-whisper）",
+      "description": "为 faster-whisper 安装 CUDA 12 / cuDNN 9 用户态运行库。",
+      "packages": [
+        "nvidia-cublas-cu12",
+        "nvidia-cudnn-cu12==9.*"
+      ],
+      "index_url": "https://pypi.org/simple",
+      "python_abi": "cp313",
+      "platform": "win_amd64"
+    },
+    {
+      "id": "qwen-cpu-win-x64",
+      "group": "qwen",
+      "variant": "cpu",
+      "display_name": "Qwen3 ASR / ForcedAligner（CPU）",
+      "description": "Qwen3 ASR 与强制对齐 CPU 运行时；无需 NVIDIA 显卡，但速度较慢。",
+      "packages": [
+        "qwen-asr==0.0.6",
+        "modelscope==1.38.1",
+        "torch==2.11.0"
+      ],
+      "index_url": "https://pypi.org/simple",
+      "extra_index_urls": [
+        "https://download.pytorch.org/whl/cpu"
+      ],
+      "python_abi": "cp313",
+      "platform": "win_amd64"
+    },
+    {
+      "id": "qwen-cuda-win-x64",
+      "group": "qwen",
+      "variant": "cuda128",
+      "display_name": "Qwen3 ASR / ForcedAligner（NVIDIA GPU）",
+      "description": "Qwen3 ASR 与强制对齐 CUDA 12.8 运行时；需要兼容的 NVIDIA 驱动。",
+      "packages": [
+        "qwen-asr==0.0.6",
+        "modelscope==1.38.1",
+        "torch==2.11.0"
+      ],
+      "index_url": "https://pypi.org/simple",
+      "extra_index_urls": [
+        "https://download.pytorch.org/whl/cu128"
+      ],
+      "python_abi": "cp313",
+      "platform": "win_amd64"
+    },
+    {
+      "id": "whisperx-cpu-win-x64",
+      "group": "whisperx",
+      "variant": "cpu",
+      "display_name": "WhisperX 精确对齐（CPU）",
+      "description": "WhisperX 识别与词级强制对齐 CPU 运行时。",
+      "packages": [
+        "whisperx>=3.7,<3.9",
+        "torch==2.8.0",
+        "torchaudio==2.8.0",
+        "torchvision==0.23.0"
+      ],
+      "index_url": "https://pypi.org/simple",
+      "extra_index_urls": [
+        "https://download.pytorch.org/whl/cpu"
+      ],
+      "python_abi": "cp313",
+      "platform": "win_amd64"
+    },
+    {
+      "id": "whisperx-cuda-win-x64",
+      "group": "whisperx",
+      "variant": "cuda128",
+      "display_name": "WhisperX 精确对齐（NVIDIA GPU）",
+      "description": "WhisperX 识别与词级强制对齐 CUDA 12.8 运行时。",
+      "packages": [
+        "whisperx>=3.7,<3.9",
+        "torch==2.8.0",
+        "torchaudio==2.8.0",
+        "torchvision==0.23.0"
+      ],
+      "index_url": "https://pypi.org/simple",
+      "extra_index_urls": [
+        "https://download.pytorch.org/whl/cu128"
+      ],
+      "python_abi": "cp313",
+      "platform": "win_amd64"
+    }
+  ]
+}

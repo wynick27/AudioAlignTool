@@ -6,16 +6,28 @@ import zipfile
 from pathlib import Path
 
 from audioalign.core.text import (
+    anki_furigana_to_html,
     cursor_split_offset,
     import_epub,
     join_segment_text,
     normalize_for_match,
     preferred_split_offset,
     split_sentences,
+    html_to_text,
 )
 
 
 class TextTests(unittest.TestCase):
+    def test_anki_furigana_renders_ruby_but_alignment_text_excludes_reading(self) -> None:
+        rendered = anki_furigana_to_html(
+            "<html><head></head><body><p>彼は魔法[まほう]学校[がっこう]へ行く。</p>"
+            "<code>値[かな]</code></body></html>"
+        )
+        self.assertIn('data-aat-anki="1">魔法<rt>まほう</rt>', rendered)
+        self.assertIn('data-aat-anki="1">学校<rt>がっこう</rt>', rendered)
+        self.assertIn("値[かな]", rendered)
+        self.assertEqual("彼は魔法学校へ行く。\n値[かな]", html_to_text(rendered))
+
     def test_long_spanish_sentence_is_not_split_at_an_arbitrary_space(self) -> None:
         text = " ".join(f"palabra{index}" for index in range(80))
         self.assertEqual([text], split_sentences(text))
@@ -92,6 +104,31 @@ class TextTests(unittest.TestCase):
             chapters = import_epub(epub)
             self.assertEqual("第一章", chapters[0].title)
             self.assertIn("正文内容", chapters[0].text)
+
+    def test_japanese_epub_uses_head_title_and_excludes_ruby_readings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            epub = Path(temporary) / "japanese-ruby.epub"
+            with zipfile.ZipFile(epub, "w") as archive:
+                archive.writestr(
+                    "META-INF/container.xml",
+                    '<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>',
+                )
+                archive.writestr(
+                    "OEBPS/content.opf",
+                    '<package><manifest><item id="body" href="body.xhtml"/></manifest>'
+                    '<spine><itemref idref="body"/></spine></package>',
+                )
+                archive.writestr(
+                    "OEBPS/body.xhtml",
+                    "<html><head><title>第１章　生き残った男の子</title></head><body>"
+                    "<p>プリベット通りの<ruby>夫<rt>ふ</rt></ruby>"
+                    "<ruby>妻<rt>さい</rt></ruby>はまともな人間だった。</p></body></html>",
+                )
+            chapters = import_epub(epub)
+            self.assertEqual("第１章　生き残った男の子", chapters[0].title)
+            self.assertIn("夫妻は", chapters[0].text)
+            self.assertNotIn("夫ふ妻さい", chapters[0].text)
+            self.assertEqual("夫妻はまともな人間だった。", chapters[0].fragments[0].text[-13:])
 
     def test_epub_merges_duplicate_title_page_without_losing_spoken_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

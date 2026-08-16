@@ -6,4 +6,3 @@ ebooklib>=0.18
 beautifulsoup4>=4.12
 markdown-it-py>=3,<5
 faster-whisper>=1.2.1
-qwen-asr==0.0.6

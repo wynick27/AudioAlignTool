@@ -29,8 +29,8 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QFont, QKeySequence
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QFont, QKeySequence, QTextCursor
+from PySide6.QtMultimedia import QAudioBufferOutput, QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -69,8 +69,19 @@ from audioalign.core.alignment import (
     align_segments_from_silence,
     anchors_from_segments_tokens,
     align_segments_to_tokens,
+    ForcedAlignmentBlockResult,
+    ForcedAlignmentHypothesis,
+    ForcedAlignmentPlannerOptions,
+    ForcedAlignmentRunResult,
+    forced_alignment_overlap_score,
+    forced_alignment_text_group_ends,
+    forced_alignment_window_ends,
+    locate_contiguous_audio_part,
+    progressive_vad_next_start,
     segments_from_asr_tokens,
     snap_boundaries,
+    score_forced_alignment_hypothesis,
+    spoken_unit_count,
 )
 from audioalign.core.asr import (
     ASROptions,
@@ -88,8 +99,15 @@ from audioalign.core.asr import (
     runtime_status,
     transcriber_for_options,
 )
-from audioalign.core.audio import create_m4a_proxy, decode_audio_mono, detect_silence_candidates
-from audioalign.core.epub_media_overlay import EpubMediaOverlayOptions, export_epub_media_overlay
+from audioalign.core.audio import (
+    create_m4a_proxy,
+    decode_audio_mono,
+    detect_silence_candidates,
+    key_silence_candidates,
+)
+from audioalign.core.epub_media_overlay import (
+    EpubMediaOverlayOptions, EpubTextPolicy, export_epub_media_overlay,
+)
 from audioalign.core.exporters import export_html, export_json, export_subtitles
 from audioalign.core.models import (
     AlignmentMode,
@@ -107,6 +125,7 @@ from audioalign.core.models import (
     SegmentOrigin,
     SegmentOverlapPolicy,
     SegmentStatus,
+    SilenceDisplayMode,
     SilenceAlignmentOptions,
     SilenceSettings,
     SourceFragment,
@@ -119,6 +138,7 @@ from audioalign.core.models import (
 )
 from audioalign.core.paths import ApplicationPaths, sanitize_project_name
 from audioalign.core.runtime import subprocess_runtime_environment
+from audioalign.gui.runtime_manager import RuntimeManagerDialog
 from audioalign.core.spectrogram import (
     AudioVisualizationCache,
     build_audio_visualization_cache_from_slices,
@@ -146,10 +166,21 @@ from audioalign.core.subtitles import import_srt
 
 from .article_spectrogram import ArticleSpectrogramView
 from .asr_comparison import ASRComparisonView
+from .find_dialog import FindDialog
 from .mapping_dialog import ChapterAudioMappingDialog
 from .original_book_view import OriginalBookView
 from .segment_model import MiniSpectrogramDelegate, SegmentTableModel
 from .spectrogram_editor import AudioVisualizerEditor, AudioVisualizerOverview
+
+
+def _are_unedited_asr_segments(segments: list[TextSegment]) -> bool:
+    """Allow cached ASR to refresh generated punctuation, never manual text."""
+    return bool(segments) and all(
+        segment.origin == SegmentOrigin.ASR
+        and not segment.locked
+        and segment.status in {SegmentStatus.AUTO, SegmentStatus.LOW_CONFIDENCE}
+        for segment in segments
+    )
 
 
 WORKFLOW_FASTER_WHISPER = "faster-whisper-asr-align"
@@ -493,6 +524,8 @@ class MainWindow(QMainWindow):
         self._editor_loading = False
         self._editor_history_pushed = False
         self._editing_row = -1
+        self._editor_cursor_row = -1
+        self._editor_cursor_position = 0
         self._speed_warning_shown = False
         self._playback_row_update = False
         self._manual_selection_until = 0.0
@@ -502,9 +535,23 @@ class MainWindow(QMainWindow):
         self._seek_generation = 0
         self._pending_seek_target: int | None = None
         self._pending_seek_deadline = 0.0
+        # QMediaPlayer loads sources asynchronously. Keep the resource-absolute
+        # seek until LoadedMedia instead of letting an M4B slice start at zero.
+        self._pending_media_position: int | None = None
+        self._pending_media_autoplay = False
+        self._pending_media_deadline = 0.0
+        self._player_asset_id: int | None = None
+        self._logical_playhead_ms = 0
+        # User intent is independent from the backend's transient state. A
+        # late proxy/load callback may only play while this remains True.
+        self._playback_requested = False
+        self._audio_watch_started_at = 0.0
+        self._last_audio_buffer_at = 0.0
         self._drag_changed_rows: set[int] = set()
         self._runtime_probe_pending: set[str] = set()
         self._runtime_probe_cache: dict[str, RuntimeStatus] = {}
+        self._find_dialog: FindDialog | None = None
+        self._find_state: tuple[tuple, int, int, int, int] | None = None
         self._runtime_probe_signals = RuntimeProbeSignals(self)
         self._runtime_probe_signals.finished.connect(self._runtime_probe_finished)
 
@@ -512,6 +559,9 @@ class MainWindow(QMainWindow):
         self.audio_output.setVolume(0.9)
         self.player = QMediaPlayer(self)
         self.player.setAudioOutput(self.audio_output)
+        self.audio_buffer_output = QAudioBufferOutput(self)
+        self.player.setAudioBufferOutput(self.audio_buffer_output)
+        self.audio_buffer_output.audioBufferReceived.connect(self._audio_buffer_received)
         stored_rate = (
             1.0
             if self.preferences.get("always_start_1x", False)
@@ -525,8 +575,13 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self.player.positionChanged.connect(self._on_position)
+        self.player.mediaStatusChanged.connect(self._media_status_changed)
         self.player.playbackStateChanged.connect(self._play_state_changed)
         self.player.errorOccurred.connect(self._player_error)
+        self.audio_watchdog = QTimer(self)
+        self.audio_watchdog.setInterval(400)
+        self.audio_watchdog.timeout.connect(self._check_m4b_audio_output)
+        self.audio_watchdog.start()
 
         self.tasks = TaskManager(self)
         self.tasks.laneStarted.connect(self._lane_task_started)
@@ -586,6 +641,14 @@ class MainWindow(QMainWindow):
         self.detect_book_silence_action = QAction(
             "检测全书静音区", self, triggered=self.detect_book_silence,
         )
+        self.clear_chapter_timing_action = QAction(
+            "清除本章全部时间对应（保留文本）", self,
+            triggered=self.clear_chapter_timing,
+        )
+        self.reset_chapter_alignment_action = QAction(
+            "重置本章字幕并重新匹配…", self,
+            triggered=self.reset_chapter_and_rematch,
+        )
         self.export_html_action = QAction("导出 HTML…", self, triggered=lambda: self.export_output("html"))
         self.export_srt_action = QAction("导出 SRT…", self, triggered=lambda: self.export_output("srt"))
         self.export_vtt_action = QAction("导出 VTT…", self, triggered=lambda: self.export_output("vtt"))
@@ -595,6 +658,15 @@ class MainWindow(QMainWindow):
         )
         self.undo_action = QAction("撤销", self, shortcut=QKeySequence.StandardKey.Undo, triggered=self.undo)
         self.redo_action = QAction("重做", self, shortcut=QKeySequence.StandardKey.Redo, triggered=self.redo)
+        self.find_action = QAction(
+            "查找…", self, shortcut=QKeySequence.StandardKey.Find, triggered=self.show_find_dialog,
+        )
+        self.find_next_action = QAction(
+            "查找下一个", self, shortcut=QKeySequence("F3"), triggered=lambda: self.find_again(False),
+        )
+        self.find_previous_action = QAction(
+            "查找上一个", self, shortcut=QKeySequence("Shift+F3"), triggered=lambda: self.find_again(True),
+        )
         defaults = {
             "play_pause": "Space", "play_current": "F5", "loop_current": "Shift+F5",
             "set_start": "F11", "set_end": "F12", "set_end_next": "F10",
@@ -716,10 +788,31 @@ class MainWindow(QMainWindow):
         for action in (self.article_none_action, self.article_spectrum_action, self.article_waveform_action):
             self.article_visualization_group.addAction(action)
         self.article_spectrum_action.setChecked(True)
-        self.silence_markers_action = command(
-            "silence_markers", "显示静音标记", self._set_silence_markers_visible, checkable=True
-        )
-        self.silence_markers_action.setChecked(bool(self.preferences.get("show_silence_markers", True)))
+        self.silence_display_group = QActionGroup(self)
+        self.silence_display_group.setExclusive(True)
+        self.silence_hidden_action = QAction("隐藏", self, checkable=True)
+        self.silence_key_action = QAction("关键", self, checkable=True)
+        self.silence_all_action = QAction("全部", self, checkable=True)
+        for action, mode in (
+            (self.silence_hidden_action, SilenceDisplayMode.HIDDEN),
+            (self.silence_key_action, SilenceDisplayMode.KEY),
+            (self.silence_all_action, SilenceDisplayMode.ALL),
+        ):
+            self.silence_display_group.addAction(action)
+            action.triggered.connect(
+                lambda checked=False, value=mode: self._set_silence_display_mode(value)
+            )
+        try:
+            silence_mode = SilenceDisplayMode(
+                self.preferences.get("silence_display_mode", SilenceDisplayMode.KEY.value)
+            )
+        except ValueError:
+            silence_mode = SilenceDisplayMode.KEY
+        {
+            SilenceDisplayMode.HIDDEN: self.silence_hidden_action,
+            SilenceDisplayMode.KEY: self.silence_key_action,
+            SilenceDisplayMode.ALL: self.silence_all_action,
+        }[silence_mode].setChecked(True)
         self.start_normal_speed_action = QAction("启动时使用 1.0×", self, checkable=True)
         self.start_normal_speed_action.setChecked(bool(self.preferences.get("always_start_1x", False)))
         self.start_normal_speed_action.toggled.connect(
@@ -739,9 +832,18 @@ class MainWindow(QMainWindow):
             self.export_json_action, self.export_epub_action,
         ])
         edit_menu = self.menuBar().addMenu("编辑")
-        edit_menu.addActions([self.undo_action, self.redo_action, self.mapping_action])
+        edit_menu.addActions([self.undo_action, self.redo_action])
+        edit_menu.addSeparator()
+        edit_menu.addActions([self.find_action, self.find_next_action, self.find_previous_action])
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.mapping_action)
         recognize_menu = self.menuBar().addMenu("识别")
         recognize_menu.addAction(self.recognize_action)
+        recognize_menu.addSeparator()
+        recognize_menu.addActions([
+            self.clear_chapter_timing_action,
+            self.reset_chapter_alignment_action,
+        ])
         book_menu = recognize_menu.addMenu("全书批量处理")
         book_menu.addActions([
             self.recognize_book_action,
@@ -750,13 +852,17 @@ class MainWindow(QMainWindow):
         ])
         options_menu = self.menuBar().addMenu("选项")
         options_menu.addAction("快捷键…", self.edit_shortcuts)
+        options_menu.addAction("运行时组件…", self.manage_runtime_components)
         options_menu.addAction(self.start_normal_speed_action)
         view_menu = self.menuBar().addMenu("视图")
         list_menu = view_menu.addMenu("句子视图音频图")
         list_menu.addActions([self.list_none_action, self.list_spectrum_action, self.list_waveform_action])
         article_menu = view_menu.addMenu("文章视图音频图")
         article_menu.addActions([self.article_none_action, self.article_spectrum_action, self.article_waveform_action])
-        view_menu.addAction(self.silence_markers_action)
+        silence_menu = view_menu.addMenu("静音显示")
+        silence_menu.addActions([
+            self.silence_hidden_action, self.silence_key_action, self.silence_all_action,
+        ])
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("主工具栏", self)
@@ -765,6 +871,11 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addActions([self.import_book_action, self.import_audio_action, self.mapping_action, self.recognize_action])
         self.addToolBar(toolbar)
+
+    def manage_runtime_components(self) -> None:
+        RuntimeManagerDialog(self.paths, self).exec()
+        self._runtime_probe_cache.clear()
+        self._update_model_status()
 
     def _tool_button(self, text: str, tooltip: str, callback=None, *, checkable: bool = False) -> QToolButton:
         button = QToolButton(self)
@@ -943,7 +1054,7 @@ class MainWindow(QMainWindow):
         self.qwen_align_menu = QMenu(self.qwen_align_button)
         self.qwen_align_menu.addAction("对齐当前句", self.qwen_align_current_segment)
         self.qwen_align_menu.addAction("对齐所选句子 ↔ 音频选区", self.qwen_align_selected_range)
-        self.qwen_align_menu.addAction("从当前句/时间向后对齐", self.qwen_align_from_current_anchor)
+        self.qwen_align_menu.addAction("块级对齐（从当前句/时间向后）", self.qwen_align_from_current_anchor)
         self.qwen_align_button.setMenu(self.qwen_align_menu)
         silence_button = QPushButton("检测静音区")
         silence_button.clicked.connect(self.detect_silence)
@@ -1050,6 +1161,7 @@ class MainWindow(QMainWindow):
         self.overview = AudioVisualizerOverview()
         self.overview.seekRequested.connect(self._overview_jump)
         self.overview.windowRequested.connect(self._overview_window)
+        self.overview.issueRequested.connect(self._overview_issue_requested)
         self.overview.interactionStarted.connect(lambda: self.spectrogram.suspend_follow("overview"))
         bottom_layout.addWidget(self.spectrogram)
         bottom_layout.addWidget(self.overview)
@@ -1078,7 +1190,13 @@ class MainWindow(QMainWindow):
             self._set_list_visualization_mode(AudioVisualizationMode.SPECTROGRAM)
         self._article_visualization_changed(self.article_view.canvas.mode.value)
         self.spectrogram.set_follow_enabled(self.follow_action.isChecked())
-        self._set_silence_markers_visible(self.silence_markers_action.isChecked())
+        checked_silence_action = self.silence_display_group.checkedAction()
+        silence_mode = {
+            self.silence_hidden_action: SilenceDisplayMode.HIDDEN,
+            self.silence_key_action: SilenceDisplayMode.KEY,
+            self.silence_all_action: SilenceDisplayMode.ALL,
+        }.get(checked_silence_action, SilenceDisplayMode.KEY)
+        self._set_silence_display_mode(silence_mode)
         self._alignment_mode_changed()
         self._update_model_status()
 
@@ -1117,6 +1235,7 @@ class MainWindow(QMainWindow):
         self.editor_text.setPlaceholderText("选择一句后在这里编辑文本")
         self.editor_text.setFixedHeight(76)
         self.editor_text.textChanged.connect(self._segment_editor_changed)
+        self.editor_text.cursorPositionChanged.connect(self._segment_editor_cursor_changed)
         self.editor_text.commitRequested.connect(self._commit_segment_editor)
         self.editor_text.splitRequested.connect(self.split_segment_at_text_cursor)
         text_row = QHBoxLayout()
@@ -1135,6 +1254,117 @@ class MainWindow(QMainWindow):
             self._load_segment_editor(row)
             if not self.segment_model.segments[row].locked:
                 self.editor_text.setFocus()
+
+    def show_find_dialog(self) -> None:
+        if self._find_dialog is None:
+            self._find_dialog = FindDialog(self)
+            self._find_dialog.findRequested.connect(self._perform_find)
+        selected = ""
+        if self.editor_text.hasFocus():
+            selected = self.editor_text.textCursor().selectedText().replace("\u2029", "\n")
+        self._find_dialog.show_for_search(selected)
+
+    def find_again(self, backwards: bool = False) -> None:
+        if self._find_dialog is None or not self._find_dialog.query_edit.text():
+            self.show_find_dialog()
+            return
+        self._find_dialog.request_find(backwards)
+
+    def _perform_find(
+        self,
+        query: str,
+        regular_expression: bool,
+        case_sensitive: bool,
+        whole_word: bool,
+        scope: str,
+        backwards: bool,
+    ) -> None:
+        if self._find_dialog is None or not self.session:
+            return
+        if not query:
+            self._find_dialog.set_status("请输入查找内容", error=True)
+            return
+        expression = query if regular_expression else re.escape(query)
+        if whole_word:
+            expression = rf"(?<!\w)(?:{expression})(?!\w)"
+        try:
+            pattern = re.compile(expression, 0 if case_sensitive else re.IGNORECASE)
+        except re.error as exc:
+            self._find_dialog.set_status(f"正则表达式错误：{exc}", error=True)
+            return
+
+        chapters = self.session.repository.chapters()
+        chapter_index = {chapter.id or 0: index for index, chapter in enumerate(chapters)}
+        if scope == "project":
+            sources = [
+                (index, chapter.id or 0, chapter.title, self.session.repository.segments(chapter.id or 0))
+                for index, chapter in enumerate(chapters)
+            ]
+        else:
+            index = chapter_index.get(self.current_chapter_id or 0, 0)
+            title = chapters[index].title if chapters and index < len(chapters) else "当前章节"
+            sources = [(index, self.current_chapter_id or 0, title, self.segment_model.segments)]
+
+        matches: list[tuple[int, int, str, int, int, int]] = []
+        for chapter_row, chapter_id, title, segments in sources:
+            for segment_row, segment in enumerate(segments):
+                for match in pattern.finditer(segment.text):
+                    if match.end() > match.start():
+                        matches.append((
+                            chapter_row, chapter_id, title, segment_row,
+                            match.start(), match.end(),
+                        ))
+        if not matches:
+            self._find_state = None
+            self._find_dialog.set_status("没有找到匹配内容", error=True)
+            return
+
+        signature = (query, regular_expression, case_sensitive, whole_word, scope)
+        current_row = self.segment_table.currentIndex().row()
+        current_chapter_row = chapter_index.get(self.current_chapter_id or 0, 0)
+        state = self._find_state
+        state_is_current = bool(
+            state and state[0] == signature
+            and state[1] == (self.current_chapter_id or 0)
+            and state[2] == current_row
+        )
+        if state_is_current:
+            anchor = (
+                current_chapter_row,
+                current_row,
+                state[3] if backwards else state[4],
+            )
+        else:
+            anchor = (current_chapter_row, max(0, current_row), 10**9 if backwards else -1)
+
+        selected_match = None
+        ordered = reversed(matches) if backwards else iter(matches)
+        for candidate in ordered:
+            key = (candidate[0], candidate[3], candidate[4])
+            if (backwards and key < anchor) or (not backwards and key >= anchor):
+                selected_match = candidate
+                break
+        if selected_match is None:
+            selected_match = matches[-1] if backwards else matches[0]
+
+        chapter_row, chapter_id, title, segment_row, start, end = selected_match
+        if chapter_id != self.current_chapter_id:
+            self.chapter_list.setCurrentRow(chapter_row)
+        self._select_segment_row(segment_row)
+        cursor = self.editor_text.textCursor()
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        self.editor_text.setTextCursor(cursor)
+        self.editor_text.ensureCursorVisible()
+        self._find_state = (signature, chapter_id, segment_row, start, end)
+        wrapped = (
+            (not backwards and (chapter_row, segment_row, start) < anchor)
+            or (backwards and (chapter_row, segment_row, start) > anchor)
+        )
+        suffix = "（已从头继续）" if wrapped and not backwards else ("（已从末尾继续）" if wrapped else "")
+        self._find_dialog.set_status(
+            f"{title} · 第 {segment_row + 1} 句 · 字符 {start + 1}–{end}{suffix}"
+        )
 
     def _segment_table_context_menu(self, position, *, execute: bool = True) -> QMenu:
         index = self.segment_table.indexAt(position)
@@ -1202,6 +1432,11 @@ class MainWindow(QMainWindow):
                 )
             menu.addSeparator()
             add_action("清除所选句时间对应", self.clear_timing)
+            add_action(
+                f"合并所选 {count} 句",
+                self.merge_selected_segments,
+                consecutive and unlocked,
+            )
             add_action("锁定/解锁所选句", self.toggle_lock)
             add_action("删除所选句时间匹配", self.delete_segments)
         else:
@@ -1226,8 +1461,24 @@ class MainWindow(QMainWindow):
             add_action("锁定/解锁", self.toggle_lock, has_row)
             add_action("恢复原始段落", self.restore_source_fragment, has_row)
             add_action("删除句段", self.delete_segments, has_row)
+            menu.addSeparator()
+            add_action(
+                "Qwen 块级对齐（从当前句/时间向后）",
+                self.qwen_align_from_current_anchor,
+                has_row and unlocked,
+            )
         menu.addSeparator()
         add_action("恢复整章原文", self.restore_source_chapter, bool(self.current_chapter_id))
+        add_action(
+            "清除本章全部时间对应（保留文本）",
+            self.clear_chapter_timing,
+            bool(self.current_chapter_id),
+        )
+        add_action(
+            "重置本章字幕并重新匹配…",
+            self.reset_chapter_and_rematch,
+            bool(self.current_chapter_id and self.current_parts),
+        )
         if execute:
             menu.exec(self.segment_table.viewport().mapToGlobal(position))
         return menu
@@ -1332,7 +1583,14 @@ class MainWindow(QMainWindow):
         self._session_generation += 1
         self.tasks.set_session_generation(self._session_generation)
         if self.session and self.session is not session:
+            self._playback_requested = False
             self.player.stop()
+            self._pending_media_position = None
+            self._pending_media_autoplay = False
+            self._pending_media_deadline = 0.0
+            self._player_asset_id = None
+            self._logical_playhead_ms = 0
+            self._proxy_attempted.clear()
             self.player.setSource(QUrl())
             if hasattr(self, "original_book_view"):
                 self.original_book_view.clear_book(self._session_generation)
@@ -1341,8 +1599,12 @@ class MainWindow(QMainWindow):
         self.session = session
         self._history.clear()
         self._future.clear()
+        self._find_state = None
+        if self._find_dialog is not None:
+            self._find_dialog.set_status("")
         self._media_revision = 0
         self.current_chapter_id = None
+        self._logical_playhead_ms = 0
         self._clear_play_range()
         self._sync_settings_from_manifest()
         self._reload_chapters()
@@ -1436,8 +1698,14 @@ class MainWindow(QMainWindow):
         self.current_asset = None
         self.current_link = None
         self.current_parts = []
+        self._logical_playhead_ms = 0
         links = self.session.repository.chapter_links(chapter.id or 0)
         if not links:
+            self._playback_requested = False
+            self._pending_media_position = None
+            self._pending_media_autoplay = False
+            self._pending_media_deadline = 0.0
+            self._player_asset_id = None
             self.player.setSource(QUrl())
             self.spectrogram.set_cache(None)
             self.overview.set_cache(None)
@@ -1459,7 +1727,11 @@ class MainWindow(QMainWindow):
             local_cursor += part_duration
         first_link, first_asset, first_path, _start, _end = self.current_parts[0]
         self.current_asset, self.current_link = first_asset, first_link
-        self.player.setSource(QUrl.fromLocalFile(str(first_path)))
+        self._pending_seek_target = 0
+        self._pending_seek_deadline = time.monotonic() + 3.0
+        self._request_media_position(
+            first_asset, first_path, first_link.source_start_ms, autoplay=False,
+        )
         cache_token = hashlib.sha1(
             "|".join(f"{link.audio_id}:{link.source_start_ms}:{link.source_end_ms}" for link in links).encode("ascii")
         ).hexdigest()[:16]
@@ -1476,8 +1748,7 @@ class MainWindow(QMainWindow):
         self.silence_candidates = self.session.repository.silence_candidates(
             chapter.id or 0, self._silence_signature()
         )
-        self.spectrogram.set_silences(self.silence_candidates)
-        self.overview.set_silences(self.silence_candidates)
+        self._refresh_silence_overlays()
         if is_visualization_cache(cache_dir):
             self._load_visualization(cache_dir, duration)
         else:
@@ -1670,6 +1941,7 @@ class MainWindow(QMainWindow):
                 imported = import_book(
                     source,
                     one_chapter=one_per_file and source.suffix.lower() != ".epub",
+                    anki_furigana=self.session.manifest.anki_furigana,
                 )
                 if source.suffix.lower() in {".html", ".htm"}:
                     resources, warnings = collect_local_html_resources(source)
@@ -1900,6 +2172,11 @@ class MainWindow(QMainWindow):
             self._media_graph_changed()
             self._reload_chapters(max(0, self.chapter_list.currentRow()))
             self._mark_dirty()
+            if dialog.created_audio_only_chapters:
+                self.status_stage.setText(
+                    f"已创建 {dialog.created_audio_only_chapters} 个纯音频章节 · "
+                    "运行“识别并对齐当前章节”或“全书批量处理”可生成文本"
+                )
 
     def edit_mappings(self) -> None:
         if not self.session:
@@ -2457,8 +2734,11 @@ class MainWindow(QMainWindow):
                         continue
                     del published_tokens
                     aligned = (
-                        align_segments_to_tokens(current, tokens, language=alignment_language)
-                        if current else segments_from_asr_tokens(tokens, chapter_id=chapter_id)
+                        segments_from_asr_tokens(
+                            tokens, chapter_id=chapter_id, language=alignment_language,
+                        )
+                        if not current or _are_unedited_asr_segments(current)
+                        else align_segments_to_tokens(current, tokens, language=alignment_language)
                     )
                     if candidates:
                         aligned = snap_boundaries(
@@ -2535,8 +2815,11 @@ class MainWindow(QMainWindow):
         self.session.repository.replace_asr_tokens(chapter_id, tokens)
         current = self.session.repository.segments(chapter_id)
         aligned = (
-            align_segments_to_tokens(current, tokens, language=self.session.manifest.language)
-            if current else segments_from_asr_tokens(tokens, chapter_id=chapter_id)
+            segments_from_asr_tokens(
+                tokens, chapter_id=chapter_id, language=self.session.manifest.language,
+            )
+            if not current or _are_unedited_asr_segments(current)
+            else align_segments_to_tokens(current, tokens, language=self.session.manifest.language)
         )
         if self.silence_candidates:
             settings = self._silence_settings()
@@ -2796,187 +3079,516 @@ class MainWindow(QMainWindow):
             session_generation=self._session_generation,
         )
 
+    def _start_qwen_block_alignment(
+        self,
+        start_row: int,
+        start_ms: int,
+        limit_ms: int,
+        *,
+        scope: str,
+        allow_silence_detection: bool,
+    ) -> None:
+        """Run the shared, ASR-free block alignment engine."""
+        if not self.session or self.current_chapter_id is None or not self.current_parts:
+            self._show_error("当前章节没有可用于强制对齐的音频")
+            return
+        if not self.silence_candidates:
+            if allow_silence_detection:
+                self.status_stage.setText("块级强制对齐需要VAD候选，正在先检测静音区…")
+                self.detect_silence(
+                    lambda: self._start_qwen_block_alignment(
+                        start_row, start_ms, limit_ms, scope=scope,
+                        allow_silence_detection=False,
+                    )
+                )
+            else:
+                self._show_error("当前参数没有检测到有效静音区，无法规划强制对齐块")
+            return
+        segments = copy.deepcopy(self.segment_model.segments)
+        if not 0 <= start_row < len(segments):
+            self._show_error("请选择有效的文本起点")
+            return
+        chapter_end = self.current_parts[-1][4]
+        start_ms = max(0, int(start_ms))
+        limit_ms = min(chapter_end, int(limit_ms))
+        if start_ms >= limit_ms:
+            self._show_error("请选择章节范围内的音频起点")
+            return
+        language = self._selected_language_code()
+        if language == "auto":
+            self._show_error("Qwen ForcedAligner需要明确选择文本语言")
+            return
+        runtime = runtime_status(
+            "Qwen3-ForcedAligner-0.6B", self.paths.models, ASRBackendId.QWEN3_ASR,
+        )
+        if not runtime.runtime_available:
+            self._show_error(runtime.message)
+            return
+        if not runtime.cuda_available and not self._confirm_qwen_cpu_run(
+            f"Qwen {scope}强制对齐", limit_ms - start_ms,
+        ):
+            return
+
+        chapter_id = self.current_chapter_id
+        parts = list(self.current_parts)
+        candidates = list(self.silence_candidates)
+        padding_ms = self.padding_spin.value()
+        min_silence_ms = self.min_silence_spin.value()
+        planner = ForcedAlignmentPlannerOptions()
+        source_ranges: dict[int, tuple[int, int]] = {}
+        source_cursor = 0
+        for index, segment in enumerate(segments):
+            source_ranges[index] = (source_cursor, source_cursor + len(segment.text))
+            source_cursor += len(segment.text)
+
+        def job(progress):
+            aligner = Qwen3ForcedAligner()
+            blocks: list[ForcedAlignmentBlockResult] = []
+            observed_rate: float | None = None
+            segment_index = start_row
+            cursor_ms = start_ms
+            total = max(1, len(segments) - start_row)
+            pending: ForcedAlignmentHypothesis | None = None
+            pending_alternatives: list[ForcedAlignmentHypothesis] = []
+            backtracks = 0
+            stopped_reason = ""
+
+            def locate_part(milliseconds: int):
+                return locate_contiguous_audio_part(parts, milliseconds)
+
+            def build_hypotheses(
+                block_start: int,
+                audio_start: int,
+                *,
+                trial_label: str = "",
+            ) -> list[ForcedAlignmentHypothesis]:
+                nonlocal observed_rate
+                part, audio_start = locate_part(audio_start)
+                if part is None or audio_start >= limit_ms:
+                    return []
+                link, _asset, path, local_start, local_end = part
+                block_limit = min(local_end, limit_ms)
+                next_locked_start = next(
+                    (
+                        later.start_ms for later in segments[block_start + 1:]
+                        if later.locked and later.end_ms > later.start_ms
+                        and later.start_ms > audio_start
+                    ),
+                    None,
+                )
+                if next_locked_start is not None:
+                    block_limit = min(block_limit, next_locked_start)
+                group_ends = forced_alignment_text_group_ends(
+                    segments, block_start, language=language,
+                    observed_ms_per_unit=observed_rate, options=planner,
+                )
+                hypotheses: list[ForcedAlignmentHypothesis] = []
+                trial_count = 0
+                trial_budget = 6
+                for group_end in group_ends:
+                    group = segments[block_start:group_end]
+                    combined_text = "\n".join(item.text for item in group if item.text.strip())
+                    if not combined_text:
+                        continue
+                    window_ends = forced_alignment_window_ends(
+                        audio_start, block_limit, combined_text, candidates,
+                        language=language, observed_ms_per_unit=observed_rate,
+                        options=planner,
+                    )
+                    for audio_end, weak_boundary in window_ends:
+                        if trial_count >= trial_budget:
+                            break
+                        trial_count += 1
+                        progress(
+                            (block_start - start_row) / total,
+                            f"Qwen {scope}块级对齐 · 第 {block_start + 1}–{group_end} 句"
+                            f" · 候选 {trial_count}/{trial_budget}{trial_label}",
+                        )
+                        options = ASROptions(
+                            backend=ASRBackendId.QWEN3_ASR,
+                            model="Qwen3-ForcedAligner-0.6B",
+                            language=language,
+                            model_root=str(self.paths.models),
+                            clip_start_ms=link.source_start_ms + audio_start - local_start,
+                            clip_end_ms=link.source_start_ms + audio_end - local_start,
+                        )
+                        try:
+                            tokens = aligner.align(
+                                path, combined_text, language, chapter_id, options,
+                                lambda _value, message: progress(
+                                    (block_start - start_row) / total,
+                                    f"{message} · 第 {block_start + 1}–{group_end} 句",
+                                ),
+                            )
+                        except ValueError:
+                            continue
+                        if not tokens:
+                            continue
+                        aligned_local = align_segments_to_tokens(group, tokens, language=language)
+                        score, reasons, _measured_rate = score_forced_alignment_hypothesis(
+                            aligned_local, tokens,
+                            audio_start_ms=audio_start,
+                            audio_end_ms=audio_end,
+                            candidates=candidates,
+                            language=language,
+                            observed_ms_per_unit=observed_rate,
+                            weak_boundary=weak_boundary,
+                        )
+                        if score < planner.review_score:
+                            continue
+                        aligned_absolute = copy.deepcopy(aligned_local)
+                        absolute_tokens = copy.deepcopy(tokens)
+                        for segment in aligned_absolute:
+                            segment.start_ms += audio_start
+                            segment.end_ms += audio_start
+                            segment.confidence = score
+                            segment.status = (
+                                SegmentStatus.AUTO
+                                if score >= planner.stable_score
+                                else SegmentStatus.LOW_CONFIDENCE
+                            )
+                        for token in absolute_tokens:
+                            token.start_ms += audio_start
+                            token.end_ms += audio_start
+                        hypotheses.append(ForcedAlignmentHypothesis(
+                            block_start, group_end, audio_start, audio_end,
+                            aligned_absolute, absolute_tokens, score, reasons, weak_boundary,
+                        ))
+                    if trial_count >= trial_budget:
+                        break
+                hypotheses.sort(key=lambda item: item.score, reverse=True)
+                return hypotheses[:planner.beam_width]
+
+            def append_block(hypothesis: ForcedAlignmentHypothesis, status: str) -> None:
+                blocks.append(ForcedAlignmentBlockResult(
+                    hypothesis.start_index, hypothesis.end_index, status,
+                    [hypothesis], hypothesis,
+                    "；".join(hypothesis.reasons),
+                ))
+
+            while segment_index < len(segments):
+                progress(
+                    (segment_index - start_row) / total,
+                    f"Qwen {scope}块级强制对齐 · 从第 {segment_index + 1} 句开始",
+                )
+                if cursor_ms >= limit_ms:
+                    stopped_reason = "已到达音频范围终点"
+                    break
+                current = segments[segment_index]
+                if current.locked:
+                    if pending is not None:
+                        append_block(pending, "review" if pending.score < planner.stable_score else "stable")
+                        pending = None
+                    if current.end_ms <= current.start_ms or current.end_ms < cursor_ms:
+                        stopped_reason = f"第 {segment_index + 1} 句是无可用时间的锁定锚点"
+                        break
+                    cursor_ms = progressive_vad_next_start(
+                        current.end_ms, candidates, padding_ms=padding_ms, limit_ms=limit_ms,
+                    )
+                    segment_index += 1
+                    continue
+                if not current.text.strip():
+                    segment_index += 1
+                    continue
+
+                hypotheses = build_hypotheses(segment_index, cursor_ms)
+                if not hypotheses:
+                    recovery_starts = [
+                        (candidate.end_ms or candidate.time_ms) + padding_ms
+                        for candidate in key_silence_candidates(candidates, min_silence_ms)
+                        if cursor_ms < (candidate.end_ms or candidate.time_ms) + padding_ms
+                        <= min(limit_ms, cursor_ms + planner.recovery_search_ms)
+                    ][:3]
+                    for recovery_start in recovery_starts:
+                        hypotheses = build_hypotheses(
+                            segment_index, recovery_start, trial_label=" · 重新同步",
+                        )
+                        if hypotheses:
+                            for hypothesis in hypotheses:
+                                hypothesis.score = min(hypothesis.score, planner.stable_score - 0.01)
+                                hypothesis.reasons = (*hypothesis.reasons, "从后续强静音重新同步")
+                            break
+                if not hypotheses:
+                    if pending is not None:
+                        pending.score = min(pending.score, planner.stable_score - 0.01)
+                        pending.reasons = (*pending.reasons, "后续块未能验证")
+                        append_block(pending, "review")
+                    blocks.append(ForcedAlignmentBlockResult(
+                        segment_index,
+                        min(len(segments), segment_index + planner.minimum_segments),
+                        "failed", [], None,
+                        "没有找到达到最低评分的候选块",
+                    ))
+                    stopped_reason = f"第 {segment_index + 1} 句附近无法重新建立稳定对齐"
+                    break
+
+                if pending is None:
+                    pending = hypotheses[0]
+                    pending_alternatives = hypotheses[1:]
+                else:
+                    matched = next(
+                        (
+                            hypothesis for hypothesis in hypotheses
+                            if forced_alignment_overlap_score(
+                                pending, hypothesis,
+                                overlap_segments=planner.overlap_segments,
+                            ) > 0
+                        ),
+                        None,
+                    )
+                    while matched is None and pending_alternatives and backtracks < planner.maximum_backtracks:
+                        pending = pending_alternatives.pop(0)
+                        backtracks += 1
+                        segment_index = max(
+                            pending.start_index,
+                            pending.end_index - planner.overlap_segments,
+                        )
+                        cursor_ms = pending.segments[-min(
+                            planner.overlap_segments, len(pending.segments)
+                        )].start_ms
+                        hypotheses = build_hypotheses(
+                            segment_index, cursor_ms, trial_label=" · 回溯验证",
+                        )
+                        matched = next(
+                            (
+                                hypothesis for hypothesis in hypotheses
+                                if forced_alignment_overlap_score(
+                                    pending, hypothesis,
+                                    overlap_segments=planner.overlap_segments,
+                                ) > 0
+                            ),
+                            None,
+                        )
+                    if matched is None:
+                        recovered: list[ForcedAlignmentHypothesis] = []
+                        recovery_starts = [
+                            (candidate.end_ms or candidate.time_ms) + padding_ms
+                            for candidate in key_silence_candidates(candidates, min_silence_ms)
+                            if cursor_ms < (candidate.end_ms or candidate.time_ms) + padding_ms
+                            <= min(limit_ms, cursor_ms + planner.recovery_search_ms)
+                        ][:3]
+                        for recovery_start in recovery_starts:
+                            recovered = build_hypotheses(
+                                segment_index, recovery_start,
+                                trial_label=" · 漂移后重新同步",
+                            )
+                            if recovered:
+                                break
+                        if not recovered:
+                            pending.score = min(pending.score, planner.stable_score - 0.01)
+                            pending.reasons = (*pending.reasons, "与后续重叠块时间不一致")
+                            append_block(pending, "review")
+                            blocks.append(ForcedAlignmentBlockResult(
+                                segment_index,
+                                min(len(segments), segment_index + planner.minimum_segments),
+                                "failed", [], None, "重叠句验证失败",
+                            ))
+                            stopped_reason = f"第 {segment_index + 1} 句附近发生持续漂移"
+                            break
+                        pending.score = min(pending.score, planner.stable_score - 0.01)
+                        pending.reasons = (*pending.reasons, "与后续块不一致，已重新同步")
+                        append_block(pending, "review")
+                        pending = recovered[0]
+                        pending.score = min(pending.score, planner.stable_score - 0.01)
+                        pending.reasons = (*pending.reasons, "从后续强静音重新同步")
+                        pending_alternatives = recovered[1:]
+                        backtracks = 0
+                    else:
+                        overlap_score = forced_alignment_overlap_score(
+                            pending, matched, overlap_segments=planner.overlap_segments,
+                        )
+                        if overlap_score < 0.35:
+                            pending.score = min(
+                                pending.score, planner.stable_score - 0.01,
+                            )
+                            pending.reasons = (*pending.reasons, "重叠句接近容差上限")
+                        append_block(
+                            pending,
+                            "stable" if pending.score >= planner.stable_score else "review",
+                        )
+                        pending = matched
+                        pending_alternatives = [item for item in hypotheses if item is not matched]
+
+                units = sum(spoken_unit_count(item.text, language) for item in pending.segments)
+                measured_rate = (
+                    pending.segments[-1].end_ms - pending.segments[0].start_ms
+                ) / max(1, units)
+                observed_rate = measured_rate if observed_rate is None else observed_rate * 0.7 + measured_rate * 0.3
+                if pending.end_index >= len(segments):
+                    append_block(
+                        pending,
+                        "stable" if pending.score >= planner.stable_score else "review",
+                    )
+                    pending = None
+                    segment_index = len(segments)
+                    break
+                overlap = min(planner.overlap_segments, len(pending.segments) - 1)
+                if overlap <= 0:
+                    append_block(pending, "review" if pending.score < planner.stable_score else "stable")
+                    cursor_ms = progressive_vad_next_start(
+                        pending.segments[-1].end_ms, candidates,
+                        padding_ms=padding_ms, limit_ms=limit_ms,
+                    )
+                    segment_index = pending.end_index
+                    pending = None
+                else:
+                    segment_index = pending.end_index - overlap
+                    cursor_ms = pending.segments[-overlap].start_ms
+
+            if pending is not None:
+                pending.score = min(pending.score, planner.stable_score - 0.01)
+                pending.reasons = (*pending.reasons, "没有后续重叠块确认")
+                append_block(pending, "review")
+
+            aligned_rows = {
+                block.start_index + offset
+                for block in blocks if block.selected is not None
+                for offset in range(len(block.selected.segments))
+            }
+            review_rows = {
+                block.start_index + offset
+                for block in blocks if block.status == "review" and block.selected is not None
+                for offset in range(len(block.selected.segments))
+            }
+            review_rows.update(
+                index
+                for block in blocks if block.status == "failed"
+                for index in range(block.start_index, block.end_index)
+            )
+            progress(1.0, f"Qwen {scope}块级对齐结束 · 完成 {len(aligned_rows)} 句")
+            return ForcedAlignmentRunResult(
+                blocks, len(aligned_rows), len(review_rows), stopped_reason,
+            ), aligner.last_device_info
+
+        def done(payload):
+            if not self.session or self.current_chapter_id != chapter_id:
+                return
+            result, device = payload
+            updated = copy.deepcopy(self.segment_model.segments)
+            final_rows: dict[int, tuple[TextSegment, list]] = {}
+            affected: set[int] = set()
+            for block in result.blocks:
+                if block.selected is None:
+                    for row_index in range(block.start_index, min(block.end_index, len(updated))):
+                        target = updated[row_index]
+                        if not target.locked and target.status != SegmentStatus.UNMATCHED:
+                            target.status = SegmentStatus.LOW_CONFIDENCE
+                            target.confidence = min(target.confidence, 0.49)
+                            affected.add(row_index)
+                    continue
+                for offset, aligned_segment in enumerate(block.selected.segments):
+                    row_index = block.start_index + offset
+                    if not 0 <= row_index < len(updated) or updated[row_index].locked:
+                        continue
+                    replacement = copy.deepcopy(aligned_segment)
+                    if block.status == "review":
+                        replacement.status = SegmentStatus.LOW_CONFIDENCE
+                        replacement.confidence = min(replacement.confidence, planner.stable_score - 0.01)
+                    else:
+                        replacement.status = SegmentStatus.AUTO
+                    overlapping_tokens = [
+                        token for token in block.selected.tokens
+                        if token.end_ms > replacement.start_ms and token.start_ms < replacement.end_ms
+                    ]
+                    final_rows[row_index] = (replacement, overlapping_tokens)
+                    affected.add(row_index)
+            for row_index, (replacement, _tokens) in final_rows.items():
+                target = updated[row_index]
+                target.start_ms = replacement.start_ms
+                target.end_ms = replacement.end_ms
+                target.confidence = replacement.confidence
+                target.status = replacement.status
+
+            existing_anchors = [
+                anchor for anchor in self.session.repository.anchors(chapter_id)
+                if not any(
+                    source_ranges[index][0] < anchor.source_end_char
+                    and anchor.source_start_char < source_ranges[index][1]
+                    for index in affected
+                )
+            ]
+            new_anchors: list[TextAudioAnchor] = []
+            for row_index, (replacement, tokens) in final_rows.items():
+                if not tokens:
+                    continue
+                generated = anchors_from_segments_tokens([replacement], tokens, language=language)
+                source_start, _source_end = source_ranges[row_index]
+                for anchor in generated:
+                    anchor.source_start_char += source_start
+                    anchor.source_end_char += source_start
+                    anchor.method = "qwen-forced-aligner-block"
+                new_anchors.extend(generated)
+            if not affected:
+                self._show_error(result.stopped_reason or "强制对齐没有生成可应用结果")
+                return
+            self._push_history()
+            self.session.repository.replace_chapter_edit_state(
+                chapter_id, updated, [*existing_anchors, *new_anchors],
+            )
+            self.segment_model.set_segments(self.session.repository.segments(chapter_id))
+            self._refresh_segment_views(defer_hidden=True, refresh_audio=True)
+            self.model_status_label.setText(device.display_text)
+            if result.stopped_reason:
+                self.status_stage.setText(
+                    f"Qwen {scope}部分完成 · {result.completed_count} 句 · "
+                    f"{result.review_count} 句待检查 · {result.stopped_reason}"
+                )
+            else:
+                self.status_stage.setText(
+                    f"Qwen {scope}完成 · {result.completed_count} 句 · "
+                    f"{result.review_count} 句待检查 · {device.display_text}"
+                )
+            self._mark_dirty()
+
+        self.tasks.submit(
+            f"Qwen ForcedAligner · {scope}块级对齐", job, done,
+            session_generation=self._session_generation,
+        )
+
     def qwen_align_from_current_anchor(self) -> None:
+        self._qwen_align_vad_progressive(allow_silence_detection=True)
+
+    def _qwen_align_vad_progressive(self, *, allow_silence_detection: bool) -> None:
+        """Start shared block alignment from the selected text/audio anchor."""
         if not self.session or self.current_chapter_id is None or not self.current_parts:
             self._show_error("当前章节没有可用于强制对齐的音频")
             return
         row = self.segment_table.currentIndex().row()
-        if not (0 <= row < len(self.segment_model.segments)):
+        if not 0 <= row < len(self.segment_model.segments):
             self._show_error("请先选择作为文本起点的句子")
             return
+        if self.segment_model.segments[row].locked:
+            self._show_error("起始句已锁定，请先解锁或选择后面的句子")
+            return
         selection = self.spectrogram.selection
-        start_ms = selection.start_ms if selection and selection.end_ms > selection.start_ms else self._local_position()
+        explicit_selection = bool(
+            selection and selection.end_ms > selection.start_ms
+            and not self.spectrogram.selection_tracks_segment
+        )
+        start_ms = selection.start_ms if explicit_selection else self._local_position()
         chapter_end = self.current_parts[-1][4]
-        if not (0 <= start_ms < chapter_end):
+        limit_ms = selection.end_ms if explicit_selection else chapter_end
+        if not 0 <= start_ms < limit_ms <= chapter_end:
             self._show_error("请选择章节范围内的音频起点")
             return
-        self._qwen_align_chapter(row, start_ms, anchored=True)
+        self._start_qwen_block_alignment(
+            row, start_ms, limit_ms,
+            scope="从当前句向后",
+            allow_silence_detection=allow_silence_detection,
+        )
 
     def qwen_align_chapter(self) -> None:
         self._qwen_align_chapter(0, 0, anchored=False)
 
     def _qwen_align_chapter(self, start_row: int, start_ms: int, *, anchored: bool) -> None:
-        """Forced-align every unlocked sentence in the chapter as one atomic alignment run.
-
-        Qwen's four-minute input limit is respected by processing sentence-sized
-        windows.  The model instance is reused, and no database rows are changed
-        until all windows have completed successfully.
-        """
-        if not self.session or self.current_chapter_id is None or not self.current_parts:
+        """Start the shared block engine for a whole chapter or explicit anchor."""
+        if not self.current_parts:
             self._show_error("当前章节没有可用于强制对齐的音频")
             return
-        language = self._selected_language_code()
-        if language == "auto":
-            self._show_error("Qwen ForcedAligner 整章模式需要明确选择文本语言")
-            return
-        runtime = runtime_status("Qwen3-ASR-0.6B", self.paths.models, ASRBackendId.QWEN3_ASR)
-        if not runtime.runtime_available:
-            self._show_error(runtime.message)
-            return
-        chapter_duration = max(0, self.current_parts[-1][4] - start_ms)
-        if not runtime.cuda_available and not self._confirm_qwen_cpu_run(
-            "Qwen 从锚点向后强制对齐" if anchored else "Qwen 整章强制对齐", chapter_duration,
-        ):
-            return
-
-        chapter_id = self.current_chapter_id
-        segments = copy.deepcopy(self.segment_model.segments)
-        if not segments:
-            self._show_error("当前章节没有原文句段")
-            return
-        total_characters = max(1, sum(max(1, len(item.text.strip())) for item in segments[start_row:]))
-        chapter_end = self.current_parts[-1][4]
-        character_cursor = 0
-        source_cursor = 0
-        tasks = []
-        source_ranges: dict[int, tuple[int, int]] = {}
-        problems: list[str] = []
-        for row, segment in enumerate(segments):
-            source_start = source_cursor
-            source_end = source_start + len(segment.text)
-            source_ranges[row] = (source_start, source_end)
-            source_cursor = source_end
-            if row < start_row:
-                continue
-            weight = max(1, len(segment.text.strip()))
-            estimated_start = start_ms + round((chapter_end - start_ms) * character_cursor / total_characters)
-            character_cursor += weight
-            estimated_end = start_ms + round((chapter_end - start_ms) * character_cursor / total_characters)
-            if segment.locked or not segment.text.strip():
-                continue
-            use_existing = not anchored and segment.end_ms > segment.start_ms
-            coarse_start = segment.start_ms if use_existing else estimated_start
-            coarse_end = segment.end_ms if use_existing else estimated_end
-            midpoint = (coarse_start + coarse_end) // 2
-            part = next((item for item in self.current_parts if item[3] <= midpoint <= item[4]), None)
-            if part is None:
-                problems.append(f"#{row + 1} 无法映射到音频切片")
-                continue
-            link, _asset, path, local_start, local_end = part
-            clip_start = max(local_start, coarse_start - (0 if anchored and row == start_row else 1_500))
-            clip_end = min(local_end, coarse_end + 1_500)
-            if clip_end <= clip_start:
-                problems.append(f"#{row + 1} 没有有效音频范围")
-                continue
-            if clip_end - clip_start > 240_000:
-                problems.append(f"#{row + 1} 音频范围超过 240 秒")
-                continue
-            options = ASROptions(
-                backend=ASRBackendId.QWEN3_ASR,
-                model="Qwen3-ForcedAligner-0.6B",
-                language=language,
-                model_root=str(self.paths.models),
-                clip_start_ms=link.source_start_ms + clip_start - local_start,
-                clip_end_ms=link.source_start_ms + clip_end - local_start,
-            )
-            tasks.append((row, segment.text, path, clip_start, options))
-        if problems:
-            self._show_error("整章强制对齐预检失败：\n" + "\n".join(problems[:12]))
-            return
-        if not tasks:
-            self._show_error("当前章节没有可修改的未锁定句段")
-            return
-        task_scope = "从锚点向后" if anchored else "整章"
-
-        def job(progress):
-            aligner = Qwen3ForcedAligner()
-            results = []
-            total = len(tasks)
-            for task_index, (row, text, path, clip_start, options) in enumerate(tasks):
-                progress(task_index / total, f"Qwen {task_scope}强制对齐 {task_index + 1}/{total}")
-                tokens = aligner.align(
-                    path, text, language, chapter_id, options,
-                    lambda value, message, index=task_index: progress(
-                        -1.0 if value < 0 else (index + value) / total,
-                        f"{message} · {index + 1}/{total}",
-                    ),
-                )
-                if not tokens:
-                    raise ValueError(f"Qwen ForcedAligner 未能对齐第 {row + 1} 句")
-                for token in tokens:
-                    token.start_ms += clip_start
-                    token.end_ms += clip_start
-                results.append((row, tokens))
-            progress(1.0, f"Qwen {task_scope}强制对齐完成 {total}/{total}")
-            return results, aligner.last_device_info
-
-        def done(payload):
-            if not self.session or self.current_chapter_id != chapter_id:
-                return
-            results, device = payload
-            updated = copy.deepcopy(self.segment_model.segments)
-            affected = {row for row, _tokens in results}
-            existing_anchors = [
-                anchor for anchor in self.session.repository.anchors(chapter_id)
-                if not any(
-                    source_ranges[row][0] < anchor.source_end_char
-                    and anchor.source_start_char < source_ranges[row][1]
-                    for row in affected
-                )
-            ]
-            new_anchors = []
-            for row, tokens in results:
-                segment = updated[row]
-                segment.start_ms = tokens[0].start_ms
-                segment.end_ms = tokens[-1].end_ms
-                segment.confidence = min(1.0, sum(token.probability for token in tokens) / len(tokens))
-                segment.status = SegmentStatus.MANUAL
-                source_start, source_end = source_ranges[row]
-                cursor = source_start
-                for token in tokens:
-                    width = max(1, len(token.text.strip()))
-                    end = min(source_end, cursor + width)
-                    new_anchors.append(TextAudioAnchor(
-                        None, chapter_id, segment.id, cursor, end,
-                        token.start_ms, token.end_ms, token.probability, "qwen-forced-aligner",
-                    ))
-                    cursor = end
-            self._push_history()
-            self.session.repository.replace_segments_and_anchors(
-                chapter_id, updated, [*existing_anchors, *new_anchors],
-            )
-            self.segment_model.set_segments(self.session.repository.segments(chapter_id))
-            self.spectrogram.set_segments(self.segment_model.segments)
-            self.overview.set_segments(self.segment_model.segments)
-            self.article_view.set_content(
-                self.segment_model.segments,
-                self.session.repository.anchors(chapter_id),
-                self.current_cache,
-            )
-            self.asr_comparison.set_content(
-                self.segment_model.segments,
-                self.session.repository.asr_tokens(chapter_id),
-                self.session.repository.anchors(chapter_id),
-            )
-            self.model_status_label.setText(device.display_text)
-            self.status_stage.setText(
-                f"Qwen {task_scope}强制对齐完成 · {len(results)} 句 · {device.display_text}"
-            )
-            self._mark_dirty()
-
-        self.tasks.submit(
-            f"Qwen ForcedAligner · {task_scope}", job, done,
-            session_generation=self._session_generation,
+        self._start_qwen_block_alignment(
+            start_row, start_ms, self.current_parts[-1][4],
+            scope="从锚点向后" if anchored else "整章",
+            allow_silence_detection=True,
         )
 
     @staticmethod
@@ -3083,8 +3695,7 @@ class MainWindow(QMainWindow):
                 self.silence_candidates = self.session.repository.silence_candidates(
                     self.current_chapter_id, signature,
                 ) if signature else []
-                self.spectrogram.set_silences(self.silence_candidates)
-                self.overview.set_silences(self.silence_candidates)
+                self._refresh_silence_overlays()
             self.status_stage.setText(
                 f"全书静音检测完成 · {len(counts)}/{total_chapters} 章 · "
                 f"{sum(count for _chapter_id, count in counts)} 个候选 · 跳过 {len(skipped_chapters)} 章"
@@ -3130,8 +3741,7 @@ class MainWindow(QMainWindow):
             if not self.session or chapter_id != self.current_chapter_id:
                 return
             self.silence_candidates = result
-            self.spectrogram.set_silences(result)
-            self.overview.set_silences(result)
+            self._refresh_silence_overlays()
             self.session.repository.replace_silence_candidates(chapter_id or 0, result, signature)
             self.status_stage.setText(f"静音检测完成：{len(result)} 个候选")
             self._mark_dirty()
@@ -3527,24 +4137,37 @@ class MainWindow(QMainWindow):
 
     def _time_for_text_offset(
         self, source: TextSegment, text: str, text_offset: int, fallback_ms: int,
+        *, row: int | None = None,
     ) -> int:
         """Map a textual split boundary through ASR/forced-aligner anchors."""
         if source.end_ms - source.start_ms < 2:
             return 0
         result = int(fallback_ms)
-        if (
-            self.session and self.current_chapter_id is not None
-            and source.source_start_char is not None
-            and source.source_end_char is not None
-        ):
-            source_span = max(1, source.source_end_char - source.source_start_char)
-            mapped_character = source.source_start_char + round(
-                source_span * text_offset / max(1, len(text))
+        if self.session and self.current_chapter_id is not None:
+            if row is None:
+                row = next((
+                    index for index, segment in enumerate(self.segment_model.segments)
+                    if segment is source or (source.id is not None and segment.id == source.id)
+                ), -1)
+            if not 0 <= row < len(self.segment_model.segments):
+                return max(source.start_ms + 1, min(source.end_ms - 1, int(result)))
+            # TextAudioAnchor offsets are chapter-concatenated coordinates.
+            # TextSegment.source_* offsets belong to an EPUB/HTML source
+            # fragment and often restart at zero for every paragraph.  Mixing
+            # those coordinate systems selected anchors from unrelated cues and
+            # pushed cursor splits to one end of the timing range.
+            chapter_source_start = sum(
+                len(segment.text) for segment in self.segment_model.segments[:row]
+            )
+            chapter_source_span = max(1, len(source.text))
+            chapter_source_end = chapter_source_start + chapter_source_span
+            mapped_character = chapter_source_start + round(
+                chapter_source_span * text_offset / max(1, len(text))
             )
             anchors = [
                 anchor for anchor in self.session.repository.anchors(self.current_chapter_id)
-                if anchor.source_end_char >= source.source_start_char
-                and anchor.source_start_char <= source.source_end_char
+                if anchor.source_end_char >= chapter_source_start
+                and anchor.source_start_char <= chapter_source_end
                 and anchor.end_ms > anchor.start_ms
                 and (
                     "asr" in anchor.method.casefold()
@@ -3557,9 +4180,9 @@ class MainWindow(QMainWindow):
             # source segment.
             anchors = [
                 anchor for anchor in anchors
-                if source.source_start_char
+                if chapter_source_start
                 <= (anchor.source_start_char + anchor.source_end_char) / 2
-                <= source.source_end_char
+                <= chapter_source_end
             ]
             containing = [
                 anchor for anchor in anchors
@@ -3620,7 +4243,8 @@ class MainWindow(QMainWindow):
         approximate = round(len(source.text) * (position - source.start_ms) / max(1, source.end_ms - source.start_ms))
         anchors = self.session.repository.anchors(self.current_chapter_id) if self.session else []
         source_anchors = [anchor for anchor in anchors if anchor.segment_id == source.id]
-        if source_anchors and source.source_start_char is not None:
+        if source_anchors:
+            chapter_source_start = sum(len(item.text) for item in self.segment_model.segments[:row])
             nearest = min(
                 source_anchors,
                 key=lambda anchor: abs((anchor.start_ms + anchor.end_ms) // 2 - position),
@@ -3630,7 +4254,7 @@ class MainWindow(QMainWindow):
             mapped = nearest.source_start_char + round(
                 (nearest.source_end_char - nearest.source_start_char) * ratio
             )
-            approximate = mapped - source.source_start_char
+            approximate = mapped - chapter_source_start
         text_offset = preferred_split_offset(source.text, approximate)
         if not 0 < text_offset < len(source.text):
             return
@@ -3665,6 +4289,8 @@ class MainWindow(QMainWindow):
             return
         row = self._editing_row
         if not 0 <= row < len(self.segment_model.segments):
+            row = self.segment_table.currentIndex().row()
+        if not 0 <= row < len(self.segment_model.segments):
             self.status_stage.setText("请先选择一个句段并把光标放到文本框中")
             return
         source = self.segment_model.segments[row]
@@ -3672,7 +4298,11 @@ class MainWindow(QMainWindow):
             self.status_stage.setText("当前句已锁定，请先解锁")
             return
         text = self.editor_text.toPlainText().replace("\r\n", "\n").replace("\r", "\n")
-        requested_offset = self.editor_text.textCursor().position()
+        requested_offset = (
+            self._editor_cursor_position
+            if self._editor_cursor_row == row
+            else self.editor_text.textCursor().position()
+        )
         text_offset = cursor_split_offset(text, requested_offset)
         if not text_offset:
             self.status_stage.setText("光标两侧都必须包含文字，不能在句首或句尾拆分")
@@ -3693,7 +4323,7 @@ class MainWindow(QMainWindow):
                 (source.end_ms - source.start_ms) * text_offset / max(1, len(text))
             )
             split_time = self._time_for_text_offset(
-                source, text, text_offset, fallback_time,
+                source, text, text_offset, fallback_time, row=row,
             )
 
         source_start = source.source_start_char
@@ -3736,11 +4366,23 @@ class MainWindow(QMainWindow):
     def split_segment_by_punctuation(self) -> None:
         rows = self._selected_rows()
         if not rows or self.current_chapter_id is None:
+            self.status_stage.setText("请先选择一个需要按标点拆分的句段")
+            return
+        if len(rows) != 1:
+            self.status_stage.setText("按标点拆分一次只处理一个句段，请先单选")
             return
         row = rows[0]
         source = self.segment_model.segments[row]
-        pieces = split_sentences_with_offsets(source.text)
-        if source.locked or len(pieces) < 2:
+        if source.locked:
+            self.status_stage.setText("当前句已锁定，请先解锁")
+            return
+        live_text = (
+            self.editor_text.toPlainText().replace("\r\n", "\n").replace("\r", "\n")
+            if row == self._editing_row else source.text
+        )
+        pieces = split_sentences_with_offsets(live_text)
+        if len(pieces) < 2:
+            self.status_stage.setText("当前文本没有找到可用的句末、逗号或换行拆分点")
             return
         duration = max(0, source.end_ms - source.start_ms)
         has_timing = duration >= len(pieces)
@@ -3758,26 +4400,41 @@ class MainWindow(QMainWindow):
                 piece_end = source.end_ms
             else:
                 fallback_end = source.start_ms + round(
-                    duration * end / max(1, len(source.text))
+                    duration * end / max(1, len(live_text))
                 )
                 piece_end = self._time_for_text_offset(
-                    source, source.text, end, fallback_end,
+                    source, live_text, end, fallback_end, row=row,
                 )
                 latest = source.end_ms - (len(pieces) - index - 1) * minimum_piece_ms
                 piece_end = min(latest, max(piece_start + minimum_piece_ms, piece_end))
             previous_end = piece_end
             base = source.source_start_char
+            source_span = (
+                source.source_end_char - base
+                if base is not None and source.source_end_char is not None else None
+            )
+            if base is None or source_span is None:
+                piece_source_start = piece_source_end = None
+            elif source_span == len(live_text):
+                piece_source_start, piece_source_end = base + start, base + end
+            else:
+                piece_source_start = base + round(source_span * start / max(1, len(live_text)))
+                piece_source_end = base + round(source_span * end / max(1, len(live_text)))
             replacement.append(TextSegment(
                 None, self.current_chapter_id, 0, text, piece_start, piece_end,
                 source.confidence,
                 SegmentStatus.MANUAL if has_timing else SegmentStatus.UNMATCHED,
                 origin=source.origin,
                 source_fragment_id=source.source_fragment_id,
-                source_start_char=None if base is None else base + start,
-                source_end_char=None if base is None else base + end,
+                source_start_char=piece_source_start,
+                source_end_char=piece_source_end,
             ))
-        self._push_history()
+        self.editor_commit_timer.stop()
+        if not self._editor_history_pushed:
+            self._push_history()
         self._replace_one_segment(row, replacement)
+        self._select_segment_row(row)
+        self.status_stage.setText(f"已按标点拆分为 {len(replacement)} 句")
 
     def restore_source_fragment(self) -> None:
         rows = self._selected_rows()
@@ -3873,6 +4530,9 @@ class MainWindow(QMainWindow):
         rows = self._selected_rows()
         if not rows or self.current_chapter_id is None:
             return
+        if len(rows) > 1:
+            self.merge_selected_segments()
+            return
         first = rows[0]
         second = first + direction
         if not 0 <= second < len(self.segment_model.segments):
@@ -3903,6 +4563,61 @@ class MainWindow(QMainWindow):
                 + self.segment_model.segments[high + 1:]
             )
 
+    def merge_selected_segments(self) -> None:
+        """Merge one contiguous multi-selection as one undoable transaction."""
+        rows = self._selected_rows()
+        if len(rows) < 2 or not self.session or self.current_chapter_id is None:
+            self.status_stage.setText("请连续选择至少两个句段")
+            return
+        if rows != list(range(rows[0], rows[-1] + 1)):
+            self.status_stage.setText("只能合并连续句段")
+            return
+        selected = [self.segment_model.segments[row] for row in rows]
+        if any(segment.locked for segment in selected):
+            self.status_stage.setText("所选范围包含锁定句，请先解锁")
+            return
+        self._commit_segment_editor()
+        selected = [self.segment_model.segments[row] for row in rows]
+        text = selected[0].text
+        for segment in selected[1:]:
+            text = join_segment_text(text, segment.text)
+        timed = [segment for segment in selected if segment.end_ms > segment.start_ms]
+        start_ms = min((segment.start_ms for segment in timed), default=0)
+        end_ms = max((segment.end_ms for segment in timed), default=0)
+        same_source = (
+            selected[0].source_fragment_id is not None
+            and all(
+                segment.source_fragment_id == selected[0].source_fragment_id
+                for segment in selected
+            )
+        )
+        merged = TextSegment(
+            None, self.current_chapter_id, rows[0], text,
+            start_ms, end_ms, min(segment.confidence for segment in selected),
+            SegmentStatus.MANUAL if timed else SegmentStatus.UNMATCHED,
+            origin=selected[0].origin if same_source else SegmentOrigin.USER,
+            source_fragment_id=selected[0].source_fragment_id if same_source else None,
+            source_start_char=selected[0].source_start_char if same_source else None,
+            source_end_char=selected[-1].source_end_char if same_source else None,
+        )
+        self._push_history()
+        ids = [segment.id for segment in selected]
+        if all(identifier is not None for identifier in ids):
+            self.session.repository.merge_segment_range(
+                self.current_chapter_id,
+                [int(identifier) for identifier in ids],
+                merged,
+            )
+            self._reload_after_structural_edit()
+        else:
+            self._replace_segments(
+                self.segment_model.segments[:rows[0]]
+                + [merged]
+                + self.segment_model.segments[rows[-1] + 1:]
+            )
+        self._select_segment_row(rows[0])
+        self.status_stage.setText(f"已合并连续 {len(rows)} 句")
+
     def delete_segments(self) -> None:
         rows = self._selected_rows()
         if not rows or not self.session or self.current_chapter_id is None:
@@ -3912,7 +4627,9 @@ class MainWindow(QMainWindow):
             return
         source_rows = [
             row for row in editable
-            if self.segment_model.segments[row].origin == SegmentOrigin.SOURCE
+            if self.segment_model.segments[row].origin in {
+                SegmentOrigin.SOURCE, SegmentOrigin.SUBTITLE,
+            }
         ]
         removable = [row for row in editable if row not in source_rows]
         self._push_history()
@@ -3935,6 +4652,69 @@ class MainWindow(QMainWindow):
 
     def clear_timing(self) -> None:
         self._clear_segment_matches(self._selected_rows())
+
+    def clear_chapter_timing(self) -> None:
+        if not self.segment_model.segments or self.current_chapter_id is None:
+            return
+        locked = sum(1 for segment in self.segment_model.segments if segment.locked)
+        if locked:
+            answer = QMessageBox.question(
+                self,
+                "清除本章时间对应",
+                f"本章有 {locked} 个锁定句段；它们会保持不变。是否清除其余句段的时间对应？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._clear_segment_matches(list(range(len(self.segment_model.segments))))
+
+    def reset_chapter_and_rematch(self) -> None:
+        if (
+            not self.session or self.current_chapter_id is None
+            or not self.current_parts
+        ):
+            self.status_stage.setText("当前章节没有可用于重新匹配的媒体")
+            return
+        locked = [segment for segment in self.segment_model.segments if segment.locked]
+        if locked:
+            QMessageBox.information(
+                self,
+                "不能重置本章",
+                f"本章还有 {len(locked)} 个锁定句段。请先解锁，避免重置操作绕过人工校正。",
+            )
+            return
+        protected = [
+            segment for segment in self.segment_model.segments
+            if segment.origin in {SegmentOrigin.SOURCE, SegmentOrigin.SUBTITLE}
+        ]
+        generated = [
+            segment for segment in self.segment_model.segments
+            if segment.origin not in {SegmentOrigin.SOURCE, SegmentOrigin.SUBTITLE}
+        ]
+        answer = QMessageBox.question(
+            self,
+            "重置本章字幕并重新匹配",
+            f"将保留 {len(protected)} 条原书/SRT 文本并清除其时间，"
+            f"删除 {len(generated)} 条 ASR 或用户新建句段。\n\n"
+            "随后优先复用识别缓存重新匹配；缓存不存在时才运行当前 ASR 模型。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._push_history()
+        protected_ids = [segment.id for segment in protected if segment.id is not None]
+        generated_ids = [segment.id for segment in generated if segment.id is not None]
+        self.session.repository.mark_segments_unmatched(protected_ids)
+        self.session.repository.delete_segments(self.current_chapter_id, generated_ids)
+        self.segment_model.set_segments(
+            self.session.repository.segments(self.current_chapter_id)
+        )
+        self._clear_play_range()
+        self._refresh_segment_views(defer_hidden=True, refresh_audio=True)
+        self._mark_dirty()
+        self.status_stage.setText("本章字幕已重置，正在读取识别缓存并重新匹配…")
+        QTimer.singleShot(0, lambda: self.recognize_current(force=False))
 
     def _clear_segment_matches(self, rows: list[int]) -> None:
         if not rows:
@@ -4333,6 +5113,8 @@ class MainWindow(QMainWindow):
             self._last_editor_values = (segment.start_ms, segment.end_ms, segment.end_ms - segment.start_ms)
         finally:
             self._editor_loading = False
+        self._editor_cursor_row = row
+        self._editor_cursor_position = self.editor_text.textCursor().position()
 
     @staticmethod
     def _parse_timecode(value: str) -> int:
@@ -4353,6 +5135,12 @@ class MainWindow(QMainWindow):
             self._push_history()
             self._editor_history_pushed = True
         self.editor_commit_timer.start()
+
+    def _segment_editor_cursor_changed(self) -> None:
+        if self._editor_loading or self._editing_row < 0:
+            return
+        self._editor_cursor_row = self._editing_row
+        self._editor_cursor_position = self.editor_text.textCursor().position()
 
     def _commit_segment_editor(self) -> None:
         if self._editor_loading or not (0 <= self._editing_row < len(self.segment_model.segments)):
@@ -4551,7 +5339,7 @@ class MainWindow(QMainWindow):
         if was_playing and segment.end_ms > target:
             self._set_segment_play_range(row)
             self.spectrogram.restore_follow()
-            self.player.play()
+            self._resume_after_seek()
 
     def _locate_segment_start_if_outside(self, segment: TextSegment) -> None:
         """Explicit sentence activation locates only an off-screen cue start."""
@@ -4566,40 +5354,149 @@ class MainWindow(QMainWindow):
 
     def _seek_local(self, milliseconds: int) -> None:
         milliseconds = max(0, int(milliseconds))
+        if self.current_parts:
+            milliseconds = min(milliseconds, self.current_parts[-1][4])
+        self._logical_playhead_ms = milliseconds
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._audio_watch_started_at = time.monotonic()
+            self._last_audio_buffer_at = 0.0
         self._seek_generation += 1
         self._pending_seek_target = milliseconds
         self._pending_seek_deadline = time.monotonic() + 2.0
         self.spectrogram.set_playhead(milliseconds)
         self.overview.set_playhead(milliseconds)
-        for link, asset, path, local_start, local_end in self.current_parts:
-            if local_start <= milliseconds <= local_end:
+        for index, (link, asset, path, local_start, local_end) in enumerate(self.current_parts):
+            is_last = index == len(self.current_parts) - 1
+            if local_start <= milliseconds < local_end or (is_last and milliseconds == local_end):
                 was_playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-                if self.current_link is not link:
-                    self.current_link, self.current_asset = link, asset
-                    self.player.setSource(QUrl.fromLocalFile(str(path)))
-                self.player.setPosition(link.source_start_ms + milliseconds - local_start)
-                if was_playing:
-                    self.player.play()
+                self.current_link, self.current_asset = link, asset
+                absolute = link.source_start_ms + milliseconds - local_start
+                self._request_media_position(asset, path, absolute, autoplay=was_playing)
                 return
         offset = self.current_link.source_start_ms if self.current_link else 0
-        self.player.setPosition(offset + milliseconds)
+        if self.current_asset and self.current_link:
+            current_path = next(
+                (path for link, _asset, path, _start, _end in self.current_parts if link is self.current_link),
+                None,
+            )
+            if current_path:
+                self._request_media_position(
+                    self.current_asset, current_path, offset + milliseconds,
+                    autoplay=self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState,
+                )
+
+    def _request_media_position(
+        self, asset: AudioAsset, path: Path, absolute_ms: int, *, autoplay: bool,
+        force_source: bool = False,
+    ) -> None:
+        """Load an asset and apply its absolute seek only when Qt is ready."""
+        target = max(0, int(absolute_ms))
+        # Windows Media Foundation can acknowledge a deep M4A/M4B seek and
+        # then silently jump back to the old position when it was issued while
+        # Playing. Preserve the intent, pause first, seek, then resume.
+        autoplay = bool(
+            autoplay
+            or self._pending_media_autoplay
+            or self._playback_requested
+            or self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        if autoplay:
+            self._playback_requested = True
+        self._pending_media_position = target
+        self._pending_media_autoplay = autoplay
+        self._pending_media_deadline = time.monotonic() + 8.0
+        playback_path = path
+        if (
+            not force_source
+            and self.session
+            and asset.id is not None
+            and path.suffix.lower() == ".m4b"
+        ):
+            proxy = self.session.root / "cache" / f"playback-{asset.id}.m4a"
+            if proxy.is_file() and proxy.stat().st_size > 0:
+                playback_path = proxy
+                self._proxy_attempted.add(asset.id)
+        source_loaded = not self.player.source().isEmpty()
+        same_asset = asset.id is not None and self._player_asset_id == asset.id and source_loaded
+        if force_source or not same_asset:
+            self._player_asset_id = asset.id
+            self._last_audio_buffer_at = 0.0
+            self._audio_watch_started_at = time.monotonic() if autoplay else 0.0
+            self.player.setSource(QUrl.fromLocalFile(str(playback_path)))
+        self._apply_pending_media_position()
+
+    def _apply_pending_media_position(self) -> None:
+        if self._pending_media_position is None:
+            return
+        if self.player.mediaStatus() in {
+            QMediaPlayer.MediaStatus.NoMedia,
+            QMediaPlayer.MediaStatus.LoadingMedia,
+            QMediaPlayer.MediaStatus.InvalidMedia,
+        }:
+            return
+        resume = self._pending_media_autoplay and self._playback_requested
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        self._pending_media_deadline = time.monotonic() + 3.0
+        self.player.setPosition(self._pending_media_position)
+        if resume:
+            self._pending_media_autoplay = False
+            self.player.play()
+
+    def _media_status_changed(self, _status) -> None:
+        self._apply_pending_media_position()
+
+    def _resume_after_seek(self) -> None:
+        self._playback_requested = True
+        if self._pending_media_position is not None:
+            self._pending_media_autoplay = True
+            self._apply_pending_media_position()
+        else:
+            self.player.play()
 
     def seek_relative(self, amount_ms: int) -> None:
         self._clear_play_range()
         self._seek_local(max(0, self._local_position() + amount_ms))
 
     def _local_position(self) -> int:
-        for link, _asset, _path, local_start, _local_end in self.current_parts:
+        if (
+            self._pending_media_position is not None
+            or (
+                self._pending_seek_target is not None
+                and time.monotonic() < self._pending_seek_deadline
+            )
+        ):
+            return self._logical_playhead_ms
+        for link, _asset, _path, local_start, local_end in self.current_parts:
             if link is self.current_link:
-                return max(0, local_start + self.player.position() - link.source_start_ms)
-        return 0
+                absolute = self.player.position()
+                # Loading and failed deep seeks can report resource position 0
+                # even though the editor has a valid chapter-local playhead.
+                if absolute + 250 < link.source_start_ms or absolute > link.source_end_ms + 250:
+                    return self._logical_playhead_ms
+                local = max(local_start, min(local_end, local_start + absolute - link.source_start_ms))
+                self._logical_playhead_ms = local
+                return local
+        return self._logical_playhead_ms
 
     def toggle_play(self) -> None:
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+        if (
+            self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            or self._playback_requested
+        ):
+            self._playback_requested = False
+            self._pending_media_autoplay = False
             self.player.pause()
+            self.play_button.setText("▶")
+            self.play_button.setToolTip("播放（Space）")
         else:
             self._clear_play_range()
-            self.player.play()
+            if (
+                self.current_parts
+                and self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia
+            ):
+                self._seek_local(0)
+            self._resume_after_seek()
 
     def play_selection(self) -> None:
         if self.spectrogram.selection:
@@ -4609,7 +5506,7 @@ class MainWindow(QMainWindow):
             self._play_range_end = self.spectrogram.selection.end_ms
             self._seek_local(self._play_range_start)
             self.spectrogram.restore_follow()
-            self.player.play()
+            self._resume_after_seek()
 
     def play_segment(self, row: int) -> None:
         if not (0 <= row < len(self.segment_model.segments)):
@@ -4623,7 +5520,7 @@ class MainWindow(QMainWindow):
         self.spectrogram.restore_follow()
         self._seek_local(segment.start_ms)
         self._set_segment_play_range(row)
-        self.player.play()
+        self._resume_after_seek()
 
     def play_current_segment(self) -> None:
         row = self.segment_table.currentIndex().row() if self.segment_table.currentIndex().isValid() else -1
@@ -4669,13 +5566,37 @@ class MainWindow(QMainWindow):
             self.article_view.set_audio_visible(visible)
         self.preferences["show_article_audio_visual"] = visible
 
-    def _set_silence_markers_visible(self, visible: bool = True) -> None:
-        visible = bool(visible)
+    def _set_silence_display_mode(self, mode: SilenceDisplayMode | str) -> None:
+        mode = SilenceDisplayMode(mode)
+        actions = {
+            SilenceDisplayMode.HIDDEN: self.silence_hidden_action,
+            SilenceDisplayMode.KEY: self.silence_key_action,
+            SilenceDisplayMode.ALL: self.silence_all_action,
+        }
+        actions[mode].setChecked(True)
+        self.preferences["silence_display_mode"] = mode.value
+        self._refresh_silence_overlays(mode)
+
+    def _refresh_silence_overlays(self, mode: SilenceDisplayMode | None = None) -> None:
+        if mode is None:
+            try:
+                mode = SilenceDisplayMode(
+                    self.preferences.get("silence_display_mode", SilenceDisplayMode.KEY.value)
+                )
+            except ValueError:
+                mode = SilenceDisplayMode.KEY
+        visible = mode != SilenceDisplayMode.HIDDEN
+        displayed = self.silence_candidates
+        if mode == SilenceDisplayMode.KEY:
+            displayed = key_silence_candidates(
+                self.silence_candidates, self.min_silence_spin.value(),
+            )
         if hasattr(self, "spectrogram"):
+            self.spectrogram.set_silences(displayed)
             self.spectrogram.set_silences_visible(visible)
         if hasattr(self, "overview"):
+            self.overview.set_silences(displayed)
             self.overview.set_silences_visible(visible)
-        self.preferences["show_silence_markers"] = visible
 
     def _set_list_visualization_mode(self, mode: AudioVisualizationMode | str) -> None:
         mode = AudioVisualizationMode(mode)
@@ -4765,11 +5686,58 @@ class MainWindow(QMainWindow):
 
     def _play_state_changed(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
+        if playing and not self._playback_requested:
+            # Suppress a stale play() from a completed proxy/load request.
+            QTimer.singleShot(0, self.player.pause)
+            return
         self.play_button.setText("⏸" if playing else "▶")
         self.play_button.setToolTip("暂停（Space）" if playing else "播放（Space）")
+        if playing:
+            self._audio_watch_started_at = time.monotonic()
+            self._last_audio_buffer_at = 0.0
+        else:
+            self._audio_watch_started_at = 0.0
+
+    def _audio_buffer_received(self, buffer) -> None:
+        if buffer.isValid() and buffer.byteCount() > 0:
+            self._last_audio_buffer_at = time.monotonic()
+
+    def _check_m4b_audio_output(self) -> None:
+        """Recover Qt's silent M4B failure, which emits no player error."""
+        if (
+            self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState
+            or not self.current_asset
+            or self.current_asset.path.suffix.lower() != ".m4b"
+        ):
+            return
+        current_source = Path(self.player.source().toLocalFile())
+        if current_source.suffix.lower() != ".m4b":
+            return
+        now = time.monotonic()
+        if self._audio_watch_started_at <= 0:
+            self._audio_watch_started_at = now
+            return
+        if self._last_audio_buffer_at >= self._audio_watch_started_at:
+            return
+        if now - self._audio_watch_started_at < 3.0:
+            return
+        self._audio_watch_started_at = now + 60.0
+        self._ensure_m4b_proxy("检测到 M4B 正在走时但没有音频输出")
 
     def _on_position(self, absolute_ms: int) -> None:
+        if self._pending_media_position is not None:
+            if abs(absolute_ms - self._pending_media_position) <= 250:
+                self._pending_media_position = None
+                self._pending_media_deadline = 0.0
+            elif time.monotonic() < self._pending_media_deadline:
+                # Source changes emit a stale zero/old-source callback before
+                # the deferred M4B chapter seek. Never expose that as chapter 0.
+                return
+            else:
+                self._pending_media_position = None
+                self._pending_media_autoplay = False
         local = self._local_position()
+        self._logical_playhead_ms = local
         duration = self.current_parts[-1][4] if self.current_parts else self.player.duration()
         if self._pending_seek_target is not None:
             if abs(local - self._pending_seek_target) <= 180:
@@ -4784,8 +5752,9 @@ class MainWindow(QMainWindow):
         if play_bounds is not None and local >= play_bounds[1]:
             if self._loop_selection:
                 self._seek_local(play_bounds[0])
-                self.player.play()
+                self._resume_after_seek()
                 return
+            self._playback_requested = False
             self.player.pause()
             local = play_bounds[1]
             self._clear_play_range()
@@ -4794,8 +5763,9 @@ class MainWindow(QMainWindow):
             if 0 <= current_index + 1 < len(self.current_parts):
                 next_start = self.current_parts[current_index + 1][3]
                 self._seek_local(next_start)
-                self.player.play()
+                self._resume_after_seek()
                 return
+            self._playback_requested = False
             self.player.pause()
             local = duration
         self.spectrogram.follow_playhead(local)
@@ -4812,29 +5782,97 @@ class MainWindow(QMainWindow):
                 self._playback_row_update = False
 
     def _player_error(self, _error, message: str) -> None:
-        asset = self.current_asset
-        if not self.session or not asset or asset.id is None or asset.path.suffix.lower() != ".m4b" or asset.id in self._proxy_attempted:
-            if message:
-                self.status_stage.setText(f"播放器：{message}")
+        if self._ensure_m4b_proxy(message or "Qt 无法播放 M4B"):
             return
+        if message:
+            self.status_stage.setText(f"播放器：{message}")
+
+    def _ensure_m4b_proxy(self, reason: str) -> bool:
+        asset = self.current_asset
+        if not self.session or not asset or asset.id is None or asset.path.suffix.lower() != ".m4b":
+            return False
         source = self.session.resolve_audio(asset)
         if not source:
-            return
-        self._proxy_attempted.add(asset.id)
+            return False
         proxy = self.session.root / "cache" / f"playback-{asset.id}.m4a"
+        current_source = Path(self.player.source().toLocalFile())
+        if (
+            proxy.is_file()
+            and current_source
+            and current_source.resolve() == proxy.resolve()
+        ):
+            return False
+        chapter_id = self.current_chapter_id
+        absolute_target = (
+            self._pending_media_position
+            if self._pending_media_position is not None
+            else self._resource_position_for_local(self._logical_playhead_ms)
+        )
+        resume = bool(
+            self._playback_requested
+            or self._pending_media_autoplay
+            or self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        self._playback_requested = resume
+        if proxy.is_file() and proxy.stat().st_size > 0:
+            self.status_stage.setText(f"{reason}，已切换 M4A 播放代理")
+            self._request_media_position(
+                asset, proxy, absolute_target, autoplay=resume, force_source=True,
+            )
+            return True
+        if asset.id in self._proxy_attempted:
+            self.status_stage.setText("正在准备 M4A 播放代理，请稍候…")
+            return True
+        self._proxy_attempted.add(asset.id)
+        self.player.pause()
+        if resume:
+            self.play_button.setText("…")
+            self.play_button.setToolTip("正在准备 M4A 代理；点击可取消自动播放")
+        self.status_stage.setText(f"{reason}，正在无损封装 M4A 播放代理…")
 
         def job(progress):
-            progress(0.05, "Qt 无法直接播放 M4B，正在无损封装为 M4A 代理")
-            result = create_m4a_proxy(source, proxy)
-            progress(1.0, "M4A 播放代理已就绪")
-            return result
+            try:
+                progress(0.05, "M4B 无声，正在无损封装为 M4A 播放代理")
+                result = create_m4a_proxy(source, proxy)
+                progress(1.0, "M4A 播放代理已就绪")
+                return result
+            except Exception:
+                self._proxy_attempted.discard(asset.id or 0)
+                raise
+
+        def done(result):
+            if (
+                self.current_chapter_id != chapter_id
+                or not self.current_asset
+                or self.current_asset.id != asset.id
+            ):
+                return
+            latest_target = self._resource_position_for_local(self._logical_playhead_ms)
+            should_resume = self._playback_requested
+            self._request_media_position(
+                asset, Path(result), latest_target,
+                autoplay=should_resume, force_source=True,
+            )
+            self.status_stage.setText(
+                "已切换 M4A 播放代理并恢复原播放位置"
+                if should_resume else "M4A 播放代理已就绪（保持暂停）"
+            )
 
         self.tasks.submit(
             "M4B 播放代理", job,
-            lambda result: self.player.setSource(QUrl.fromLocalFile(str(result))),
+            done,
             lane=TaskLane.MEDIA, priority=80,
             session_generation=self._session_generation,
         )
+        return True
+
+    def _resource_position_for_local(self, local_ms: int) -> int:
+        local_ms = max(0, int(local_ms))
+        for index, (link, _asset, _path, local_start, local_end) in enumerate(self.current_parts):
+            is_last = index == len(self.current_parts) - 1
+            if local_start <= local_ms < local_end or (is_last and local_ms == local_end):
+                return link.source_start_ms + local_ms - local_start
+        return self.current_link.source_start_ms if self.current_link else local_ms
 
     def _selection_changed(self, start: int, end: int) -> None:
         if end > start:
@@ -4853,6 +5891,14 @@ class MainWindow(QMainWindow):
             self._audio_seek_requested(milliseconds)
         self.spectrogram.focus_time(milliseconds, span)
 
+    def _overview_issue_requested(self, row: int) -> None:
+        if not 0 <= row < len(self.segment_model.segments):
+            return
+        self._select_segment_row(row)
+        segment = self.segment_model.segments[row]
+        span = max(1_000, self.spectrogram.view_end - self.spectrogram.view_start)
+        self.spectrogram.focus_time((segment.start_ms + segment.end_ms) // 2, span)
+
     def export_output(self, kind: str) -> None:
         if not self.session:
             return
@@ -4862,10 +5908,32 @@ class MainWindow(QMainWindow):
                 if path:
                     export_json(self.session, path)
             else:
+                standalone_html = False
+                if kind == "html":
+                    mode, accepted = QInputDialog.getItem(
+                        self,
+                        "HTML 导出模式",
+                        "导出方式：",
+                        [
+                            "整书阅读器（index.html + 章节页）",
+                            "独立章节 HTML（无 index，章节间不互相引用）",
+                        ],
+                        0,
+                        False,
+                    )
+                    if not accepted:
+                        return
+                    standalone_html = mode.startswith("独立章节")
                 folder = QFileDialog.getExistingDirectory(self, f"导出 {kind.upper()}")
                 if not folder:
                     return
-                export_html(self.session, folder) if kind == "html" else export_subtitles(self.session, folder, kind)
+                if kind == "html":
+                    export_html(
+                        self.session, folder,
+                        standalone_chapters=standalone_html,
+                    )
+                else:
+                    export_subtitles(self.session, folder, kind)
             self.status_stage.setText(f"{kind.upper()} 导出完成")
         except Exception as exc:
             self._show_error(str(exc))
@@ -4889,6 +5957,19 @@ class MainWindow(QMainWindow):
         audio_policy_combo = QComboBox(dialog)
         audio_policy_combo.addItems(labels)
         form.addRow("音频处理方式：", audio_policy_combo)
+
+        text_policy_combo = QComboBox(dialog)
+        text_policy_combo.addItem(
+            "保持原书正文（安全默认）", EpubTextPolicy.PRESERVE_SOURCE,
+        )
+        text_policy_combo.addItem(
+            "尝试把编辑文字应用到导出副本", EpubTextPolicy.APPLY_EDITS,
+        )
+        text_policy_combo.setToolTip(
+            "尝试应用时只替换能够可靠定位且不跨越样式、链接或 ruby 的文字；"
+            "失败的句段保持原书正文并在导出报告中列出。"
+        )
+        form.addRow("正文处理：", text_policy_combo)
 
         extend_ends = QCheckBox("自动延长句段结束到下一句开始（推荐）", dialog)
         extend_ends.setChecked(True)
@@ -4933,6 +6014,7 @@ class MainWindow(QMainWindow):
         }[label]
         options = EpubMediaOverlayOptions(
             audio_policy=policy,
+            text_policy=EpubTextPolicy(text_policy_combo.currentData()),
             extend_segment_ends=extend_ends.isChecked(),
             max_end_extension_ms=maximum_extension.value(),
         )
@@ -4955,11 +6037,11 @@ class MainWindow(QMainWindow):
             if generation == self._session_generation:
                 if warnings:
                     self.status_stage.setText(
-                        f"EPUB 导出完成 · 已跳过 {len(warnings)} 个未映射句段：{result}"
+                        f"EPUB 导出完成 · {len(warnings)} 条警告：{result}"
                     )
                     QMessageBox.warning(
-                        self, "EPUB 已部分导出",
-                        f"EPUB 已生成，但跳过了 {len(warnings)} 个无法映射或超出媒体范围的句段。\n\n"
+                        self, "EPUB 导出报告",
+                        f"EPUB 已生成，共有 {len(warnings)} 条正文应用、映射或媒体范围警告。\n\n"
                         + "\n".join(warnings[:20]),
                     )
                 else:

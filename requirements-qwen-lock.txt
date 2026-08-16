@@ -1,0 +1,6 @@
+-r requirements-lock.txt
+
+# Optional known-text/ASR backend.  Kept out of the default portable package
+# because its CPU PyTorch stack adds several hundred megabytes.
+qwen-asr==0.0.6
+modelscope==1.38.1

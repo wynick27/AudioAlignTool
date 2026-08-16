@@ -167,7 +167,7 @@ def _annotate_html_export_page(
 
     nodes = [
         node for node in soup.find_all(string=True)
-        if node.parent and node.parent.name not in {"style", "script", "title", "svg"}
+        if node.parent and node.parent.name not in {"style", "script", "title", "svg", "rt", "rp"}
     ]
     document, mapping = _normalized_html_nodes(nodes)
     cursor = 0
@@ -214,14 +214,20 @@ def _annotate_html_export_page(
         const selection=window.getSelection();
         if(selection && !selection.isCollapsed)return;
         const target=event.target.closest('[data-aat-index]');
-        if(target)parent.postMessage({type:'aat-segment',index:Number(target.dataset.aatIndex)},'*');
+        if(!target)return;
+        const index=Number(target.dataset.aatIndex);
+        if(typeof window.aatActivateSegment==='function')window.aatActivateSegment(index);
+        else parent.postMessage({type:'aat-segment',index},'*');
       });
+      window.aatSetActive=function(index,follow){
+        document.querySelectorAll('.aat-active').forEach(e=>e.classList.remove('aat-active'));
+        const targets=document.querySelectorAll('[data-aat-index="'+index+'"]');
+        targets.forEach(target=>target.classList.add('aat-active'));
+        if(targets.length&&follow)targets[0].scrollIntoView({block:'center',behavior:'smooth'});
+      };
       addEventListener('message',function(event){
         if(!event.data || event.data.type!=='aat-active')return;
-        document.querySelectorAll('.aat-active').forEach(e=>e.classList.remove('aat-active'));
-        const targets=document.querySelectorAll('[data-aat-index="'+event.data.index+'"]');
-        targets.forEach(target=>target.classList.add('aat-active'));
-        if(targets.length&&event.data.follow)targets[0].scrollIntoView({block:'center',behavior:'smooth'});
+        window.aatSetActive(event.data.index,event.data.follow);
       });
     """
     soup.head.append(script)
@@ -270,13 +276,117 @@ addEventListener('message',e=>{if(e.data&&e.data.type==='aat-segment')activate(N
 </script></body></html>"""
 
 
-def export_html(session: ProjectSession, output: str | Path) -> Path:
+_STANDALONE_READER_SCRIPT = r"""
+const data=JSON.parse(document.getElementById('aat-chapter-data').textContent),
+player=document.getElementById('aat-player'),playButton=document.getElementById('aat-play'),
+clock=document.getElementById('aat-clock'),speed=document.getElementById('aat-speed'),
+loop=document.getElementById('aat-loop');
+const segments=data.segments||[],links=data.audio_links||[];
+let active=-1,linkIndex=0,lastSaved=0;
+const storageKey='AudioAlignTool:chapter:'+data.project_id+':'+data.chapter_id;
+function localStart(i){return links.slice(0,i).reduce((n,x)=>n+x.source_end_ms-x.source_start_ms,0)}
+function currentMs(){const x=links[linkIndex];return x?Math.max(0,localStart(linkIndex)+player.currentTime*1000-x.source_start_ms):0}
+function save(force=false){const now=Date.now();if(!force&&now-lastSaved<500)return;lastSaved=now;try{localStorage.setItem(storageKey,JSON.stringify({position_ms:Math.round(currentMs()),rate:player.playbackRate,loop:loop.checked}))}catch(_){}}
+function syncPlayButton(){const playing=!player.paused&&!player.ended;playButton.textContent=playing?'⏸':'▶';playButton.title=playing?'暂停':'播放';playButton.setAttribute('aria-label',playButton.title)}
+function playAt(ms,autoplay=true){
+  if(!links.length)return;
+  let i=links.findIndex((x,n)=>ms<localStart(n)+x.source_end_ms-x.source_start_ms);
+  if(i<0)i=links.length-1;
+  const x=links[i],position=Math.max(x.source_start_ms,x.source_start_ms+ms-localStart(i))/1000,src=x.export_path||x.path;
+  const apply=()=>{player.currentTime=position;player.playbackRate=Number(speed.value);if(autoplay)player.play().catch(()=>{});tick()};
+  if(i!==linkIndex||player.getAttribute('src')!==src){linkIndex=i;player.src=src;player.onloadedmetadata=apply}else apply();
+}
+function activate(i,autoplay=true){if(!segments[i])return;active=i;window.aatSetActive(i,true);playAt(segments[i].start_ms,autoplay)}
+window.aatActivateSegment=i=>activate(Number(i),true);
+function tick(){
+  const x=links[linkIndex],ms=currentMs();clock.textContent=new Date(Math.max(0,ms)).toISOString().slice(11,19);
+  if(loop.checked&&active>=0&&segments[active]&&ms>=segments[active].end_ms-25){playAt(segments[active].start_ms,true);return}
+  if(x&&player.currentTime*1000>=x.source_end_ms){if(linkIndex+1<links.length)playAt(localStart(linkIndex+1),!player.paused);else player.pause()}
+  const i=segments.findIndex(s=>s.end_ms>s.start_ms&&ms>=s.start_ms&&ms<s.end_ms);
+  if(i!==active){active=i;window.aatSetActive(i,true)}
+  save();
+}
+speed.onchange=()=>{player.playbackRate=Number(speed.value);save(true)};
+loop.onchange=()=>save(true);player.ontimeupdate=tick;player.onplay=syncPlayButton;
+player.onpause=()=>{syncPlayButton();save(true)};player.onended=syncPlayButton;player.onemptied=syncPlayButton;
+playButton.onclick=()=>player.paused?player.play():player.pause();
+document.getElementById('aat-previous').onclick=()=>activate(Math.max(0,(active<0?0:active)-1),true);
+document.getElementById('aat-next').onclick=()=>activate(Math.min(segments.length-1,(active<0?-1:active)+1),true);
+addEventListener('beforeunload',()=>save(true));
+let saved={};try{saved=JSON.parse(localStorage.getItem(storageKey)||'{}')}catch(_){}
+speed.value=String(saved.rate||1);if(!speed.value)speed.value='1';player.playbackRate=Number(speed.value);loop.checked=!!saved.loop;syncPlayButton();
+if(links.length){player.src=links[0].export_path||links[0].path;player.onloadedmetadata=()=>playAt(Math.max(0,Number(saved.position_ms)||0),false)}
+"""
+
+
+def _standalone_chapter_page(
+    source_html: str,
+    segments: list[TextSegment],
+    chapter_data: dict,
+    project_id: str,
+    base_href: str,
+) -> str:
+    soup = BeautifulSoup(
+        _annotate_html_export_page(source_html, segments, base_href), "html.parser",
+    )
+    if soup.body is None:
+        body = soup.new_tag("body")
+        soup.append(body)
+    style = soup.new_tag("style")
+    style.string = (
+        "#aat-reader-toolbar{position:sticky;top:0;z-index:2147483647;display:flex;"
+        "align-items:center;gap:.45rem;flex-wrap:wrap;padding:.5rem .7rem;background:#fff;"
+        "color:#222;border-bottom:1px solid #bbb;box-shadow:0 1px 5px #0003;font:14px/1.4 "
+        "system-ui,sans-serif}#aat-reader-toolbar button,#aat-reader-toolbar select{font:inherit;"
+        "padding:.25rem .5rem}#aat-player{width:min(430px,55vw);height:36px}"
+        "#aat-clock{min-width:5.2rem;font-variant-numeric:tabular-nums;color:#666}"
+    )
+    soup.head.append(style)
+    toolbar = BeautifulSoup(
+        '<div id="aat-reader-toolbar">'
+        '<button id="aat-previous" title="上一句">⏮</button>'
+        '<button id="aat-play" title="播放" aria-label="播放">▶</button>'
+        '<button id="aat-next" title="下一句">⏭</button>'
+        '<audio id="aat-player" controls></audio>'
+        '<label>倍速 <select id="aat-speed">'
+        '<option value="0.25">0.25</option><option value="0.5">0.50</option>'
+        '<option value="0.75">0.75</option><option value="1" selected>1.00</option>'
+        '<option value="1.25">1.25</option><option value="1.5">1.50</option>'
+        '<option value="2">2.00</option><option value="2.5">2.50</option>'
+        '<option value="3">3.00</option></select>×</label>'
+        '<label><input id="aat-loop" type="checkbox"> 单句循环</label>'
+        '<span id="aat-clock">00:00:00</span></div>',
+        "html.parser",
+    ).div
+    soup.body.insert(0, toolbar)
+    payload = {
+        "project_id": project_id,
+        "chapter_id": chapter_data.get("id"),
+        "segments": chapter_data.get("segments", []),
+        "audio_links": chapter_data.get("audio_links", []),
+    }
+    data_script = soup.new_tag("script", id="aat-chapter-data", type="application/json")
+    data_script.string = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    soup.body.append(data_script)
+    reader_script = soup.new_tag("script")
+    reader_script.string = _STANDALONE_READER_SCRIPT
+    soup.body.append(reader_script)
+    return str(soup)
+
+
+def export_html(
+    session: ProjectSession,
+    output: str | Path,
+    *,
+    standalone_chapters: bool = False,
+) -> Path:
     target = Path(output)
     target.mkdir(parents=True, exist_ok=True)
     media_dir = target / "media"
     media_dir.mkdir(exist_ok=True)
     pages_dir = target / "pages"
-    pages_dir.mkdir(exist_ok=True)
+    if not standalone_chapters:
+        pages_dir.mkdir(exist_ok=True)
     book_dir = target / "book"
     book_dir.mkdir(exist_ok=True)
     data = project_alignment_dict(session)
@@ -331,7 +441,9 @@ def export_html(session: ProjectSession, output: str | Path) -> Path:
             entry = document_root / entry_path
             if len(source_parts) <= 1 and entry.is_file():
                 source_html = entry.read_text("utf-8", errors="replace")
-            relative_base = Path("..") / "book" / document_root.name / Path(entry_path).parent
+            relative_base = (
+                Path("book") if standalone_chapters else Path("..") / "book"
+            ) / document_root.name / Path(entry_path).parent
             base_href = relative_base.as_posix().rstrip("/") + "/"
         if not source_html:
             body = "".join(
@@ -343,10 +455,24 @@ def export_html(session: ProjectSession, output: str | Path) -> Path:
                 "body{max-width:52rem;margin:2rem auto;padding:0 1.5rem;font:18px/1.9 serif}"
                 "</style></head><body>" + body + "</body></html>"
             )
-        page_name = f"chapter-{chapter.position + 1:03d}.html"
-        page = _annotate_html_export_page(source_html, segments, base_href)
-        (pages_dir / page_name).write_text(page, encoding="utf-8")
-        chapter_data["page_path"] = f"pages/{page_name}"
+        if standalone_chapters:
+            page_name = (
+                f"{chapter.position + 1:03d}-"
+                f"{_safe_name(chapter.title, 'chapter')}.html"
+            )
+            page = _standalone_chapter_page(
+                source_html, segments, chapter_data,
+                session.manifest.project_id, base_href,
+            )
+            (target / page_name).write_text(page, encoding="utf-8")
+        else:
+            page_name = f"chapter-{chapter.position + 1:03d}.html"
+            page = _annotate_html_export_page(source_html, segments, base_href)
+            (pages_dir / page_name).write_text(page, encoding="utf-8")
+            chapter_data["page_path"] = f"pages/{page_name}"
+
+    if standalone_chapters:
+        return target
 
     encoded = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     title = html.escape(session.manifest.title)

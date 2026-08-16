@@ -9,10 +9,12 @@ from pathlib import Path
 
 _DLL_HANDLES: list[object] = []
 _REGISTERED_DLL_PATHS: list[str] = []
+_ACTIVE_PACKAGE_PATHS: tuple[str, ...] = ()
 
 
 def _candidate_site_packages() -> list[Path]:
     candidates: list[Path] = []
+    candidates.extend(Path(value) for value in _ACTIVE_PACKAGE_PATHS)
     configured = sysconfig.get_paths().get("purelib")
     if configured:
         candidates.append(Path(configured))
@@ -32,11 +34,23 @@ def _candidate_site_packages() -> list[Path]:
     return unique
 
 
+def activate_optional_runtimes() -> tuple[str, ...]:
+    """Activate app-local runtime add-ons before importing model libraries."""
+    global _ACTIVE_PACKAGE_PATHS
+    if not _ACTIVE_PACKAGE_PATHS:
+        from .runtime_addons import activate_runtime_paths
+
+        _ACTIVE_PACKAGE_PATHS = activate_runtime_paths()
+    return _ACTIVE_PACKAGE_PATHS
+
+
 def native_runtime_directories() -> list[Path]:
+    activate_optional_runtimes()
     relative = (
         Path("nvidia") / "cublas" / "bin",
         Path("nvidia") / "cudnn" / "bin",
         Path("nvidia") / "cuda_runtime" / "bin",
+        Path("torch") / "lib",
     )
     found: list[Path] = []
     for root in _candidate_site_packages():
@@ -53,6 +67,7 @@ def native_runtime_directories() -> list[Path]:
 
 def bootstrap_native_runtime() -> tuple[str, ...]:
     """Register app-local NVIDIA DLL folders without changing system PATH."""
+    activate_optional_runtimes()
     if os.name != "nt" or not hasattr(os, "add_dll_directory"):
         return tuple(_REGISTERED_DLL_PATHS)
     for directory in native_runtime_directories():

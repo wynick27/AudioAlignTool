@@ -742,6 +742,42 @@ class ProjectRepository:
                 ],
             )
 
+    @staticmethod
+    def _shift_segment_positions(
+        connection: sqlite3.Connection,
+        chapter_id: int,
+        after_position: int,
+        delta: int,
+    ) -> None:
+        """Shift ordered rows without transient UNIQUE(position) collisions.
+
+        SQLite checks UNIQUE constraints row-by-row inside a bulk UPDATE. A
+        direct ``position = position + 1`` can therefore collide with the next
+        row before that row has moved. First move the suffix beyond the live
+        range, then bring it back at its final offset.
+        """
+        if not delta:
+            return
+        row = connection.execute(
+            "SELECT COALESCE(MAX(position), -1) AS maximum FROM text_segments WHERE chapter_id=?",
+            (chapter_id,),
+        ).fetchone()
+        maximum = int(row["maximum"] if row is not None else -1)
+        temporary_offset = maximum + abs(delta) + 2
+        connection.execute(
+            "UPDATE text_segments SET position=position+? "
+            "WHERE chapter_id=? AND position>?",
+            (temporary_offset, chapter_id, after_position),
+        )
+        connection.execute(
+            "UPDATE text_segments SET position=position-?+? "
+            "WHERE chapter_id=? AND position>?",
+            (
+                temporary_offset, delta, chapter_id,
+                after_position + temporary_offset,
+            ),
+        )
+
     def replace_one_segment(
         self,
         chapter_id: int,
@@ -762,10 +798,7 @@ class ProjectRepository:
             position = int(row["position"])
             delta = len(values) - 1
             if delta:
-                connection.execute(
-                    "UPDATE text_segments SET position=position+? WHERE chapter_id=? AND position>?",
-                    (delta, chapter_id, position),
-                )
+                self._shift_segment_positions(connection, chapter_id, position, delta)
 
             first = values[0]
             connection.execute(
@@ -856,9 +889,56 @@ class ProjectRepository:
             connection.execute(
                 "DELETE FROM text_segments WHERE id=? AND chapter_id=?", (right_id, chapter_id),
             )
+            self._shift_segment_positions(connection, chapter_id, position + 1, -1)
+
+    def merge_segment_range(
+        self, chapter_id: int, segment_ids: Sequence[int], merged: TextSegment,
+    ) -> None:
+        """Merge a contiguous range while retaining all word anchors."""
+        ids = [int(value) for value in segment_ids]
+        if len(ids) < 2:
+            raise ValueError("At least two segments are required")
+        if merged.chapter_id != chapter_id:
+            raise ValueError("Invalid merged segment chapter")
+        placeholders = ",".join("?" for _value in ids)
+        with self.transaction() as connection:
+            rows = connection.execute(
+                f"SELECT id,position FROM text_segments WHERE id IN ({placeholders}) "
+                "AND chapter_id=? ORDER BY position",
+                (*ids, chapter_id),
+            ).fetchall()
+            if len(rows) != len(ids):
+                raise ValueError("One or more selected segments no longer exist")
+            positions = [int(row["position"]) for row in rows]
+            if positions != list(range(positions[0], positions[-1] + 1)):
+                raise ValueError("Segments are no longer contiguous")
+            keep_id = int(rows[0]["id"])
+            remove_ids = [int(row["id"]) for row in rows[1:]]
             connection.execute(
-                "UPDATE text_segments SET position=position-1 WHERE chapter_id=? AND position>?",
-                (chapter_id, position + 1),
+                """UPDATE text_segments SET position=?,text=?,start_ms=?,end_ms=?,confidence=?,
+                status=?,locked=?,origin=?,source_fragment_id=?,source_start_char=?,source_end_char=?
+                WHERE id=? AND chapter_id=?""",
+                (
+                    positions[0], merged.text, merged.start_ms, merged.end_ms,
+                    merged.confidence, merged.status.value, int(merged.locked),
+                    merged.origin.value, merged.source_fragment_id,
+                    merged.source_start_char, merged.source_end_char,
+                    keep_id, chapter_id,
+                ),
+            )
+            remove_placeholders = ",".join("?" for _value in remove_ids)
+            connection.execute(
+                f"UPDATE text_audio_anchors SET segment_id=? WHERE chapter_id=? "
+                f"AND segment_id IN ({remove_placeholders})",
+                (keep_id, chapter_id, *remove_ids),
+            )
+            connection.execute(
+                f"DELETE FROM text_segments WHERE chapter_id=? "
+                f"AND id IN ({remove_placeholders})",
+                (chapter_id, *remove_ids),
+            )
+            self._shift_segment_positions(
+                connection, chapter_id, positions[-1], -len(remove_ids),
             )
 
     def mark_segments_unmatched(self, segment_ids: Sequence[int]) -> None:
@@ -890,6 +970,16 @@ class ProjectRepository:
                 "SELECT id FROM text_segments WHERE chapter_id=? ORDER BY position,id",
                 (chapter_id,),
             ).fetchall()
+            position_row = connection.execute(
+                "SELECT COALESCE(MAX(position), -1) AS maximum FROM text_segments WHERE chapter_id=?",
+                (chapter_id,),
+            ).fetchone()
+            temporary_offset = int(position_row["maximum"]) + len(rows) + 2
+            if rows:
+                connection.execute(
+                    "UPDATE text_segments SET position=position+? WHERE chapter_id=?",
+                    (temporary_offset, chapter_id),
+                )
             connection.executemany(
                 "UPDATE text_segments SET position=? WHERE id=?",
                 [(position, row["id"]) for position, row in enumerate(rows)],

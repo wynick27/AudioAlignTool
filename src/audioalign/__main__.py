@@ -16,9 +16,20 @@ def _runtime_probe(arguments: list[str]) -> int:
     return 0
 
 
-def main() -> int:
-    from audioalign.core.runtime import bootstrap_native_runtime
+def _runtime_pip(arguments: list[str]) -> int:
+    """Private entry point used by the frozen app's runtime installer."""
+    from pip._internal.cli.main import main as pip_main
 
+    return int(pip_main(arguments))
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--runtime-pip":
+        return _runtime_pip(sys.argv[2:])
+
+    from audioalign.core.runtime import activate_optional_runtimes, bootstrap_native_runtime
+
+    activate_optional_runtimes()
     bootstrap_native_runtime()
     if len(sys.argv) > 1 and sys.argv[1] == "--runtime-probe":
         return _runtime_probe(sys.argv[2:])

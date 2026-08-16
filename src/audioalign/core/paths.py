@@ -48,6 +48,20 @@ class ApplicationPaths:
         return self.root / "models"
 
     @property
+    def runtimes(self) -> Path:
+        """Installed optional inference runtimes kept beside the app."""
+        return self.root / "runtimes"
+
+    @property
+    def runtime_packages(self) -> Path:
+        """Directory containing the bundled local runtime component index."""
+        return self.root / "runtime-packages"
+
+    @property
+    def runtime_index(self) -> Path:
+        return self.runtime_packages / "runtime-index.json"
+
+    @property
     def logs(self) -> Path:
         return self.root / "logs"
 
@@ -56,7 +70,10 @@ class ApplicationPaths:
         return self.root / "settings.json"
 
     def ensure(self) -> None:
-        for path in (self.projects, self.work, self.models, self.logs):
+        for path in (
+            self.projects, self.work, self.models, self.runtimes,
+            self.runtime_packages, self.logs,
+        ):
             path.mkdir(parents=True, exist_ok=True)
         probe = self.root / ".audioalign-write-test"
         try:

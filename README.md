@@ -19,6 +19,7 @@ AudioAlignTool 是用于电子书文本与有声书时间轴对齐的 Windows �
 
 - 支持将时间选区绑定到当前句、平均或按已有时长分配给多句、设置起止点、插入、拆分、合并、清除时间、锁定和删除。
 - 删除来源于 EPUB/TXT/MD/HTML/SRT 的句段时只清除时间并保留原文为“未匹配”；只有用户或 ASR 新建的无来源句段才会真正删除。
+- “识别 → 清除本章全部时间对应”保留全部文字；“重置本章字幕并重新匹配”则保留原书/SRT、删除自动或用户临时句，并优先复用识别缓存重新匹配。
 - 拆分支持“按播放头”“文本框当前光标”“按标点拆成多句”。存在 ASR 或 Forced Aligner 字符锚点时优先用锚点确定文本和时间边界，没有锚点时才按字符比例估算。
 - 语言感知分句可处理中文、日文和空格语言，支持省略号、多重标点、直接引语及含多个逗号的长句；自动分句不会因为句子较长就在普通词间空格处硬切，也不会产生只有标点的句段。
 - 三种重叠策略可选：限制当前句且不修改相邻句、自动缩放直接相邻句、允许重叠并显示红色冲突。
@@ -29,8 +30,9 @@ AudioAlignTool 是用于电子书文本与有声书时间轴对齐的 Windows �
 
 - faster-whisper、WhisperX 和 Qwen3-ASR 提供“识别后与原文匹配”；Qwen3-ForcedAligner 提供“已知文本强制对齐”。两类工作流在界面中明确分开。
 - faster-whisper 是默认识别后端；WhisperX 在 Whisper 识别之后使用语言相关的声学模型细化词时间，因此属于组合式识别与对齐 pipeline。
-- Qwen3-ASR 支持 0.6B 和 1.7B；Qwen3-ForcedAligner 可精确处理当前句、连续所选句与音频选区、从指定句子/时间向后，或整个章节。
-- 支持完全没有原文的纯音频转写，根据 ASR 标点、停顿和最大句长自动生成可编辑句段。
+- Qwen3-ASR 支持 0.6B 和 1.7B；Qwen3-ForcedAligner 可精确处理当前句、连续所选句与音频选区、从指定句子/时间向后，或整个章节。自动向后和整章模式使用多句块、重叠验证与有限回溯，不再按全文字符比例逐句估时；无法可靠恢复时保留稳定结果并将问题句标黄。
+- 静音候选默认仅显示筛选后的关键灰蓝区域且没有中心竖线；黄色只表示低置信度、漂移或重新同步等需要人工检查的对齐结果。“视图 → 静音显示”可切换隐藏、关键和全部。
+- 支持完全没有原文的纯音频转写：媒体管理器会明确询问是否按媒体文件或 M4B 内嵌章节建立空白章节；应用后运行当前章或全书识别，根据 ASR 标点、停顿和最大句长生成可编辑句段。
 - 静音检测使用 VAD 判断语音区，再在非语音区寻找低能量边界。检测结果只生成可视候选，不会直接覆盖时间轴。
 - “从当前句按静音自动分配”不加载 ASR，以当前句和播放头或选区为起点进行粗排；锁定句段作为硬锚点，置信不足时标记为待检查。
 - ASR 对比视图按词锚点把原文句段与识别稿排成成对行，共用一个滚动位置，并恢复空格语言的词间空格；单击识别词只定位播放头，双击则定位并将主音频视图居中。
@@ -52,7 +54,7 @@ AudioAlignTool 是用于电子书文本与有声书时间轴对齐的 Windows �
 - M4B 内嵌章节作为同一媒体资源中的独立时间切片参与配对，无需拆分或重复复制整本音频。
 - 媒体资源与章节配对管理器支持添加、排序、重命名、重新定位、替换、移除引用、重复检查，以及一个文本章节连接多个媒体切片。
 - 同一媒体切片可以复用到多个文本章节；规范路径和文件指纹用于防止同一文件被重复导入。所有配对修改在点击“应用”后才以一次事务写入。
-- EPUB 的独立 `CHAPTER XXX` 标题页可与后续正文页组成同一逻辑章节，同时保留标题句本身；HTML `<head><title>` 等不可见元数据不会被误当成正文。
+- EPUB 的独立 `CHAPTER XXX` 标题页可与后续正文页组成同一逻辑章节，同时保留标题句本身；日文 EPUB 优先使用 `<head><title>` 的正式章名，并从匹配文本中排除 ruby 注音的 `<rt>`，避免“夫妻”变成“夫ふ妻さい”而破坏 ASR 匹配。
 
 ### 项目、后台任务与设备状态
 
@@ -67,7 +69,9 @@ AudioAlignTool 是用于电子书文本与有声书时间轴对齐的 Windows �
 
 - 支持交互式 HTML、SRT、WebVTT、schema v2 JSON，以及 EPUB 3 Media Overlays；回写原版 XHTML 时允许受控的细微用词差异，同时保持章节内单调映射，避免误配重复文本。
 - HTML 阅读包优先复用 EPUB/HTML 的原始标签、CSS、字体和图片；固定播放器支持章节切换、`0.25×–3.0×` 倍速、上一句/下一句、单句循环、播放高亮，并在浏览器本地记录上次章节、播放位置、倍率和循环状态。
+- HTML 还可选择“独立章节”模式：每章输出一个自带播放器和同步逻辑的 HTML，不生成 `index.html`，也不建立章节之间的链接；音频及原书图片、字体、CSS 仍复用导出目录中的 `media/` 与 `book/` 资源。
 - EPUB 来源项目复制原 EPUB 包结构，保留 CSS、字体、图片、封面、导航、元数据、spine 顺序和原版排版，只注入同步锚点、SMIL 与媒体清单。
+- EPUB 正文可选择“保持原书正文”或“尝试应用编辑文字”；后者只替换能够可靠定位且不跨越样式、链接或 ruby 的范围，其余句段保持原文并写入导出报告。
 - EPUB 导出可以自动把相邻句之间的短空隙补到前一句 `clipEnd`，保留自然停顿，避免阅读器在句段边界产生突兀跳变；最大补齐长度可设置，且不会跨越未匹配句、重叠或长空白。
 - 自动兼容策略会直接复制 MP3/AAC、把 M4B 或视频中的 AAC 无损重封装为 M4A，并将 Opus、Vorbis、FLAC、WAV 等格式转换为 AAC-LC；也可强制 AAC 或 MP3。
 - 转换后的 EPUB 音频保存在项目缓存中，第二次导出相同媒体和参数时直接复用；多个媒体可以并行准备。
@@ -102,7 +106,7 @@ cache/
 
 ## 安装与启动
 
-要求 Python 3.14。首次准备源码环境：
+发布和推荐开发环境使用 Python 3.13。首次准备源码环境：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
@@ -114,7 +118,7 @@ powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
 .\start.bat
 ```
 
-Whisper 模型在首次确认下载后写入 `models/<模型名>/`，之后可离线运行。WhisperX 工作流另行安装可选组件：
+Whisper 模型在首次确认下载后写入 `models/<模型名>/`，之后可离线运行。源码环境也可直接安装 WhisperX：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install whisperx
@@ -137,19 +141,42 @@ Whisper 模型在首次确认下载后写入 `models/<模型名>/`，之后可�
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-## Windows 便携版打包
+## Windows 发布包
 
-项目只发布免安装便携版，不生成安装器。请在 Windows 上使用 Python 3.14：
+项目发布两个免安装 ZIP，不生成安装器，也暂不提供包含 CUDA 的完整包。发布构建
+统一使用 Windows x64 Python 3.13。
+
+精简便携版包含 faster-whisper CPU、VAD、编辑器和全部导入导出功能，不内置
+Qwen/PyTorch：
 
 ```powershell
 .\build-portable.ps1 -Clean
 ```
+
+普通版额外内置 Qwen3-ASR、ForcedAligner 和 CPU-only PyTorch，但不包含 CUDA：
+
+```powershell
+.\build-portable.ps1 -Clean -Standard
+```
+
+普通版必须在干净的 CPU PyTorch 构建环境中生成；脚本发现所选 Python 已安装
+CUDA PyTorch 时会停止，不会替换用户现有的 GPU 环境。精简版可通过
+“选项 → 运行时组件”安装 Qwen CPU/GPU，普通版也可在那里切换 Qwen GPU；
+faster-whisper 的 CUDA 用户态库同样可以按需安装。组件清单只读取程序自带的
+`runtime-packages/runtime-index.json`，依赖由 pip 从 PyPI 或 PyTorch 官方 wheel
+源安装到程序目录的 `runtimes/`，不会读取 GitHub 索引或从 GitHub Release 下载
+运行时包。由于发布版已统一为 Python 3.13，WhisperX CPU/GPU 也使用相同的按需
+安装机制，不再下载或维护第二套 Python 运行时。
+
+每次构建都会先删除旧的
+`dist/AudioAlignTool` 目录，防止旧 ZIP、模型或项目被意外嵌套进新包。
 
 脚本会创建或复用程序目录内的 `.venv`，安装锁定依赖，运行测试，调用
 PyInstaller 生成 onedir 目录，最后输出：
 
 ```text
 artifacts/AudioAlignTool-<版本>-Windows-x64-portable.zip
+artifacts/AudioAlignTool-<版本>-Windows-x64-standard.zip
 artifacts/SHA256SUMS.txt
 ```
 
@@ -160,8 +187,8 @@ artifacts/SHA256SUMS.txt
 常用参数：
 
 ```powershell
-# 使用指定的 Python 3.14
-.\build-portable.ps1 -Python C:\Python314\python.exe -Clean
+# 使用指定的 Python 3.13
+.\build-portable.ps1 -Python C:\Python313\python.exe -Clean
 
 # 已经安装依赖时跳过安装；仅在确认环境完整时使用
 .\build-portable.ps1 -SkipInstall
@@ -171,18 +198,27 @@ artifacts/SHA256SUMS.txt
 ```
 
 GitHub Actions 配置位于 `.github/workflows/windows-portable.yml`。推送到 `main`、
-创建针对 `main` 的拉取请求、推送 `v*` 标签或手动触发时都会构建，并上传 ZIP 与
-SHA-256 校验文件。CI 与本机均调用同一个 `build-portable.ps1`，不会调用 Inno Setup。
+创建针对 `main` 的拉取请求、推送 `v*` 标签或手动触发时都会并行构建精简便携版和
+CPU Qwen 普通版；`v*` 标签的 Release 同时上传两个 ZIP 和统一的 SHA-256 校验文件。
+CI 与本机均调用同一个 `build-portable.ps1`，不会调用 Inno Setup，也不会发布 GPU 完整包。
 
 ## 识别缓存与 CUDA
 
 - faster-whisper 与 Qwen3-ASR 使用统一的分块识别流程；默认目标块为 120 秒，优先在 VAD 停顿处分块。
+- 纯音频项目由 ASR 生成句段时会按语言保守恢复标点：明显句内停顿补逗号，句末缺少终止符时补句号；模型已有标点始终优先保留。
 - 完成的识别块保存在项目数据库中。修改原文只会重新匹配，不会重新运行 ASR；可在界面中强制刷新或清除当前模型缓存。
 - Windows 启动时会注册 Python 环境中 `nvidia/cublas/bin` 与 `nvidia/cudnn/bin`，不会永久修改系统 PATH。
 - 模型状态栏在实际推理后显示真正使用的 CPU/GPU、计算类型以及 CUDA 回退原因。
 - Qwen3-ForcedAligner 用于已知文本的句子或选区；GPU 优先，CPU 允许继续但会明确提示速度很慢，单次模型输入硬上限为 240 秒。
 - Qwen 强制对齐入口集中在一个下拉菜单：可处理当前句、连续所选句子与明确音频选区、从当前句/播放头向后，以及整个章节。音频存在片头或文本版本差异时，优先使用“所选句子 ↔ 音频选区”建立准确局部范围，或用“从当前句/时间向后”跳过不一致的开头。
 - Qwen 没有可用 GPU 时不会禁止任务，而是显示 CPU/float32 状态并警告可能很慢，由用户确认是否继续。
+
+## Anki Furigana 原文
+
+在“章节与音频配对管理器”的“原文解析”中可以启用 Anki Furigana。启用后，之后
+导入的 TXT、Markdown、HTML 或 EPUB 中，`漢字[かんじ]` 会在原书视图中显示为
+ruby 上方假名；文本匹配、ASR 对齐和分句只使用 `漢字`。程序只转换项目内的显示
+副本，不改写用户选择的原始文件。
 - Qwen 模型优先从 Hugging Face 下载；连接或下载失败时自动切换到 ModelScope。只有配置和全部权重完整时才会把模型标记为可用，未完成文件可供下次续传。
 
 首次启动默认播放速度为 `1.00×`；以后恢复上次使用的倍率。若开启“启动时使用 1.0×”，则每次启动都忽略历史倍率。

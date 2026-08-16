@@ -26,7 +26,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from audioalign.core.models import SourceDocumentKind, TextSegment
 from audioalign.core.epub_media_overlay import _fuzzy_projection_match, _match_projection
 from audioalign.core.storage import ProjectSession
-from audioalign.core.text import html_to_text, normalize_for_match
+from audioalign.core.text import decode_html_bytes, html_to_text, normalize_for_match
 
 
 _SCHEME_REGISTERED = False
@@ -180,7 +180,7 @@ def annotate_html(source_html: str, segments: list[TextSegment], base_href: str)
 
     nodes = [
         node for node in soup.find_all(string=True)
-        if node.parent and node.parent.name not in {"style", "script", "title", "svg"}
+        if node.parent and node.parent.name not in {"style", "script", "title", "svg", "rt", "rp"}
     ]
     document, mapping = _normalized_with_mapping(nodes)
     projected_document, projected_offsets = _match_projection(document)
@@ -352,8 +352,12 @@ class OriginalBookView(QWebEngineView):
                 extracted = session.root / "cache" / "book-view" / document.fingerprint[:16]
                 _safe_extract_epub(stored, extracted)
                 entry = extracted / entry_path
-                if len(source_parts) <= 1 and entry.is_file():
-                    source_html = entry.read_text("utf-8", errors="replace")
+                # Anki furigana imports deliberately keep the original source
+                # file untouched and store a ruby-rendered display copy on the
+                # chapter. Do not replace that copy with the raw EPUB entry.
+                has_anki_ruby = 'name="audioalign-anki-furigana"' in source_html or "name='audioalign-anki-furigana'" in source_html
+                if len(source_parts) <= 1 and entry.is_file() and not has_anki_ruby:
+                    source_html = decode_html_bytes(entry.read_bytes())
                 if entry.is_file():
                     base_relative = entry.parent.relative_to(session.root)
             elif document.resource_root:
@@ -371,13 +375,13 @@ class OriginalBookView(QWebEngineView):
                 target = normalize_for_match(html_to_text(chapter.source_html))[:1200]
                 scored: list[tuple[float, Path]] = []
                 for entry in list(extracted.rglob("*.xhtml")) + list(extracted.rglob("*.html")):
-                    candidate_html = entry.read_text("utf-8", errors="replace")
+                    candidate_html = decode_html_bytes(entry.read_bytes())
                     candidate = normalize_for_match(html_to_text(candidate_html))[:1200]
                     scored.append((SequenceMatcher(None, target, candidate).ratio(), entry))
                 if scored:
                     score, entry = max(scored, key=lambda item: item[0])
                     if score >= 0.45:
-                        source_html = entry.read_text("utf-8", errors="replace")
+                        source_html = decode_html_bytes(entry.read_bytes())
                         base_relative = entry.parent.relative_to(session.root)
         if not source_html:
             body = "".join(f"<p>{html.escape(segment.text)}</p>" for segment in segments)
