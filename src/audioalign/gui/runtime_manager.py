@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 
 from audioalign.core.paths import ApplicationPaths
 from audioalign.core.runtime_addons import (
-    RuntimeComponent, component_manifest, load_runtime_index,
+    RuntimeComponent, activate_component, component_manifest, load_runtime_index,
     install_runtime_component, load_active_runtimes, remove_runtime_component,
 )
 
@@ -19,6 +19,7 @@ class _RuntimeSignals(QObject):
     index_ready = Signal(object)
     progress = Signal(float, str)
     installed = Signal(object)
+    activated = Signal(object)
     failed = Signal(str)
 
 
@@ -44,6 +45,7 @@ class RuntimeManagerDialog(QDialog):
         self.signals.index_ready.connect(self._show_index)
         self.signals.progress.connect(self._show_progress)
         self.signals.installed.connect(self._installed)
+        self.signals.activated.connect(self._activated)
         self.signals.failed.connect(self._failed)
         self.setWindowTitle("运行时组件")
         self.resize(720, 470)
@@ -52,8 +54,8 @@ class RuntimeManagerDialog(QDialog):
         explanation = QLabel(
             "基础便携版已包含 faster-whisper CPU。组件列表来自程序目录中的本地索引；"
             "安装包从 PyPI 或 PyTorch 官方 wheel 源获取，不访问 GitHub。"
-            "安装结果保存在 runtimes 中，重启后生效。发布版使用 Python 3.13，"
-            "可直接安装 WhisperX CPU 或 GPU 组件。"
+            "安装结果保存在 runtimes 中，重启后生效。支持 Python 3.13/3.14，"
+            "Qwen 与 WhisperX 共用同一份 PyTorch 2.11，CPU 和 GPU 版二选一。"
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -133,12 +135,23 @@ class RuntimeManagerDialog(QDialog):
         component_id = item.data(Qt.ItemDataRole.UserRole)
         return next((item for item in self.components if item.id == component_id), None)
 
-    def _selection_changed(self) -> None:
+    def _selection_changed(self, *_args) -> None:
         component = self._component()
-        self.install_button.setEnabled(component is not None)
-        self.remove_button.setEnabled(bool(component and component_manifest(component.id, self.paths)))
+        installed = bool(component and component_manifest(component.id, self.paths))
+        active = load_active_runtimes(self.paths)
+        enabled = bool(component and active.get(component.group) == component.id)
+        if enabled:
+            self.install_button.setText("已启用")
+            self.install_button.setEnabled(False)
+        elif installed:
+            self.install_button.setText("切换并启用")
+            self.install_button.setEnabled(True)
+        else:
+            self.install_button.setText("安装并启用")
+            self.install_button.setEnabled(component is not None)
+        self.remove_button.setEnabled(installed)
         if component:
-            packages = "、".join(component.packages)
+            packages = "、".join((*component.packages, *component.no_deps_packages))
             self.detail.setText(
                 (component.description or component.display_name)
                 + f"\n来源：PyPI / 官方 Python wheel 源\n包：{packages}"
@@ -156,6 +169,10 @@ class RuntimeManagerDialog(QDialog):
 
         def job() -> None:
             try:
+                if component_manifest(component.id, self.paths) is not None:
+                    activate_component(component.group, component.id, self.paths)
+                    self.signals.activated.emit(component)
+                    return
                 install_runtime_component(component, self.paths, report)
                 self.signals.installed.emit(component)
             except Exception as exc:
@@ -176,6 +193,15 @@ class RuntimeManagerDialog(QDialog):
         self.progress.setVisible(False)
         self.refresh()
         QMessageBox.information(self, "运行时已安装", f"{component.display_name} 已安装。\n\n请重启程序后使用。")
+
+    def _activated(self, component) -> None:
+        self._set_busy(False)
+        self.progress.setVisible(False)
+        self.refresh()
+        QMessageBox.information(
+            self, "运行时已切换",
+            f"已直接启用 {component.display_name}，没有重新安装文件。\n\n请重启程序后使用。",
+        )
 
     def _failed(self, message: str) -> None:
         self._set_busy(False)

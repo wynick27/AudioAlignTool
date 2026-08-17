@@ -110,7 +110,7 @@ cache/
 
 ## 安装与启动
 
-发布和推荐开发环境使用 Python 3.13。首次准备源码环境：
+发布和推荐开发环境使用 Python 3.14，同时支持 Python 3.13。首次准备源码环境：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
@@ -122,11 +122,7 @@ powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
 .\start.bat
 ```
 
-Whisper 模型在首次确认下载后写入 `models/<模型名>/`，之后可离线运行。源码环境也可直接安装 WhisperX：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install whisperx
-```
+Whisper 模型在首次确认下载后写入 `models/<模型名>/`，之后可离线运行。Qwen 与 WhisperX 通过“选项 → 运行时组件”安装，共用一份 PyTorch。
 
 ## 基本流程
 
@@ -148,7 +144,7 @@ Whisper 模型在首次确认下载后写入 `models/<模型名>/`，之后可�
 ## Windows 发布包
 
 项目发布两个免安装 ZIP，不生成安装器，也暂不提供包含 CUDA 的完整包。发布构建
-统一使用 Windows x64 Python 3.13。
+默认使用 Windows x64 Python 3.14，构建脚本也接受 Python 3.13。
 
 精简便携版包含 faster-whisper CPU、VAD、编辑器和全部导入导出功能，不内置
 Qwen/PyTorch：
@@ -163,14 +159,13 @@ Qwen/PyTorch：
 .\build-portable.ps1 -Clean -Standard
 ```
 
-普通版必须在干净的 CPU PyTorch 构建环境中生成；脚本发现所选 Python 已安装
-CUDA PyTorch 时会停止，不会替换用户现有的 GPU 环境。精简版可通过
-“选项 → 运行时组件”安装 Qwen CPU/GPU，普通版也可在那里切换 Qwen GPU；
-faster-whisper 的 CUDA 用户态库同样可以按需安装。组件清单只读取程序自带的
+普通版的 Qwen CPU/PyTorch 以可替换运行时层预置在 `runtimes/`，不嵌入
+PyInstaller 的 `_internal`，因此构建环境已安装的 GPU PyTorch 不会混入发布包。精简版可通过
+“选项 → 运行时组件”安装统一 AI 运行时。Qwen、WhisperX 和
+faster-whisper 共用同一份 PyTorch/CUDA 库，CPU/GPU 版二选一。组件清单只读取程序自带的
 `runtime-packages/runtime-index.json`，依赖由 pip 从 PyPI 或 PyTorch 官方 wheel
 源安装到程序目录的 `runtimes/`，不会读取 GitHub 索引或从 GitHub Release 下载
-运行时包。由于发布版已统一为 Python 3.13，WhisperX CPU/GPU 也使用相同的按需
-安装机制，不再下载或维护第二套 Python 运行时。
+运行时包。组件 ABI 按当前 Python 3.13/3.14 解释器生成，不下载或维护第二套 Python 运行时。
 
 每次构建都会先删除旧的
 `dist/AudioAlignTool` 目录，防止旧 ZIP、模型或项目被意外嵌套进新包。
@@ -191,8 +186,8 @@ artifacts/SHA256SUMS.txt
 常用参数：
 
 ```powershell
-# 使用指定的 Python 3.13
-.\build-portable.ps1 -Python C:\Python313\python.exe -Clean
+# 使用指定的 Python 3.14（也接受 3.13）
+.\build-portable.ps1 -Python C:\Python314\python.exe -Clean
 
 # 已经安装依赖时跳过安装；仅在确认环境完整时使用
 .\build-portable.ps1 -SkipInstall

@@ -1,6 +1,4 @@
 # Run through build-portable.ps1 so local and CI builds use identical options.
-import os
-
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_dynamic_libs, copy_metadata
 
 datas, binaries, hiddenimports = [], [], []
@@ -46,20 +44,7 @@ for distribution in (
 ):
     datas += copy_metadata(distribution)
 
-include_qwen = os.environ.get("AAT_INCLUDE_QWEN", "").strip() == "1"
-if include_qwen:
-    package_datas, package_binaries, package_hidden = collect_all("qwen_asr")
-    datas += package_datas
-    binaries += package_binaries
-    hiddenimports += package_hidden
-    # Our fallback imports only modelscope.snapshot_download.  Static analysis
-    # follows that path; collecting every trainer/parallel plugin pulled in
-    # optional `addict` and a large unrelated training stack.
-    hiddenimports += ["modelscope", "modelscope.hub.snapshot_download"]
-    for distribution in ("qwen-asr", "modelscope"):
-        datas += copy_metadata(distribution)
-
-excludes = [] if include_qwen else [
+excludes = [
     "qwen_asr",
     "modelscope",
     "torch",

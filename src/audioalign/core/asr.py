@@ -324,10 +324,28 @@ def runtime_status(
 
     backend = ASRBackendId(backend)
     runtime_module = "qwen_asr" if backend == ASRBackendId.QWEN3_ASR else "faster_whisper"
-    runtime = importlib.util.find_spec(runtime_module) is not None
+    ai_manifest = active_runtime_manifest("ai")
+
+    def manifest_has(package_name: str) -> bool:
+        if not ai_manifest:
+            return False
+        declared = (*ai_manifest.get("packages", ()), *ai_manifest.get("no_deps_packages", ()))
+        wanted = package_name.casefold().replace("_", "-")
+        return any(
+            str(requirement).casefold().replace("_", "-").startswith(wanted)
+            for requirement in declared
+        )
+
+    runtime = (
+        importlib.util.find_spec(runtime_module) is not None
+        or (backend == ASRBackendId.QWEN3_ASR and manifest_has("qwen-asr"))
+    )
+    torch_present = importlib.util.find_spec("torch") is not None
+    torch_load_error = ""
     precise = (
         importlib.util.find_spec("whisperx") is not None
         or active_runtime_manifest("whisperx") is not None
+        or manifest_has("whisperx")
     )
     cuda = False
     compute_types: tuple[str, ...] = ()
@@ -345,8 +363,8 @@ def runtime_status(
             import torch  # type: ignore
             cuda = bool(torch.cuda.is_available()) and not bool(qwen_cuda_disabled_reason())
             compute_types = ("bfloat16", "float16") if cuda else ("float32",)
-        except ImportError:
-            pass
+        except (ImportError, OSError, RuntimeError) as exc:
+            torch_load_error = f"{type(exc).__name__}: {exc}"
     root = Path(model_root)
     if backend == ASRBackendId.QWEN3_ASR:
         local_name = model.casefold().replace("qwen/", "").replace("-", "_").replace(".", "_")
@@ -368,17 +386,26 @@ def runtime_status(
                     pass
                 device_preview = f" · 将使用 GPU 0 {device_name} · bfloat16".rstrip()
             else:
-                reason = (
-                    f"本次运行 CUDA 已熔断：{qwen_cuda_disabled_reason()}"
-                    if qwen_cuda_disabled_reason() else "CPU 版 PyTorch"
-                )
-                try:
-                    import torch  # type: ignore
+                if torch_load_error:
+                    reason = (
+                        f"PyTorch 已安装但加载失败：{torch_load_error}"
+                        if torch_present else "PyTorch 未安装"
+                    )
+                else:
+                    reason = (
+                        f"本次运行 CUDA 已熔断：{qwen_cuda_disabled_reason()}"
+                        if qwen_cuda_disabled_reason() else "CPU 版 PyTorch"
+                    )
+                    try:
+                        import torch  # type: ignore
 
-                    if torch.version.cuda is not None and not qwen_cuda_disabled_reason():
-                        reason = "CUDA 不可用"
-                except ImportError:
-                    reason = "PyTorch 缺失"
+                        if torch.version.cuda is not None and not qwen_cuda_disabled_reason():
+                            reason = "CUDA 不可用"
+                    except (ImportError, OSError, RuntimeError) as exc:
+                        reason = (
+                            f"PyTorch 已安装但加载失败：{type(exc).__name__}: {exc}"
+                            if torch_present else "PyTorch 未安装"
+                        )
                 device_preview = f" · 将使用 CPU · float32 · {reason}"
         message = f"模型 {model} 尚未下载{device_preview}"
     elif not probe_device:
@@ -398,15 +425,23 @@ def runtime_status(
     else:
         reason = ""
         if backend == ASRBackendId.QWEN3_ASR:
-            if qwen_cuda_disabled_reason():
+            if torch_load_error:
+                reason = (
+                    f" · PyTorch 已安装但加载失败：{torch_load_error}"
+                    if torch_present else " · PyTorch 未安装"
+                )
+            elif qwen_cuda_disabled_reason():
                 reason = f" · CUDA 已熔断并回退 CPU：{qwen_cuda_disabled_reason()}"
             else:
                 try:
                     import torch  # type: ignore
 
                     reason = " · CPU 版 PyTorch" if torch.version.cuda is None else " · CUDA 不可用"
-                except ImportError:
-                    reason = " · PyTorch 缺失"
+                except (ImportError, OSError, RuntimeError) as exc:
+                    reason = (
+                        f" · PyTorch 已安装但加载失败：{type(exc).__name__}: {exc}"
+                        if torch_present else " · PyTorch 未安装"
+                    )
         compute = "float32" if backend == ASRBackendId.QWEN3_ASR else "INT8"
         message = f"模型 {model} 已就绪 · CPU · {compute}{reason}"
     return RuntimeStatus(runtime, available, precise, cuda, message, backend.value, compute_types, paths)

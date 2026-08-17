@@ -42,14 +42,20 @@ try {
         if (-not (Test-Path -LiteralPath $venvPython)) {
             $launcher = Get-Command py -ErrorAction SilentlyContinue
             if ($null -eq $launcher) {
-                $installedPython = Join-Path $env:LOCALAPPDATA "Python\pythoncore-3.13-64\python.exe"
+                $installedPython = Join-Path $env:LOCALAPPDATA "Python\pythoncore-3.14-64\python.exe"
                 if (-not (Test-Path -LiteralPath $installedPython)) {
-                    throw "Neither .venv nor Python 3.13 was found. Install Python 3.13 or pass -Python."
+                    $installedPython = Join-Path $env:LOCALAPPDATA "Python\pythoncore-3.13-64\python.exe"
+                }
+                if (-not (Test-Path -LiteralPath $installedPython)) {
+                    throw "Neither .venv nor Python 3.13/3.14 was found. Install it or pass -Python."
                 }
             }
-            Write-Host "Creating the Python 3.13 virtual environment: .venv"
+            Write-Host "Creating the Python 3.14 virtual environment: .venv"
             if ($null -ne $launcher) {
-                & $launcher.Source -3.13 -m venv (Join-Path $projectRoot ".venv")
+                & $launcher.Source -3.14 -m venv (Join-Path $projectRoot ".venv")
+                if ($LASTEXITCODE -ne 0) {
+                    & $launcher.Source -3.13 -m venv (Join-Path $projectRoot ".venv")
+                }
             } else {
                 & $installedPython -m venv (Join-Path $projectRoot ".venv")
             }
@@ -61,7 +67,7 @@ try {
         $pythonPath = $pythonCommand.Source
     }
 
-    & $pythonPath -c "import sys; assert sys.version_info[:2] == (3, 13), f'Python 3.13 is required; found {sys.version}'"
+    & $pythonPath -c "import sys; assert (3, 13) <= sys.version_info[:2] < (3, 15), f'Python 3.13 or 3.14 is required; found {sys.version}'"
     if ($LASTEXITCODE -ne 0) { throw "Python version validation failed." }
 
     if (-not $SkipInstall) {
@@ -70,17 +76,6 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Failed to upgrade pip." }
         & $pythonPath -m pip install -r requirements-build.txt
         if ($LASTEXITCODE -ne 0) { throw "Failed to install packaging dependencies." }
-        if ($Standard) {
-            Write-Host "Installing Qwen with CPU-only PyTorch for the standard package..."
-            & $pythonPath -m pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cpu
-            if ($LASTEXITCODE -ne 0) { throw "Failed to install CPU-only PyTorch." }
-            & $pythonPath -c "import torch; assert torch.version.cuda is None, 'The standard package requires a clean CPU-only PyTorch build environment'"
-            if ($LASTEXITCODE -ne 0) {
-                throw "The selected Python already contains CUDA PyTorch. Use a clean CPU build environment; the script will not replace your working GPU installation."
-            }
-            & $pythonPath -m pip install -r requirements-qwen-lock.txt
-            if ($LASTEXITCODE -ne 0) { throw "Failed to install Qwen dependencies." }
-        }
         & $pythonPath -m pip install --no-deps -e .
         if ($LASTEXITCODE -ne 0) { throw "Failed to install AudioAlignTool." }
     }
@@ -113,13 +108,8 @@ try {
     # or project cannot become nested in the next release archive.
     Remove-BuildPath $bundleDir
     Write-Host "Building the PyInstaller onedir bundle..."
-    $env:AAT_INCLUDE_QWEN = if ($Standard) { "1" } else { "0" }
-    try {
-        & $pythonPath -m PyInstaller --noconfirm --clean --distpath $distRoot --workpath $workRoot AudioAlignTool.spec
-        if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
-    } finally {
-        Remove-Item Env:AAT_INCLUDE_QWEN -ErrorAction SilentlyContinue
-    }
+    & $pythonPath -m PyInstaller --noconfirm --clean --distpath $distRoot --workpath $workRoot AudioAlignTool.spec
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 
     $executable = Join-Path $bundleDir "AudioAlignTool.exe"
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
@@ -139,6 +129,17 @@ try {
     Copy-Item -LiteralPath $sourceRuntimeIndex -Destination $runtimeIndex -Force
     if (-not (Test-Path -LiteralPath $runtimeIndex -PathType Leaf)) {
         throw "The build finished without the local runtime index: $runtimeIndex"
+    }
+    if ($Standard) {
+        Write-Host "Installing the shared Qwen CPU runtime beside the standard package..."
+        $previousPythonPath = $env:PYTHONPATH
+        $env:PYTHONPATH = Join-Path $projectRoot "src"
+        try {
+            & $pythonPath -c "import sys; from pathlib import Path; from audioalign.core.paths import ApplicationPaths; from audioalign.core.runtime_addons import install_runtime_component, load_runtime_index; p=ApplicationPaths(Path(sys.argv[1])); c=next(x for x in load_runtime_index(p) if x.id=='ai-qwen-cpu-win-x64'); install_runtime_component(c,p,lambda v,m: print(f'{v:.1%} {m}'))" $bundleDir
+            if ($LASTEXITCODE -ne 0) { throw "Failed to prepare the shared Qwen CPU runtime." }
+        } finally {
+            $env:PYTHONPATH = $previousPythonPath
+        }
     }
 
     New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null

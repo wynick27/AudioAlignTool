@@ -59,8 +59,10 @@ def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--runtime-pip":
         return _runtime_pip(sys.argv[2:])
 
+    from audioalign.core.runtime_addons import cleanup_inactive_ai_components
     from audioalign.core.runtime import activate_optional_runtimes, bootstrap_native_runtime
 
+    cleanup_inactive_ai_components()
     activate_optional_runtimes()
     bootstrap_native_runtime()
     if len(sys.argv) > 1 and sys.argv[1] == "--runtime-probe":

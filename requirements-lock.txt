@@ -1,4 +1,4 @@
-# Python 3.13 Windows release environment used by bootstrap.ps1.
+# Python 3.14 Windows release environment used by bootstrap.ps1 (3.13 remains supported).
 numpy==2.3.5
 PySide6==6.11.1
 pyqtgraph==0.14.0

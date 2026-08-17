@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from .paths import ApplicationPaths
 
 RUNTIME_SCHEMA_VERSION = 1
 ProgressCallback = Callable[[float, str], None]
+_PIP_RAW_PROGRESS = re.compile(r"^Progress\s+(\d+)\s+of\s+(\d+)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +27,7 @@ class RuntimeComponent:
     variant: str
     display_name: str
     packages: tuple[str, ...]
+    no_deps_packages: tuple[str, ...] = ()
     index_url: str = "https://pypi.org/simple"
     extra_index_urls: tuple[str, ...] = ()
     size: int = 0
@@ -40,6 +43,9 @@ class RuntimeComponent:
             variant=str(payload.get("variant", "")),
             display_name=str(payload.get("display_name", payload["id"])),
             packages=tuple(str(item) for item in payload.get("packages", ())),
+            no_deps_packages=tuple(
+                str(item) for item in payload.get("no_deps_packages", ())
+            ),
             index_url=str(payload.get("index_url", "https://pypi.org/simple")),
             extra_index_urls=tuple(
                 str(item) for item in payload.get("extra_index_urls", ())
@@ -110,6 +116,12 @@ def activate_component(group: str, component_id: str, paths: ApplicationPaths | 
     if manifest is None or manifest.get("group") != group:
         raise ValueError("运行时组件不存在或类型不匹配")
     active = load_active_runtimes(paths)
+    if group == "ai":
+        # The unified AI layer supersedes the former independent Qwen,
+        # WhisperX and CTranslate2-CUDA layers.  Keeping any of those active
+        # would put a second Torch/CUDA stack on sys.path.
+        for legacy_group in ("qwen", "whisperx", "cuda"):
+            active.pop(legacy_group, None)
     active[group] = component_id
     _write_active_runtimes(active, paths)
 
@@ -149,14 +161,15 @@ def load_runtime_index(
         raise ValueError("不支持的运行时索引格式")
     components = [RuntimeComponent.from_dict(item) for item in payload.get("components", [])]
     for component in components:
-        if not component.packages:
+        if not component.packages and not component.no_deps_packages:
             raise ValueError(f"运行时组件 {component.id} 没有声明 PyPI 包")
         if component.platform != "win_amd64":
             raise ValueError(f"运行时组件 {component.id} 的平台不受支持")
         sources = (component.index_url, *component.extra_index_urls)
         if any("github.com" in source.casefold() for source in sources):
             raise ValueError("运行时组件源不能指向 GitHub")
-        if any("://" in package or package.startswith("git+") for package in component.packages):
+        declared_packages = (*component.packages, *component.no_deps_packages)
+        if any("://" in package or package.startswith("git+") for package in declared_packages):
             raise ValueError("运行时组件只能声明包名和版本，不能包含直接下载地址")
     return components
 
@@ -173,43 +186,88 @@ def _install_pypi_packages(
     target: Path,
     progress: ProgressCallback | None,
 ) -> None:
-    command = [
-        *_pip_command(), "install", "--disable-pip-version-check", "--no-input",
-        "--only-binary=:all:", "--target", str(target),
-        "--index-url", component.index_url,
-    ]
-    for index_url in component.extra_index_urls:
-        command.extend(("--extra-index-url", index_url))
-    command.extend(component.packages)
-    if progress:
-        progress(-1.0, f"正在从 PyPI 安装 {component.display_name}")
-    environment = dict(os.environ)
-    environment["PYTHONUTF8"] = "1"
-    environment["PIP_NO_INPUT"] = "1"
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        env=environment,
-    )
-    recent: list[str] = []
-    if process.stdout is not None:
-        for raw_line in process.stdout:
-            line = raw_line.strip()
-            if not line:
-                continue
-            recent.append(line)
-            del recent[:-12]
-            if progress:
-                progress(-1.0, line)
-    return_code = process.wait()
-    if return_code:
-        detail = "\n".join(recent[-8:])
-        raise RuntimeError(f"pip 安装失败（退出码 {return_code}）\n{detail}")
+    def run(packages: tuple[str, ...], *, no_deps: bool, start: float, end: float) -> None:
+        if not packages:
+            return
+        command = [
+            *_pip_command(), "install", "--disable-pip-version-check", "--no-input",
+            "--only-binary=:all:", "--progress-bar", "raw", "--target", str(target),
+            "--index-url", component.index_url,
+        ]
+        for index_url in component.extra_index_urls:
+            command.extend(("--extra-index-url", index_url))
+        if no_deps:
+            # WhisperX currently declares torch~=2.8 even though its current
+            # pyannote stack works with newer Torch.  Its dependencies are
+            # installed explicitly in the first phase; only the WhisperX
+            # wheel itself bypasses the upstream Torch constraint here.
+            command.extend(("--no-deps", "--ignore-requires-python"))
+        command.extend(packages)
+        if progress:
+            progress(start, f"正在解析 {component.display_name} 的依赖")
+        environment = dict(os.environ)
+        environment["PYTHONUTF8"] = "1"
+        environment["PIP_NO_INPUT"] = "1"
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=environment,
+        )
+        recent: list[str] = []
+        displayed_progress = start
+        download_index = -1
+        previous_download: tuple[int, int] | None = None
+        if process.stdout is not None:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                recent.append(line)
+                del recent[:-12]
+                if progress:
+                    matched = _PIP_RAW_PROGRESS.match(line)
+                    if matched:
+                        current, total = (int(value) for value in matched.groups())
+                        if (
+                            previous_download is None
+                            or current < previous_download[0]
+                            or (current == 0 and total != previous_download[1])
+                        ):
+                            download_index += 1
+                        previous_download = (current, total)
+                        file_fraction = current / total if total > 0 else 0.0
+                        local_base = 0.85 * (1.0 - 0.5 ** max(0, download_index))
+                        local_span = 0.85 * 0.5 ** (max(0, download_index) + 1)
+                        local_progress = min(0.85, local_base + local_span * file_fraction)
+                        displayed_progress = max(
+                            displayed_progress,
+                            start + (end - start) * local_progress,
+                        )
+                        if total > 0:
+                            progress(
+                                displayed_progress,
+                                f"正在下载运行时文件 {current / 1024**2:.1f}/{total / 1024**2:.1f} MB",
+                            )
+                    else:
+                        folded = line.casefold()
+                        if "installing collected packages" in folded:
+                            displayed_progress = max(displayed_progress, start + (end - start) * 0.90)
+                        elif "successfully installed" in folded:
+                            displayed_progress = max(displayed_progress, end)
+                        progress(displayed_progress, line)
+        return_code = process.wait()
+        if return_code:
+            detail = "\n".join(recent[-8:])
+            raise RuntimeError(f"pip 安装失败（退出码 {return_code}）\n{detail}")
+
+    regular_end = 0.94 if component.no_deps_packages else 0.99
+    run(component.packages, no_deps=False, start=0.01, end=regular_end)
+    run(component.no_deps_packages, no_deps=True, start=regular_end, end=0.99)
 
 
 def install_runtime_component(
@@ -218,6 +276,22 @@ def install_runtime_component(
     progress: ProgressCallback | None = None,
 ) -> Path:
     application_paths = paths or ApplicationPaths.current()
+    existing = component_manifest(component.id, application_paths)
+    if existing is not None:
+        try:
+            _validate_manifest(existing, component)
+            package_root = component_directory(component.id, application_paths) / str(
+                existing.get("site_packages", "site-packages")
+            )
+            if package_root.is_dir():
+                activate_component(component.group, component.id, application_paths)
+                if progress:
+                    progress(1.0, f"{component.display_name} 已存在，已直接切换启用；重启后生效")
+                return component_directory(component.id, application_paths)
+        except ValueError:
+            # A stale or incompatible component is replaced only after a new
+            # installation has completed successfully below.
+            pass
     root = _runtime_root(application_paths)
     components = root / "components"
     components.mkdir(parents=True, exist_ok=True)
@@ -237,6 +311,7 @@ def install_runtime_component(
             "platform": component.platform,
             "site_packages": "site-packages",
             "packages": list(component.packages),
+            "no_deps_packages": list(component.no_deps_packages),
             "source": "pypi",
         }
         (temporary / "runtime.json").write_text(
@@ -274,6 +349,41 @@ def remove_runtime_component(component_id: str, paths: ApplicationPaths | None =
     target = component_directory(component_id, paths)
     if target.exists():
         shutil.rmtree(target)
+
+
+def cleanup_inactive_ai_components(paths: ApplicationPaths | None = None) -> tuple[str, ...]:
+    """Remove superseded AI layers after restart, when their DLLs are unused."""
+    application_paths = paths or ApplicationPaths.current()
+    components_root = _runtime_root(application_paths) / "components"
+    if not components_root.is_dir():
+        return ()
+    active_ids = set(load_active_runtimes(application_paths).values())
+    removed: list[str] = []
+    for directory in components_root.iterdir():
+        if not directory.is_dir() or directory.name in active_ids:
+            continue
+        manifest = component_manifest(directory.name, application_paths)
+        if not manifest:
+            continue
+        packages = (
+            *manifest.get("packages", ()),
+            *manifest.get("no_deps_packages", ()),
+        )
+        package_names = {str(item).split("=", 1)[0].split("<", 1)[0].casefold() for item in packages}
+        is_ai_layer = (
+            manifest.get("group") in {"ai", "qwen", "whisperx", "cuda"}
+            or bool(package_names & {"torch", "qwen-asr", "whisperx", "nvidia-cublas-cu12"})
+        )
+        if not is_ai_layer:
+            continue
+        try:
+            shutil.rmtree(directory)
+        except OSError:
+            # A previous process may still be releasing a native DLL.  Keep
+            # the complete layer and retry on the next clean startup.
+            continue
+        removed.append(directory.name)
+    return tuple(removed)
 
 
 def activate_runtime_paths(paths: ApplicationPaths | None = None) -> tuple[str, ...]:

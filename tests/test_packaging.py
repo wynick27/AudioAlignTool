@@ -25,8 +25,8 @@ class PortablePackagingTests(unittest.TestCase):
         spec_text = (ROOT / "AudioAlignTool.spec").read_text(encoding="utf-8")
         workflow_text = (ROOT / ".github" / "workflows" / "windows-portable.yml").read_text(encoding="utf-8")
 
-        self.assertIn("sys.version_info[:2] == (3, 13)", script_text)
-        self.assertIn('python-version: "3.13"', workflow_text)
+        self.assertIn("(3, 13) <= sys.version_info[:2] < (3, 15)", script_text)
+        self.assertIn('python-version: "3.14"', workflow_text)
         self.assertIn("AudioAlignTool.spec", script_text)
         self.assertIn("Compress-Archive", script_text)
         self.assertIn("COLLECT(", spec_text)
@@ -66,9 +66,9 @@ class PortablePackagingTests(unittest.TestCase):
 
         self.assertIn("[switch]$Standard", script_text)
         self.assertNotIn("IncludeQwen", script_text)
-        self.assertIn("download.pytorch.org/whl/cpu", script_text)
+        self.assertIn("ai-qwen-cpu-win-x64", script_text)
         self.assertIn("Remove-BuildPath $bundleDir", script_text)
-        self.assertIn('os.environ.get("AAT_INCLUDE_QWEN"', spec_text)
+        self.assertNotIn('AAT_INCLUDE_QWEN', spec_text)
         self.assertIn('"torch"', spec_text)
         self.assertNotIn('collect_all("onnxruntime")', spec_text)
         self.assertNotIn('collect_all("pyqtgraph")', spec_text)
@@ -77,11 +77,13 @@ class PortablePackagingTests(unittest.TestCase):
 
     def test_ci_builds_portable_and_cpu_qwen_standard_packages(self) -> None:
         workflow_text = (ROOT / ".github" / "workflows" / "windows-portable.yml").read_text(encoding="utf-8")
+        script_text = (ROOT / "build-portable.ps1").read_text(encoding="utf-8")
 
         self.assertIn("flavor: portable", workflow_text)
         self.assertIn("flavor: standard", workflow_text)
         self.assertIn('build_args: "-Standard"', workflow_text)
-        self.assertIn("download.pytorch.org/whl/cpu", workflow_text)
+        self.assertIn("ai-qwen-cpu-win-x64", script_text)
+        self.assertNotIn('python -m pip install "torch==2.11.0"', workflow_text)
         self.assertNotIn("-IncludeQwen", workflow_text)
         self.assertIn("AudioAlignTool-*-Windows-x64-*.zip", workflow_text)
         self.assertEqual(1, workflow_text.count("concurrency:"))

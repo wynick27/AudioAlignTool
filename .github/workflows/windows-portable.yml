@@ -36,10 +36,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Set up Python 3.13
+      - name: Set up Python 3.14
         uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           architecture: x64
           cache: pip
           cache-dependency-path: |
@@ -81,12 +81,6 @@ jobs:
         run: |
           $python = (Get-Command python).Source
           if ("${{ matrix.flavor }}" -eq "standard") {
-            python -m pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cpu
-            if ($LASTEXITCODE -ne 0) { throw "Failed to install CPU-only PyTorch." }
-            python -c "import torch; assert torch.version.cuda is None, torch.version.cuda"
-            if ($LASTEXITCODE -ne 0) { throw "Standard package unexpectedly contains CUDA PyTorch." }
-            python -m pip install -r requirements-qwen-lock.txt
-            if ($LASTEXITCODE -ne 0) { throw "Failed to install Qwen dependencies." }
             .\build-portable.ps1 -Python $python -Version "${{ steps.version.outputs.value }}" -SkipInstall -SkipTests -Clean -Standard
           } else {
             .\build-portable.ps1 -Python $python -Version "${{ steps.version.outputs.value }}" -SkipInstall -SkipTests -Clean
