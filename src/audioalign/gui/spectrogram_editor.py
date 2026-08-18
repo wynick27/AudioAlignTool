@@ -742,6 +742,11 @@ class AudioVisualizerEditor(QWidget):
         tolerance = max(60, int((self.view_end - self.view_start) / max(1, self.width()) * 8))
         boundaries: list[tuple[int, int, int, str, int]] = []
         for index, segment in enumerate(self.segments):
+            # Untimed/deleted source rows have no visible cue body or handles.
+            # Letting their equal start/end timestamps participate here makes
+            # an invisible zero-width row steal a neighbouring cue's boundary.
+            if segment.end_ms <= segment.start_ms:
+                continue
             start_distance = abs(segment.start_ms - milliseconds)
             if start_distance <= tolerance:
                 # At a shared boundary, a pointer on its right belongs to the
@@ -854,7 +859,7 @@ class AudioVisualizerEditor(QWidget):
 
     def _segment_at(self, milliseconds: int) -> int:
         candidates = [(s.end_ms - s.start_ms, i) for i, s in enumerate(self.segments)
-                      if s.start_ms <= milliseconds <= s.end_ms]
+                      if s.end_ms > s.start_ms and s.start_ms <= milliseconds <= s.end_ms]
         return min(candidates)[1] if candidates else -1
 
     def _click(self, seconds: float, modifiers: int) -> None:

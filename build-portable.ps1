@@ -17,6 +17,7 @@ $distRoot = Join-Path $projectRoot "dist"
 $workRoot = Join-Path $projectRoot "build"
 $artifactRoot = Join-Path $projectRoot "artifacts"
 $bundleDir = Join-Path $distRoot "AudioAlignTool"
+$runtimeWheelRoot = Join-Path $projectRoot "runtime-packages\wheels"
 
 function Assert-ChildPath {
     param([Parameter(Mandatory)][string]$Path)
@@ -103,6 +104,15 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Tests failed; packaging stopped." }
     }
 
+    # OmegaConf requires antlr4-python3-runtime 4.9.x, which PyPI publishes
+    # only as a source archive. A frozen executable cannot host pip's PEP 517
+    # build subprocess, so build this tiny pure-Python wheel here.
+    Remove-BuildPath $runtimeWheelRoot
+    New-Item -ItemType Directory -Path $runtimeWheelRoot -Force | Out-Null
+    Write-Host "Preparing the source-only runtime compatibility wheel..."
+    & $pythonPath -m pip wheel --no-deps --wheel-dir $runtimeWheelRoot antlr4-python3-runtime==4.9.3
+    if ($LASTEXITCODE -ne 0) { throw "Failed to prepare the antlr4 runtime wheel." }
+
     # COLLECT does not reliably remove unrelated files from an existing onedir
     # target.  Always recreate the bundle so a prior portable ZIP, model, log,
     # or project cannot become nested in the next release archive.
@@ -127,8 +137,13 @@ try {
     New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
     $runtimeIndex = Join-Path $bundleDir "runtime-packages\runtime-index.json"
     Copy-Item -LiteralPath $sourceRuntimeIndex -Destination $runtimeIndex -Force
+    $runtimeWheelDestination = Join-Path $runtimeDirectory "wheels"
+    Copy-Item -LiteralPath $runtimeWheelRoot -Destination $runtimeWheelDestination -Recurse -Force
     if (-not (Test-Path -LiteralPath $runtimeIndex -PathType Leaf)) {
         throw "The build finished without the local runtime index: $runtimeIndex"
+    }
+    if (-not (Get-ChildItem -LiteralPath $runtimeWheelDestination -Filter "antlr4_python3_runtime-4.9.3-*.whl" -File)) {
+        throw "The build finished without the antlr4 runtime compatibility wheel."
     }
     if ($Standard) {
         Write-Host "Installing the shared Qwen CPU runtime beside the standard package..."

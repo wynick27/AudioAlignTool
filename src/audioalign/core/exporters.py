@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import html
 import json
+import posixpath
 import re
 import shutil
 import zipfile
 from dataclasses import asdict
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from bs4 import BeautifulSoup, NavigableString
 
@@ -139,8 +141,50 @@ def _normalized_html_nodes(nodes: list[NavigableString]):
     return "".join(characters), mapping
 
 
+def _infer_html_resource_directory(document_root: Path, source_html: str) -> Path:
+    """Infer the source page directory when an imported cover/TOC lacks a locator."""
+    soup = BeautifulSoup(source_html, "html.parser")
+    references: list[str] = []
+    for tag, attribute in (
+        ("link", "href"), ("a", "href"), ("img", "src"), ("image", "href"),
+        ("source", "src"), ("audio", "src"), ("video", "src"),
+    ):
+        for element in soup.find_all(tag):
+            value = str(element.get(attribute, "")).strip()
+            parsed = urlsplit(value)
+            if value and not parsed.scheme and not value.startswith(("#", "//")):
+                references.append(unquote(parsed.path))
+    if not references:
+        return document_root
+    directories = [document_root]
+    directories.extend(path for path in document_root.rglob("*") if path.is_dir())
+    best = document_root
+    best_score = -1
+    asset_directories = {
+        "image", "images", "img", "style", "styles", "css", "font", "fonts",
+        "media", "audio", "video",
+    }
+    for directory in directories:
+        matched = sum(1 for value in references if (directory / value).resolve().is_file())
+        has_markup = any(
+            child.is_file() and child.suffix.casefold() in {".html", ".htm", ".xhtml"}
+            for child in directory.iterdir()
+        )
+        score = matched * 10 + int(has_markup) * 2
+        if directory.name.casefold() in asset_directories:
+            score -= 2
+        if score > best_score:
+            best, best_score = directory, score
+    return best
+
+
 def _annotate_html_export_page(
-    source_html: str, segments: list[TextSegment], base_href: str,
+    source_html: str,
+    segments: list[TextSegment],
+    base_href: str,
+    *,
+    current_entry_path: str = "",
+    chapter_targets: dict[str, tuple[int, str]] | None = None,
 ) -> str:
     """Preserve source markup while adding reader synchronization anchors."""
     soup = BeautifulSoup(source_html, "html.parser")
@@ -157,6 +201,25 @@ def _annotate_html_export_page(
             soup.insert(0, head)
     if base_href:
         soup.head.insert(0, soup.new_tag("base", href=base_href))
+    targets = chapter_targets or {}
+    for link in soup.find_all("a", href=True):
+        href = str(link.get("href", "")).strip()
+        parsed = urlsplit(href)
+        if not href or parsed.scheme or href.startswith("//"):
+            continue
+        target = targets.get(f"#{parsed.fragment}") if parsed.fragment else None
+        if target is None and parsed.path:
+            resolved = posixpath.normpath(posixpath.join(
+                posixpath.dirname(current_entry_path), unquote(parsed.path),
+            ))
+            target = targets.get(resolved) or targets.get("@" + posixpath.basename(resolved))
+        if target is None:
+            continue
+        target_index, target_page = target
+        link["data-aat-chapter-index"] = str(target_index)
+        link["data-aat-chapter-page"] = target_page
+        if parsed.fragment:
+            link["data-aat-fragment"] = parsed.fragment
     style = soup.new_tag("style")
     style.string = (
         "[data-aat-index]{cursor:pointer;}"
@@ -213,6 +276,15 @@ def _annotate_html_export_page(
       document.addEventListener('click',function(event){
         const selection=window.getSelection();
         if(selection && !selection.isCollapsed)return;
+        const chapterLink=event.target.closest('[data-aat-chapter-index]');
+        if(chapterLink){
+          event.preventDefault();
+          const detail={index:Number(chapterLink.dataset.aatChapterIndex),
+            page:chapterLink.dataset.aatChapterPage||'',fragment:chapterLink.dataset.aatFragment||''};
+          if(typeof window.aatOpenChapter==='function')window.aatOpenChapter(detail);
+          else parent.postMessage({type:'aat-chapter',...detail},'*');
+          return;
+        }
         const target=event.target.closest('[data-aat-index]');
         if(!target)return;
         const index=Number(target.dataset.aatIndex);
@@ -223,7 +295,10 @@ def _annotate_html_export_page(
         document.querySelectorAll('.aat-active').forEach(e=>e.classList.remove('aat-active'));
         const targets=document.querySelectorAll('[data-aat-index="'+index+'"]');
         targets.forEach(target=>target.classList.add('aat-active'));
-        if(targets.length&&follow)targets[0].scrollIntoView({block:'center',behavior:'smooth'});
+        // Keep playback readable without continually pulling the active sentence
+        // into the middle of the page.  `nearest` is a no-op while it is already
+        // visible and otherwise performs only the smallest necessary scroll.
+        if(targets.length&&follow)targets[0].scrollIntoView({block:'nearest',inline:'nearest'});
       };
       addEventListener('message',function(event){
         if(!event.data || event.data.type!=='aat-active')return;
@@ -259,20 +334,20 @@ header{height:74px;background:#fff;border-bottom:1px solid #ccc;padding:.45rem .
 #book{display:block;width:100%;height:calc(100vh - 74px);border:0;background:white}#player{width:min(430px,38vw);height:38px}select,button,label{font:inherit}select,button{padding:.3rem .5rem}.time{min-width:5.5rem;font-variant-numeric:tabular-nums;color:#666}.grow{flex:1;min-width:.5rem}
 @media(max-width:900px){header{height:118px}#book{height:calc(100vh - 118px)}#player{width:55vw}}
 @media(prefers-color-scheme:dark){body{background:#171717;color:#eee}header{background:#222;border-color:#444}.time{color:#bbb}}
-</style></head><body><header><strong>__TITLE__</strong><select id="chapters"></select><button id="previous" title="上一句">⏮</button><button id="play" title="播放/暂停">▶</button><button id="next" title="下一句">⏭</button><audio id="player" controls></audio><label>倍速 <select id="speed"><option value="0.25">0.25</option><option value="0.5">0.50</option><option value="0.75">0.75</option><option value="1" selected>1.00</option><option value="1.25">1.25</option><option value="1.5">1.50</option><option value="2">2.00</option><option value="2.5">2.50</option><option value="3">3.00</option></select>×</label><label><input id="loop" type="checkbox"> 单句循环</label><span class="time" id="clock">00:00:00</span><span class="grow"></span></header><iframe id="book" title="原书正文"></iframe>
+</style></head><body><header><strong>__TITLE__</strong><select id="chapters"></select><button id="previous" title="上一句">⏮</button><button id="play" title="播放/暂停">▶</button><button id="next" title="下一句">⏭</button><audio id="player" controls></audio><label>倍速 <select id="speed"><option value="0.25">0.25</option><option value="0.5">0.50</option><option value="0.75">0.75</option><option value="1" selected>1.00</option><option value="1.25">1.25</option><option value="1.5">1.50</option><option value="2">2.00</option><option value="2.5">2.50</option><option value="3">3.00</option></select>×</label><label><input id="loop" type="checkbox"> 单句循环</label><label><input id="follow" type="checkbox" checked> 跟随当前句</label><span class="time" id="clock">00:00:00</span><span class="grow"></span></header><iframe id="book" title="原书正文"></iframe>
 <script id="alignment" type="application/json">__DATA__</script><script>
-const data=JSON.parse(document.getElementById('alignment').textContent),select=document.getElementById('chapters'),player=document.getElementById('player'),playButton=document.getElementById('play'),book=document.getElementById('book'),clock=document.getElementById('clock'),speed=document.getElementById('speed'),loop=document.getElementById('loop');let active=-1,segments=[],links=[],linkIndex=0,lastSaved=0;const storageKey='AudioAlignTool:'+data.project_id;
+const data=JSON.parse(document.getElementById('alignment').textContent),select=document.getElementById('chapters'),player=document.getElementById('player'),playButton=document.getElementById('play'),book=document.getElementById('book'),clock=document.getElementById('clock'),speed=document.getElementById('speed'),loop=document.getElementById('loop'),follow=document.getElementById('follow');let active=-1,segments=[],links=[],linkIndex=0,lastSaved=0;const storageKey='AudioAlignTool:'+data.project_id;
 data.chapters.forEach((c,i)=>{const o=document.createElement('option');o.value=i;o.textContent=c.title;select.appendChild(o)});
 function localStart(i){return links.slice(0,i).reduce((n,x)=>n+x.source_end_ms-x.source_start_ms,0)}
 function currentMs(){const x=links[linkIndex];return x?Math.max(0,localStart(linkIndex)+player.currentTime*1000-x.source_start_ms):0}
-function save(force=false){const now=Date.now();if(!force&&now-lastSaved<500)return;lastSaved=now;try{localStorage.setItem(storageKey,JSON.stringify({chapter:+select.value,position_ms:Math.round(currentMs()),rate:player.playbackRate,loop:loop.checked}))}catch(_){}}
+function save(force=false){const now=Date.now();if(!force&&now-lastSaved<500)return;lastSaved=now;try{localStorage.setItem(storageKey,JSON.stringify({chapter:+select.value,position_ms:Math.round(currentMs()),rate:player.playbackRate,loop:loop.checked,follow:follow.checked}))}catch(_){}}
 function syncPlayButton(){const playing=!player.paused&&!player.ended;playButton.textContent=playing?'⏸':'▶';playButton.title=playing?'暂停':'播放';playButton.setAttribute('aria-label',playButton.title)}
-function postActive(follow=true){if(active>=0&&book.contentWindow)book.contentWindow.postMessage({type:'aat-active',index:active,follow},'*')}
+function postActive(ensureVisible=true){if(active>=0&&book.contentWindow)book.contentWindow.postMessage({type:'aat-active',index:active,follow:ensureVisible&&follow.checked},'*')}
 function playAt(ms,autoplay=true){if(!links.length)return;let i=links.findIndex((x,n)=>ms<localStart(n)+x.source_end_ms-x.source_start_ms);if(i<0)i=links.length-1;const x=links[i],position=Math.max(x.source_start_ms,(x.source_start_ms+ms-localStart(i)))/1000,src=x.export_path||x.path;const apply=()=>{player.currentTime=position;player.playbackRate=Number(speed.value);if(autoplay)player.play().catch(()=>{});tick()};if(i!==linkIndex||player.getAttribute('src')!==src){linkIndex=i;player.src=src;player.onloadedmetadata=apply}else apply()}
-function load(i,position=0){const c=data.chapters[i];select.value=i;segments=c.segments;links=c.audio_links||(c.audio?[c.audio]:[]);linkIndex=0;active=-1;book.src=c.page_path;player.src=links[0]?(links[0].export_path||links[0].path):'';player.onloadedmetadata=()=>playAt(position,false);if(!links.length)save(true)}
+function load(i,position=0,fragment=''){const c=data.chapters[i];select.value=i;segments=c.segments;links=c.audio_links||(c.audio?[c.audio]:[]);linkIndex=0;active=-1;book.src=c.page_path+(fragment?'#'+encodeURIComponent(fragment):'');player.src=links[0]?(links[0].export_path||links[0].path):'';player.onloadedmetadata=()=>playAt(position,false);if(!links.length)save(true)}
 function activate(i,autoplay=true){if(!segments[i])return;active=i;postActive(true);playAt(segments[i].start_ms,autoplay)}
 function tick(){const x=links[linkIndex],ms=currentMs();clock.textContent=new Date(Math.max(0,ms)).toISOString().slice(11,19);if(loop.checked&&active>=0&&segments[active]&&ms>=segments[active].end_ms-25){playAt(segments[active].start_ms,true);return}if(x&&player.currentTime*1000>=x.source_end_ms){if(linkIndex+1<links.length)playAt(localStart(linkIndex+1),!player.paused);else player.pause()}const i=segments.findIndex(s=>s.end_ms>s.start_ms&&ms>=s.start_ms&&ms<s.end_ms);if(i!==active){active=i;postActive(true)}save()}
-addEventListener('message',e=>{if(e.data&&e.data.type==='aat-segment')activate(Number(e.data.index),true)});book.addEventListener('load',()=>postActive(false));select.onchange=()=>load(+select.value,0);speed.onchange=()=>{player.playbackRate=Number(speed.value);save(true)};loop.onchange=()=>save(true);player.ontimeupdate=tick;player.onplay=syncPlayButton;player.onpause=()=>{syncPlayButton();save(true)};player.onended=syncPlayButton;player.onemptied=syncPlayButton;playButton.onclick=()=>player.paused?player.play():player.pause();document.getElementById('previous').onclick=()=>activate(Math.max(0,(active<0?0:active)-1),true);document.getElementById('next').onclick=()=>activate(Math.min(segments.length-1,(active<0?-1:active)+1),true);addEventListener('beforeunload',()=>save(true));let saved={};try{saved=JSON.parse(localStorage.getItem(storageKey)||'{}')}catch(_){};speed.value=String(saved.rate||1);if(!speed.value)speed.value='1';player.playbackRate=Number(speed.value);loop.checked=!!saved.loop;syncPlayButton();load(Math.max(0,Math.min(data.chapters.length-1,Number(saved.chapter)||0)),Math.max(0,Number(saved.position_ms)||0));
+addEventListener('message',e=>{if(!e.data)return;if(e.data.type==='aat-segment')activate(Number(e.data.index),true);else if(e.data.type==='aat-chapter')load(Number(e.data.index),0,String(e.data.fragment||''))});book.addEventListener('load',()=>postActive(false));select.onchange=()=>load(+select.value,0);speed.onchange=()=>{player.playbackRate=Number(speed.value);save(true)};loop.onchange=()=>save(true);follow.onchange=()=>save(true);player.ontimeupdate=tick;player.onplay=syncPlayButton;player.onpause=()=>{syncPlayButton();save(true)};player.onended=syncPlayButton;player.onemptied=syncPlayButton;playButton.onclick=()=>player.paused?player.play():player.pause();document.getElementById('previous').onclick=()=>activate(Math.max(0,(active<0?0:active)-1),true);document.getElementById('next').onclick=()=>activate(Math.min(segments.length-1,(active<0?-1:active)+1),true);addEventListener('beforeunload',()=>save(true));let saved={};try{saved=JSON.parse(localStorage.getItem(storageKey)||'{}')}catch(_){};speed.value=String(saved.rate||1);if(!speed.value)speed.value='1';player.playbackRate=Number(speed.value);loop.checked=!!saved.loop;follow.checked=saved.follow!==false;syncPlayButton();load(Math.max(0,Math.min(data.chapters.length-1,Number(saved.chapter)||0)),Math.max(0,Number(saved.position_ms)||0));
 </script></body></html>"""
 
 
@@ -280,13 +355,13 @@ _STANDALONE_READER_SCRIPT = r"""
 const data=JSON.parse(document.getElementById('aat-chapter-data').textContent),
 player=document.getElementById('aat-player'),playButton=document.getElementById('aat-play'),
 clock=document.getElementById('aat-clock'),speed=document.getElementById('aat-speed'),
-loop=document.getElementById('aat-loop');
+loop=document.getElementById('aat-loop'),follow=document.getElementById('aat-follow');
 const segments=data.segments||[],links=data.audio_links||[];
 let active=-1,linkIndex=0,lastSaved=0;
 const storageKey='AudioAlignTool:chapter:'+data.project_id+':'+data.chapter_id;
 function localStart(i){return links.slice(0,i).reduce((n,x)=>n+x.source_end_ms-x.source_start_ms,0)}
 function currentMs(){const x=links[linkIndex];return x?Math.max(0,localStart(linkIndex)+player.currentTime*1000-x.source_start_ms):0}
-function save(force=false){const now=Date.now();if(!force&&now-lastSaved<500)return;lastSaved=now;try{localStorage.setItem(storageKey,JSON.stringify({position_ms:Math.round(currentMs()),rate:player.playbackRate,loop:loop.checked}))}catch(_){}}
+function save(force=false){const now=Date.now();if(!force&&now-lastSaved<500)return;lastSaved=now;try{localStorage.setItem(storageKey,JSON.stringify({position_ms:Math.round(currentMs()),rate:player.playbackRate,loop:loop.checked,follow:follow.checked}))}catch(_){}}
 function syncPlayButton(){const playing=!player.paused&&!player.ended;playButton.textContent=playing?'⏸':'▶';playButton.title=playing?'暂停':'播放';playButton.setAttribute('aria-label',playButton.title)}
 function playAt(ms,autoplay=true){
   if(!links.length)return;
@@ -296,25 +371,30 @@ function playAt(ms,autoplay=true){
   const apply=()=>{player.currentTime=position;player.playbackRate=Number(speed.value);if(autoplay)player.play().catch(()=>{});tick()};
   if(i!==linkIndex||player.getAttribute('src')!==src){linkIndex=i;player.src=src;player.onloadedmetadata=apply}else apply();
 }
-function activate(i,autoplay=true){if(!segments[i])return;active=i;window.aatSetActive(i,true);playAt(segments[i].start_ms,autoplay)}
+function activate(i,autoplay=true){if(!segments[i])return;active=i;window.aatSetActive(i,follow.checked);playAt(segments[i].start_ms,autoplay)}
 window.aatActivateSegment=i=>activate(Number(i),true);
+window.aatOpenChapter=detail=>{
+  const target=new URL(detail.page,window.location.href);
+  if(detail.fragment)target.hash=detail.fragment;
+  window.location.href=target.href;
+};
 function tick(){
   const x=links[linkIndex],ms=currentMs();clock.textContent=new Date(Math.max(0,ms)).toISOString().slice(11,19);
   if(loop.checked&&active>=0&&segments[active]&&ms>=segments[active].end_ms-25){playAt(segments[active].start_ms,true);return}
   if(x&&player.currentTime*1000>=x.source_end_ms){if(linkIndex+1<links.length)playAt(localStart(linkIndex+1),!player.paused);else player.pause()}
   const i=segments.findIndex(s=>s.end_ms>s.start_ms&&ms>=s.start_ms&&ms<s.end_ms);
-  if(i!==active){active=i;window.aatSetActive(i,true)}
+  if(i!==active){active=i;window.aatSetActive(i,follow.checked)}
   save();
 }
 speed.onchange=()=>{player.playbackRate=Number(speed.value);save(true)};
-loop.onchange=()=>save(true);player.ontimeupdate=tick;player.onplay=syncPlayButton;
+loop.onchange=()=>save(true);follow.onchange=()=>save(true);player.ontimeupdate=tick;player.onplay=syncPlayButton;
 player.onpause=()=>{syncPlayButton();save(true)};player.onended=syncPlayButton;player.onemptied=syncPlayButton;
 playButton.onclick=()=>player.paused?player.play():player.pause();
 document.getElementById('aat-previous').onclick=()=>activate(Math.max(0,(active<0?0:active)-1),true);
 document.getElementById('aat-next').onclick=()=>activate(Math.min(segments.length-1,(active<0?-1:active)+1),true);
 addEventListener('beforeunload',()=>save(true));
 let saved={};try{saved=JSON.parse(localStorage.getItem(storageKey)||'{}')}catch(_){}
-speed.value=String(saved.rate||1);if(!speed.value)speed.value='1';player.playbackRate=Number(speed.value);loop.checked=!!saved.loop;syncPlayButton();
+speed.value=String(saved.rate||1);if(!speed.value)speed.value='1';player.playbackRate=Number(speed.value);loop.checked=!!saved.loop;follow.checked=saved.follow!==false;syncPlayButton();
 if(links.length){player.src=links[0].export_path||links[0].path;player.onloadedmetadata=()=>playAt(Math.max(0,Number(saved.position_ms)||0),false)}
 """
 
@@ -325,9 +405,16 @@ def _standalone_chapter_page(
     chapter_data: dict,
     project_id: str,
     base_href: str,
+    current_entry_path: str = "",
+    chapter_targets: dict[str, tuple[int, str]] | None = None,
 ) -> str:
     soup = BeautifulSoup(
-        _annotate_html_export_page(source_html, segments, base_href), "html.parser",
+        _annotate_html_export_page(
+            source_html, segments, base_href,
+            current_entry_path=current_entry_path,
+            chapter_targets=chapter_targets,
+        ),
+        "html.parser",
     )
     if soup.body is None:
         body = soup.new_tag("body")
@@ -355,6 +442,7 @@ def _standalone_chapter_page(
         '<option value="2">2.00</option><option value="2.5">2.50</option>'
         '<option value="3">3.00</option></select>×</label>'
         '<label><input id="aat-loop" type="checkbox"> 单句循环</label>'
+        '<label><input id="aat-follow" type="checkbox" checked> 跟随当前句</label>'
         '<span id="aat-clock">00:00:00</span></div>',
         "html.parser",
     ).div
@@ -428,15 +516,54 @@ def export_html(
         return destination
 
     source_chapters = session.repository.chapters()
-    for chapter, chapter_data in zip(source_chapters, data["chapters"]):
+    page_names = [
+        (
+            f"{chapter.position + 1:03d}-{_safe_name(chapter.title, 'chapter')}.html"
+            if standalone_chapters else f"chapter-{chapter.position + 1:03d}.html"
+        )
+        for chapter in source_chapters
+    ]
+    target_candidates: dict[str, set[tuple[int, str]]] = {}
+
+    def add_target(key: str, target: tuple[int, str]) -> None:
+        if key:
+            target_candidates.setdefault(key, set()).add(target)
+
+    fallback_document = None
+    for index, chapter in enumerate(source_chapters):
+        chapter_id = chapter.id or 0
+        navigation_target = (index, page_names[index])
+        parts = session.repository.chapter_source_parts(chapter_id)
+        source_info = parts[0] if parts else session.repository.chapter_source_document(chapter_id)
+        if source_info and fallback_document is None:
+            fallback_document = source_info[0]
+        for _document, entry_path, _selector in (
+            parts or ([source_info] if source_info else [])
+        ):
+            normalized = posixpath.normpath(entry_path)
+            add_target(normalized, navigation_target)
+            add_target("@" + posixpath.basename(normalized), navigation_target)
+        chapter_soup = BeautifulSoup(chapter.source_html or "", "html.parser")
+        for element in chapter_soup.find_all(attrs={"id": True}):
+            add_target("#" + str(element.get("id")), navigation_target)
+        for element in chapter_soup.find_all("a", attrs={"name": True}):
+            add_target("#" + str(element.get("name")), navigation_target)
+    chapter_targets = {
+        key: next(iter(candidates))
+        for key, candidates in target_candidates.items() if len(candidates) == 1
+    }
+
+    for index, (chapter, chapter_data) in enumerate(zip(source_chapters, data["chapters"])):
         chapter_id = chapter.id or 0
         segments = session.repository.segments(chapter_id)
         source_html = chapter.source_html
         source_parts = session.repository.chapter_source_parts(chapter_id)
         source_info = source_parts[0] if source_parts else session.repository.chapter_source_document(chapter_id)
         base_href = ""
+        current_entry_path = ""
         if source_info:
             document, entry_path, _selector = source_info
+            current_entry_path = entry_path
             document_root = prepare_document(document)
             entry = document_root / entry_path
             if len(source_parts) <= 1 and entry.is_file():
@@ -444,6 +571,15 @@ def export_html(
             relative_base = (
                 Path("book") if standalone_chapters else Path("..") / "book"
             ) / document_root.name / Path(entry_path).parent
+            base_href = relative_base.as_posix().rstrip("/") + "/"
+        elif fallback_document is not None:
+            document_root = prepare_document(fallback_document)
+            inferred_directory = _infer_html_resource_directory(document_root, source_html)
+            inferred_relative = inferred_directory.relative_to(document_root)
+            current_entry_path = (inferred_relative / "__inferred__.html").as_posix()
+            relative_base = (
+                Path("book") if standalone_chapters else Path("..") / "book"
+            ) / document_root.name / inferred_relative
             base_href = relative_base.as_posix().rstrip("/") + "/"
         if not source_html:
             body = "".join(
@@ -456,18 +592,20 @@ def export_html(
                 "</style></head><body>" + body + "</body></html>"
             )
         if standalone_chapters:
-            page_name = (
-                f"{chapter.position + 1:03d}-"
-                f"{_safe_name(chapter.title, 'chapter')}.html"
-            )
+            page_name = page_names[index]
             page = _standalone_chapter_page(
                 source_html, segments, chapter_data,
                 session.manifest.project_id, base_href,
+                current_entry_path, chapter_targets,
             )
             (target / page_name).write_text(page, encoding="utf-8")
         else:
-            page_name = f"chapter-{chapter.position + 1:03d}.html"
-            page = _annotate_html_export_page(source_html, segments, base_href)
+            page_name = page_names[index]
+            page = _annotate_html_export_page(
+                source_html, segments, base_href,
+                current_entry_path=current_entry_path,
+                chapter_targets=chapter_targets,
+            )
             (pages_dir / page_name).write_text(page, encoding="utf-8")
             chapter_data["page_path"] = f"pages/{page_name}"
 

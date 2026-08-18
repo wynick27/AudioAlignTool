@@ -28,6 +28,7 @@ class RuntimeComponent:
     display_name: str
     packages: tuple[str, ...]
     no_deps_packages: tuple[str, ...] = ()
+    source_packages: tuple[str, ...] = ()
     index_url: str = "https://pypi.org/simple"
     extra_index_urls: tuple[str, ...] = ()
     size: int = 0
@@ -45,6 +46,9 @@ class RuntimeComponent:
             packages=tuple(str(item) for item in payload.get("packages", ())),
             no_deps_packages=tuple(
                 str(item) for item in payload.get("no_deps_packages", ())
+            ),
+            source_packages=tuple(
+                str(item) for item in payload.get("source_packages", ())
             ),
             index_url=str(payload.get("index_url", "https://pypi.org/simple")),
             extra_index_urls=tuple(
@@ -185,6 +189,7 @@ def _install_pypi_packages(
     component: RuntimeComponent,
     target: Path,
     progress: ProgressCallback | None,
+    log_path: Path | None = None,
 ) -> None:
     def run(packages: tuple[str, ...], *, no_deps: bool, start: float, end: float) -> None:
         if not packages:
@@ -194,6 +199,25 @@ def _install_pypi_packages(
             "--only-binary=:all:", "--progress-bar", "raw", "--target", str(target),
             "--index-url", component.index_url,
         ]
+        bundled_wheels = (
+            ApplicationPaths.current().runtime_packages / "wheels"
+            if getattr(sys, "frozen", False)
+            else Path(__file__).resolve().parents[3] / "runtime-packages" / "wheels"
+        )
+        if bundled_wheels.is_dir():
+            # PyInstaller executables cannot act as the Python interpreter for
+            # a PEP 517 source build subprocess.  A tiny, build-time-generated
+            # wheel for source-only pure-Python dependencies avoids that path.
+            command.extend(("--find-links", str(bundled_wheels)))
+        elif getattr(sys, "frozen", False) and component.source_packages:
+            raise RuntimeError(
+                "安装包缺少源码依赖的兼容 wheel，请下载包含 runtime-packages/wheels 的新版程序"
+            )
+        else:
+            for package_name in component.source_packages:
+                # A normal Python interpreter can build explicitly reviewed
+                # pure-Python source packages during development.
+                command.append(f"--no-binary={package_name}")
         for index_url in component.extra_index_urls:
             command.extend(("--extra-index-url", index_url))
         if no_deps:
@@ -222,48 +246,63 @@ def _install_pypi_packages(
         displayed_progress = start
         download_index = -1
         previous_download: tuple[int, int] | None = None
+        log_file = None
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = log_path.open("a", encoding="utf-8")
+            log_file.write(f"\n[{component.id}] {'no-deps' if no_deps else 'dependencies'}\n")
         if process.stdout is not None:
-            for raw_line in process.stdout:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                recent.append(line)
-                del recent[:-12]
-                if progress:
-                    matched = _PIP_RAW_PROGRESS.match(line)
-                    if matched:
-                        current, total = (int(value) for value in matched.groups())
-                        if (
-                            previous_download is None
-                            or current < previous_download[0]
-                            or (current == 0 and total != previous_download[1])
-                        ):
-                            download_index += 1
-                        previous_download = (current, total)
-                        file_fraction = current / total if total > 0 else 0.0
-                        local_base = 0.85 * (1.0 - 0.5 ** max(0, download_index))
-                        local_span = 0.85 * 0.5 ** (max(0, download_index) + 1)
-                        local_progress = min(0.85, local_base + local_span * file_fraction)
-                        displayed_progress = max(
-                            displayed_progress,
-                            start + (end - start) * local_progress,
-                        )
-                        if total > 0:
-                            progress(
+            try:
+                for raw_line in process.stdout:
+                    if log_file is not None:
+                        log_file.write(raw_line)
+                        log_file.flush()
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    recent.append(line)
+                    del recent[:-12]
+                    if progress:
+                        matched = _PIP_RAW_PROGRESS.match(line)
+                        if matched:
+                            current, total = (int(value) for value in matched.groups())
+                            if (
+                                previous_download is None
+                                or current < previous_download[0]
+                                or (current == 0 and total != previous_download[1])
+                            ):
+                                download_index += 1
+                            previous_download = (current, total)
+                            file_fraction = current / total if total > 0 else 0.0
+                            local_base = 0.85 * (1.0 - 0.5 ** max(0, download_index))
+                            local_span = 0.85 * 0.5 ** (max(0, download_index) + 1)
+                            local_progress = min(0.85, local_base + local_span * file_fraction)
+                            displayed_progress = max(
                                 displayed_progress,
-                                f"正在下载运行时文件 {current / 1024**2:.1f}/{total / 1024**2:.1f} MB",
+                                start + (end - start) * local_progress,
                             )
-                    else:
-                        folded = line.casefold()
-                        if "installing collected packages" in folded:
-                            displayed_progress = max(displayed_progress, start + (end - start) * 0.90)
-                        elif "successfully installed" in folded:
-                            displayed_progress = max(displayed_progress, end)
-                        progress(displayed_progress, line)
+                            if total > 0:
+                                progress(
+                                    displayed_progress,
+                                    f"正在下载运行时文件 {current / 1024**2:.1f}/{total / 1024**2:.1f} MB",
+                                )
+                        else:
+                            folded = line.casefold()
+                            if "installing collected packages" in folded:
+                                displayed_progress = max(displayed_progress, start + (end - start) * 0.90)
+                            elif "successfully installed" in folded:
+                                displayed_progress = max(displayed_progress, end)
+                            progress(displayed_progress, line)
+            finally:
+                if log_file is not None:
+                    log_file.close()
         return_code = process.wait()
         if return_code:
             detail = "\n".join(recent[-8:])
-            raise RuntimeError(f"pip 安装失败（退出码 {return_code}）\n{detail}")
+            log_hint = f"\n完整日志：{log_path}" if log_path is not None else ""
+            raise RuntimeError(
+                f"pip 安装失败（退出码 {return_code}）\n{detail}{log_hint}"
+            )
 
     regular_end = 0.94 if component.no_deps_packages else 0.99
     run(component.packages, no_deps=False, start=0.01, end=regular_end)
@@ -299,7 +338,8 @@ def install_runtime_component(
     try:
         site_packages = temporary / "site-packages"
         site_packages.mkdir(parents=True, exist_ok=True)
-        _install_pypi_packages(component, site_packages, progress)
+        install_log = application_paths.logs / "runtime-install.log"
+        _install_pypi_packages(component, site_packages, progress, install_log)
         manifest = {
             "schema_version": RUNTIME_SCHEMA_VERSION,
             "id": component.id,
@@ -312,6 +352,7 @@ def install_runtime_component(
             "site_packages": "site-packages",
             "packages": list(component.packages),
             "no_deps_packages": list(component.no_deps_packages),
+            "source_packages": list(component.source_packages),
             "source": "pypi",
         }
         (temporary / "runtime.json").write_text(

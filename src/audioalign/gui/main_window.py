@@ -729,6 +729,9 @@ class MainWindow(QMainWindow):
         self.split_punctuation_action = command(
             "split_punctuation", "按标点拆成多句", self.split_segment_by_punctuation
         )
+        self.fill_unmatched_gap_action = command(
+            "fill_unmatched_gap", "用前后空隙填补未绑定句", self.fill_unmatched_gap
+        )
         self.restore_source_action = command(
             "restore_source", "恢复原始段落", self.restore_source_fragment
         )
@@ -848,6 +851,8 @@ class MainWindow(QMainWindow):
         edit_menu.addActions([self.undo_action, self.redo_action])
         edit_menu.addSeparator()
         edit_menu.addActions([self.find_action, self.find_next_action, self.find_previous_action])
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.fill_unmatched_gap_action)
         edit_menu.addSeparator()
         edit_menu.addAction(self.mapping_action)
         recognize_menu = self.menuBar().addMenu("识别")
@@ -1446,6 +1451,13 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             add_action("清除所选句时间对应", self.clear_timing)
             add_action(
+                "用前后已绑定句之间的空隙填补所选未绑定句",
+                self.fill_unmatched_gap,
+                consecutive and unlocked and all(
+                    not self._has_timing(self.segment_model.segments[row]) for row in rows
+                ),
+            )
+            add_action(
                 f"合并所选 {count} 句",
                 self.merge_selected_segments,
                 consecutive and unlocked,
@@ -1471,6 +1483,13 @@ class MainWindow(QMainWindow):
             add_action("与后一句合并", lambda: self.merge_segment(1), has_row)
             menu.addSeparator()
             add_action("清除时间对应", self.clear_timing, has_row)
+            add_action(
+                "用前后已绑定句之间的空隙填补当前未绑定句",
+                self.fill_unmatched_gap,
+                has_row and unlocked and not self._has_timing(
+                    self.segment_model.segments[rows[0]] if rows else None
+                ),
+            )
             add_action("锁定/解锁", self.toggle_lock, has_row)
             add_action("恢复原始段落", self.restore_source_fragment, has_row)
             add_action("删除句段", self.delete_segments, has_row)
@@ -4212,6 +4231,73 @@ class MainWindow(QMainWindow):
             cursor = end
         self._persist_current_segments(rows)
 
+    def fill_unmatched_gap(self) -> None:
+        """Bind one contiguous untimed run to the gap between timed neighbours."""
+        if not self.session or self.current_chapter_id is None:
+            return
+        rows = self._selected_rows()
+        if not rows:
+            self.status_stage.setText("请先选择一个未绑定句")
+            return
+        segments = self.segment_model.segments
+        if rows != list(range(rows[0], rows[-1] + 1)):
+            self.status_stage.setText("只能填补连续的未绑定句")
+            return
+        if any(self._has_timing(segments[row]) for row in rows):
+            self.status_stage.setText("所选范围包含已有时间的句段")
+            return
+
+        # Include the whole zero-time run. Filling only one row from the middle
+        # would consume the complete gap and leave its untimed siblings with no
+        # usable interval on a later invocation.
+        first, last = rows[0], rows[-1]
+        while first > 0 and not self._has_timing(segments[first - 1]):
+            first -= 1
+        while last + 1 < len(segments) and not self._has_timing(segments[last + 1]):
+            last += 1
+        run_rows = list(range(first, last + 1))
+        if any(segments[row].locked for row in run_rows):
+            self.status_stage.setText("连续未绑定句中包含锁定句，请先解锁")
+            return
+        previous = segments[first - 1] if first > 0 else None
+        following = segments[last + 1] if last + 1 < len(segments) else None
+        if not self._has_timing(previous) or not self._has_timing(following):
+            self.status_stage.setText("填补空隙需要前后各有一个已绑定句")
+            return
+        gap_start, gap_end = previous.end_ms, following.start_ms
+        if gap_end <= gap_start:
+            self.status_stage.setText("前后句之间没有可用空隙，或时间已经重叠")
+            return
+
+        language = self.session.manifest.language
+        weights = [spoken_unit_count(segments[row].text, language) for row in run_rows]
+        total_weight = max(1, sum(weights))
+        duration = gap_end - gap_start
+        if duration < len(run_rows):
+            self.status_stage.setText("前后句之间的空隙太短，无法分配给全部未绑定句")
+            return
+        cursor = gap_start
+        cumulative_weight = 0
+        self._push_history()
+        for index, (row, weight) in enumerate(zip(run_rows, weights)):
+            cumulative_weight += weight
+            target_end = (
+                gap_end if index == len(run_rows) - 1
+                else gap_start + round(duration * cumulative_weight / total_weight)
+            )
+            remaining = len(run_rows) - index - 1
+            end = max(cursor + 1, min(gap_end - remaining, target_end))
+            segment = segments[row]
+            segment.start_ms = cursor
+            segment.end_ms = end
+            segment.status = SegmentStatus.MANUAL
+            cursor = segment.end_ms
+        self._persist_current_segments(run_rows)
+        self._select_segment_rows(run_rows, current_row=rows[0])
+        self.status_stage.setText(
+            f"已用 {_time(gap_start)}–{_time(gap_end)} 的空隙填补 {len(run_rows)} 个未绑定句"
+        )
+
     def new_segment_from_selection(self) -> None:
         if self.current_chapter_id is None or not self.spectrogram.selection:
             return
@@ -4292,9 +4378,56 @@ class MainWindow(QMainWindow):
         actual = segment.start_ms if kind == "start" else segment.end_ms
         self.status_stage.setText(f"已将{target}设为 {_time(actual)}")
 
+    def _split_time_anchor_context(
+        self, source: TextSegment, row: int,
+    ) -> tuple[list[TextAudioAnchor], int, int]:
+        """Build anchors in coordinates that still match the current cue text."""
+        if not self.session or self.current_chapter_id is None:
+            return [], 0, max(1, len(source.text))
+
+        # Structural text edits can shift every later chapter-global character
+        # offset while the original ASR words remain valid. Re-match just this
+        # cue against the cached ASR tokens in its current time interval, which
+        # yields stable cue-local offsets without running inference again.
+        tokens = [
+            token for token in self.session.repository.asr_tokens(self.current_chapter_id)
+            if token.end_ms > token.start_ms
+            and source.start_ms <= (token.start_ms + token.end_ms) / 2 <= source.end_ms
+        ]
+        if tokens:
+            local = [
+                anchor for anchor in anchors_from_segments_tokens(
+                    [source], tokens, language=self.session.manifest.language,
+                )
+                if anchor.end_ms > anchor.start_ms
+            ]
+            if local:
+                return local, 0, max(1, len(source.text))
+
+        chapter_start = sum(
+            len(segment.text) for segment in self.segment_model.segments[:row]
+        )
+        chapter_end = chapter_start + max(1, len(source.text))
+        anchors = [
+            anchor for anchor in self.session.repository.anchors(self.current_chapter_id)
+            if anchor.source_end_char >= chapter_start
+            and anchor.source_start_char <= chapter_end
+            and anchor.end_ms > anchor.start_ms
+            and (
+                "asr" in anchor.method.casefold()
+                or "align" in anchor.method.casefold()
+                or "whisper" in anchor.method.casefold()
+            )
+            and chapter_start
+            <= (anchor.source_start_char + anchor.source_end_char) / 2
+            <= chapter_end
+        ]
+        return anchors, chapter_start, chapter_end
+
     def _time_for_text_offset(
         self, source: TextSegment, text: str, text_offset: int, fallback_ms: int,
         *, row: int | None = None,
+        anchor_context: tuple[list[TextAudioAnchor], int, int] | None = None,
     ) -> int:
         """Map a textual split boundary through ASR/forced-aligner anchors."""
         if source.end_ms - source.start_ms < 2:
@@ -4308,39 +4441,13 @@ class MainWindow(QMainWindow):
                 ), -1)
             if not 0 <= row < len(self.segment_model.segments):
                 return max(source.start_ms + 1, min(source.end_ms - 1, int(result)))
-            # TextAudioAnchor offsets are chapter-concatenated coordinates.
-            # TextSegment.source_* offsets belong to an EPUB/HTML source
-            # fragment and often restart at zero for every paragraph.  Mixing
-            # those coordinate systems selected anchors from unrelated cues and
-            # pushed cursor splits to one end of the timing range.
-            chapter_source_start = sum(
-                len(segment.text) for segment in self.segment_model.segments[:row]
+            anchors, coordinate_start, coordinate_end = (
+                anchor_context or self._split_time_anchor_context(source, row)
             )
-            chapter_source_span = max(1, len(source.text))
-            chapter_source_end = chapter_source_start + chapter_source_span
-            mapped_character = chapter_source_start + round(
-                chapter_source_span * text_offset / max(1, len(text))
+            coordinate_span = max(1, coordinate_end - coordinate_start)
+            mapped_character = coordinate_start + round(
+                coordinate_span * text_offset / max(1, len(text))
             )
-            anchors = [
-                anchor for anchor in self.session.repository.anchors(self.current_chapter_id)
-                if anchor.source_end_char >= chapter_source_start
-                and anchor.source_start_char <= chapter_source_end
-                and anchor.end_ms > anchor.start_ms
-                and (
-                    "asr" in anchor.method.casefold()
-                    or "align" in anchor.method.casefold()
-                    or "whisper" in anchor.method.casefold()
-                )
-            ]
-            # Inclusive range queries can pick up the first word of the next
-            # cue. Keep anchors whose character centre actually belongs to the
-            # source segment.
-            anchors = [
-                anchor for anchor in anchors
-                if chapter_source_start
-                <= (anchor.source_start_char + anchor.source_end_char) / 2
-                <= chapter_source_end
-            ]
             containing = [
                 anchor for anchor in anchors
                 if anchor.source_start_char <= mapped_character <= anchor.source_end_char
@@ -4481,6 +4588,7 @@ class MainWindow(QMainWindow):
             )
             split_time = self._time_for_text_offset(
                 source, text, text_offset, fallback_time, row=row,
+                anchor_context=self._split_time_anchor_context(source, row),
             )
 
         source_start = source.source_start_char
@@ -4544,6 +4652,9 @@ class MainWindow(QMainWindow):
         duration = max(0, source.end_ms - source.start_ms)
         has_timing = duration >= len(pieces)
         replacement: list[TextSegment] = []
+        anchor_context = (
+            self._split_time_anchor_context(source, row) if has_timing else None
+        )
         previous_end = source.start_ms if has_timing else 0
         minimum_piece_ms = (
             max(1, min(200, duration // max(1, len(pieces) * 4)))
@@ -4561,6 +4672,7 @@ class MainWindow(QMainWindow):
                 )
                 piece_end = self._time_for_text_offset(
                     source, live_text, end, fallback_end, row=row,
+                    anchor_context=anchor_context,
                 )
                 latest = source.end_ms - (len(pieces) - index - 1) * minimum_piece_ms
                 piece_end = min(latest, max(piece_start + minimum_piece_ms, piece_end))
@@ -4700,10 +4812,13 @@ class MainWindow(QMainWindow):
             return
         self._push_history()
         same_source = left.source_fragment_id is not None and left.source_fragment_id == right.source_fragment_id
+        timed = [segment for segment in (left, right) if self._has_timing(segment)]
+        start_ms = min((segment.start_ms for segment in timed), default=0)
+        end_ms = max((segment.end_ms for segment in timed), default=0)
         merged = TextSegment(
             None, self.current_chapter_id, 0, join_segment_text(left.text, right.text),
-            min(left.start_ms, right.start_ms), max(left.end_ms, right.end_ms),
-            min(left.confidence, right.confidence), SegmentStatus.MANUAL,
+            start_ms, end_ms, min(left.confidence, right.confidence),
+            SegmentStatus.MANUAL if timed else SegmentStatus.UNMATCHED,
             origin=left.origin if same_source else SegmentOrigin.USER,
             source_fragment_id=left.source_fragment_id if same_source else None,
             source_start_char=left.source_start_char if same_source else None,

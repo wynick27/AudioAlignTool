@@ -150,6 +150,78 @@ class RuntimeAddonTests(unittest.TestCase):
         self.assertIn("--ignore-requires-python", commands[1])
         self.assertIn("overridden-package==1.0", commands[1])
 
+    def test_explicit_pure_python_source_package_is_allowed(self) -> None:
+        component = RuntimeComponent(
+            id="test-win-x64",
+            group="test",
+            variant="cpu",
+            display_name="Test",
+            packages=("omegaconf==2.3.0",),
+            source_packages=("antlr4-python3-runtime",),
+        )
+        captured: list[str] = []
+
+        class FakeProcess:
+            stdout = []
+
+            @staticmethod
+            def wait() -> int:
+                return 0
+
+        def fake_popen(command, **_kwargs):
+            captured.extend(command)
+            return FakeProcess()
+
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("audioalign.core.runtime_addons.subprocess.Popen", fake_popen):
+                _install_pypi_packages(component, Path(folder), None)
+
+        self.assertIn("--only-binary=:all:", captured)
+        # Development can build the reviewed source package when the build
+        # wheel has not been staged yet; after a local package build it should
+        # reuse that wheel instead.
+        self.assertTrue(
+            "--no-binary=antlr4-python3-runtime" in captured
+            or "--find-links" in captured
+        )
+
+    def test_frozen_installer_uses_bundled_compatibility_wheel(self) -> None:
+        component = RuntimeComponent(
+            id="test-win-x64",
+            group="test",
+            variant="cpu",
+            display_name="Test",
+            packages=("omegaconf==2.3.0",),
+            source_packages=("antlr4-python3-runtime",),
+        )
+        captured: list[str] = []
+
+        class FakeProcess:
+            stdout = []
+
+            @staticmethod
+            def wait() -> int:
+                return 0
+
+        def fake_popen(command, **_kwargs):
+            captured.extend(command)
+            return FakeProcess()
+
+        with tempfile.TemporaryDirectory() as folder:
+            paths = ApplicationPaths(Path(folder))
+            wheels = paths.runtime_packages / "wheels"
+            wheels.mkdir(parents=True)
+            with (
+                patch("audioalign.core.runtime_addons.subprocess.Popen", fake_popen),
+                patch("audioalign.core.runtime_addons.ApplicationPaths.current", return_value=paths),
+                patch.object(sys, "frozen", True, create=True),
+            ):
+                _install_pypi_packages(component, Path(folder) / "target", None)
+
+        self.assertIn("--find-links", captured)
+        self.assertIn(str(wheels), captured)
+        self.assertNotIn("--no-binary=antlr4-python3-runtime", captured)
+
     def test_bundled_index_uses_package_sources_and_no_github_assets(self) -> None:
         index_path = ROOT / "runtime-packages" / "runtime-index.json"
         payload = json.loads(index_path.read_text(encoding="utf-8"))
@@ -173,6 +245,7 @@ class RuntimeAddonTests(unittest.TestCase):
         for component in components:
             packages = set(component["packages"])
             self.assertIn("torch==2.11.0", packages)
+            self.assertIn("gradio==6.17.3", packages)
             self.assertNotIn("torch==2.8.0", packages)
             if component["id"].startswith("ai-full-"):
                 self.assertIn("torchaudio==2.11.0", packages)
@@ -238,7 +311,7 @@ class RuntimeAddonTests(unittest.TestCase):
             )
             component = load_runtime_index(paths)[0]
 
-            def fake_install(_component, target, progress) -> None:
+            def fake_install(_component, target, progress, _log_path=None) -> None:
                 (target / "example_package.py").write_text("READY = True\n", encoding="utf-8")
                 if progress:
                     progress(1.0, "done")
@@ -276,7 +349,7 @@ class RuntimeAddonTests(unittest.TestCase):
             component = load_runtime_index(paths)[0]
             install_calls = 0
 
-            def fake_install(_component, target, _progress) -> None:
+            def fake_install(_component, target, _progress, _log_path=None) -> None:
                 nonlocal install_calls
                 install_calls += 1
                 (target / "example_package.py").write_text("READY = True\n", encoding="utf-8")

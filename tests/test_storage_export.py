@@ -59,6 +59,55 @@ class StorageExportTests(unittest.TestCase):
             finally:
                 session.close()
 
+    def test_html_export_repairs_unmapped_toc_assets_and_chapter_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = ProjectSession.create("epub-toc-reader", root / "project")
+            try:
+                epub = session.root / "source" / "book.epub"
+                epub.parent.mkdir(exist_ok=True)
+                toc_html = (
+                    "<html><head><link rel='stylesheet' href='../book.css'></head><body>"
+                    "<img src='../images/cover.png'><a href='chapter.xhtml#chapter-one'>"
+                    "Chapter one</a></body></html>"
+                )
+                chapter_html = (
+                    "<html><body><h1 id='chapter-one'>Chapter one</h1>"
+                    "<p>Chapter body.</p></body></html>"
+                )
+                with zipfile.ZipFile(epub, "w") as archive:
+                    archive.writestr("text/toc.xhtml", toc_html)
+                    archive.writestr("text/chapter.xhtml", chapter_html)
+                    archive.writestr("book.css", "body{font-family:serif}")
+                    archive.writestr("images/cover.png", b"image")
+                document_id = session.repository.add_source_document(SourceDocument(
+                    None, SourceDocumentKind.EPUB, "book.epub", "source/book.epub", "fixture",
+                ))
+                toc_id = session.repository.add_chapter(Chapter(None, "Contents", 0, toc_html))
+                chapter_id = session.repository.add_chapter(Chapter(None, "Chapter one", 1, chapter_html))
+                session.repository.set_chapter_source_document(
+                    chapter_id, document_id, entry_path="text/chapter.xhtml",
+                )
+                session.repository.replace_segments(toc_id, [
+                    TextSegment(None, toc_id, 0, "Chapter one", 0, 0),
+                ])
+                session.repository.replace_segments(chapter_id, [
+                    TextSegment(None, chapter_id, 0, "Chapter body.", 0, 500),
+                ])
+
+                output = root / "html"
+                export_html(session, output)
+                toc_page = (output / "pages" / "chapter-001.html").read_text("utf-8")
+                shell = (output / "index.html").read_text("utf-8")
+                self.assertIn(f'<base href="../book/source-{document_id}/text/"', toc_page)
+                self.assertIn('data-aat-chapter-index="1"', toc_page)
+                self.assertIn('data-aat-chapter-page="chapter-002.html"', toc_page)
+                self.assertIn('data-aat-fragment="chapter-one"', toc_page)
+                self.assertIn("e.data.type==='aat-chapter'", shell)
+                self.assertTrue((output / "book" / f"source-{document_id}" / "images" / "cover.png").is_file())
+            finally:
+                session.close()
+
     def test_html_export_preserves_source_style_and_reader_state_controls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -84,7 +133,12 @@ class StorageExportTests(unittest.TestCase):
                 self.assertIn("data-aat-index", rendered)
                 self.assertGreaterEqual(rendered.count('data-aat-index="0"'), 3)
                 self.assertIn("targets.forEach(target=>target.classList.add('aat-active'))", rendered)
+                self.assertIn("scrollIntoView({block:'nearest',inline:'nearest'})", rendered)
+                self.assertNotIn("scrollIntoView({block:'center'", rendered)
                 self.assertIn("单句循环", shell)
+                self.assertIn("跟随当前句", shell)
+                self.assertIn("follow:follow.checked", shell)
+                self.assertIn("follow.checked=saved.follow!==false", shell)
                 self.assertIn("playbackRate", shell)
                 self.assertIn("player.onplay=syncPlayButton", shell)
                 self.assertIn("playing?'⏸':'▶'", shell)
@@ -118,6 +172,9 @@ class StorageExportTests(unittest.TestCase):
                 self.assertEqual(output, result)
                 self.assertFalse((output / "index.html").exists())
                 self.assertFalse((output / "pages").exists())
+                first_page = next(output.glob("001-*.html")).read_text("utf-8")
+                self.assertIn("跟随当前句", first_page)
+                self.assertIn("window.aatOpenChapter", first_page)
                 pages = sorted(output.glob("*.html"))
                 self.assertEqual(2, len(pages))
                 first = pages[0].read_text("utf-8")

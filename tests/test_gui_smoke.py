@@ -540,6 +540,36 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(900, window.segment_model.segments[1].start_ms)
             window.close()
 
+    def test_punctuation_split_rematches_cached_asr_when_global_anchors_are_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("local-anchor-split", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            text = "First sentence. Second sentence."
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, text, 0, 2_000)
+            ])
+            segment = session.repository.segments(chapter_id)[0]
+            session.repository.replace_asr_tokens(chapter_id, [
+                ASRToken(None, chapter_id, 0, "First", 100, 500, 0.95),
+                ASRToken(None, chapter_id, 1, "Second", 900, 1_500, 0.95),
+            ])
+            # These chapter-global offsets represent a stale layout from
+            # before structural text edits and deliberately point elsewhere.
+            session.repository.replace_anchors(chapter_id, [
+                TextAudioAnchor(None, chapter_id, segment.id, 1_000, 1_005, 100, 500, 1.0, "asr-word"),
+                TextAudioAnchor(None, chapter_id, segment.id, 1_016, 1_022, 1_600, 1_900, 1.0, "asr-word"),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            window._select_segment_row(0)
+
+            window.split_segment_by_punctuation()
+
+            self.assertEqual(2, window.segment_model.rowCount())
+            self.assertEqual(900, window.segment_model.segments[0].end_ms)
+            self.assertEqual(900, window.segment_model.segments[1].start_ms)
+            window.close()
+
     def test_punctuation_split_uses_unsaved_fixed_editor_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("live-punctuation-split", Path(temporary) / "project")
@@ -587,6 +617,47 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(4, window.segment_model.rowCount())
             window.close()
 
+    def test_merge_with_unmatched_next_row_keeps_the_timed_cue_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("merge-unmatched-next", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(
+                    None, chapter_id, 0, "Timed sentence", 12_000, 14_500,
+                    0.9, SegmentStatus.MANUAL,
+                ),
+                TextSegment(
+                    None, chapter_id, 1, "deleted timing", 0, 0,
+                    0.0, SegmentStatus.UNMATCHED,
+                ),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            window._select_segment_row(0)
+
+            window.merge_segment(1)
+
+            stored = session.repository.segments(chapter_id)
+            self.assertEqual(1, len(stored))
+            self.assertEqual("Timed sentence deleted timing", stored[0].text)
+            self.assertEqual((12_000, 14_500), (stored[0].start_ms, stored[0].end_ms))
+            self.assertEqual(SegmentStatus.MANUAL, stored[0].status)
+            window.close()
+
+    def test_zero_width_row_does_not_steal_a_shared_boundary_handle(self) -> None:
+        editor = AudioVisualizerEditor()
+        editor.resize(1_000, 400)
+        editor.set_cache(None, 5_000)
+        editor.set_segments([
+            TextSegment(None, 1, 0, "left", 1_000, 2_000),
+            TextSegment(None, 1, 1, "untimed", 2_000, 2_000, status=SegmentStatus.UNMATCHED),
+            TextSegment(None, 1, 2, "right", 2_000, 3_000),
+        ])
+
+        target = editor._nearest_target(2_000)
+        self.assertEqual(("start", 2), (target.kind, target.segment_index))
+        self.assertNotEqual(1, editor._segment_at(2_000))
+
     def test_binding_updates_existing_row_without_rebuilding_chapter(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = ProjectSession.create("fast-bind", Path(temporary) / "project")
@@ -612,6 +683,34 @@ class GuiSmokeTests(unittest.TestCase):
                 session.repository.segments(chapter_id)[0].start_ms,
                 session.repository.segments(chapter_id)[0].end_ms,
             ))
+            window.close()
+
+    def test_fill_unmatched_gap_expands_and_distributes_the_whole_untimed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = ProjectSession.create("fill-unmatched-gap", Path(temporary) / "project")
+            chapter_id = session.repository.add_chapter(Chapter(None, "chapter", 0))
+            session.repository.replace_segments(chapter_id, [
+                TextSegment(None, chapter_id, 0, "before", 1_000, 2_000, status=SegmentStatus.MANUAL),
+                TextSegment(None, chapter_id, 1, "short", 0, 0, status=SegmentStatus.UNMATCHED),
+                TextSegment(None, chapter_id, 2, "a much longer unmatched sentence", 0, 0, status=SegmentStatus.UNMATCHED),
+                TextSegment(None, chapter_id, 3, "after", 6_000, 7_000, status=SegmentStatus.MANUAL),
+            ])
+            window = MainWindow()
+            window._set_session(session)
+            # Selecting only the second row still fills its complete untimed
+            # run, so a sibling is not stranded after the gap is consumed.
+            window._select_segment_row(2)
+
+            window.fill_unmatched_gap()
+
+            stored = session.repository.segments(chapter_id)
+            self.assertEqual(2_000, stored[1].start_ms)
+            self.assertEqual(stored[1].end_ms, stored[2].start_ms)
+            self.assertLess(stored[1].end_ms, 4_000)
+            self.assertEqual(6_000, stored[2].end_ms)
+            self.assertEqual(SegmentStatus.MANUAL, stored[1].status)
+            self.assertEqual(SegmentStatus.MANUAL, stored[2].status)
+            self.assertEqual([1, 2], window._selected_rows())
             window.close()
 
     def test_inference_and_media_lanes_run_concurrently(self) -> None:
